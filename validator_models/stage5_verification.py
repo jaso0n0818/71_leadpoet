@@ -2561,15 +2561,31 @@ def _extract_industry_from_snippet(text: str) -> str:
 
 
 def _extract_company_size_from_snippet(text: str) -> str:
-    """Extract company size from LinkedIn snippet."""
+    """Extract company size from LinkedIn snippet (supports international languages)."""
     if not text:
         return ''
+    # Employee-related words across LinkedIn languages
+    emp_words = (
+        r'employees?|Beschäftigte|Mitarbeiter|pekerja|ansatte|'
+        r'pracowników|çalışan|anställda|dipendenti|employés|'
+        r'empleados|funcionários|medewerkers|werknemers|collaboratori|'
+        r'עובדים|karyawan|angajați|medarbejdere|zaměstnanců|'
+        r'työntekijää|従業員|직원|员工|موظف|موظفين'
+    )
+    # Size label words across languages
+    size_labels = (
+        r'Company\s*size|Größe|Taille|Tamaño|Dimensione|Grootte|'
+        r'Wielkość\s*firmy|Şirket\s*büyüklüğü|Företagsstorlek'
+    )
     patterns = [
-        re.compile(r'Company\s*size[:\s;]+(\d{1,3}(?:,\d{3})*(?:\+|\s*[-–—]\s*\d{1,3}(?:,\d{3})*)?)\s*employees?', re.I),
-        re.compile(r'Company\s*size\s+(\d{1,3}(?:,\d{3})*(?:\+|\s*[-–—]\s*\d{1,3}(?:,\d{3})*)?)\s*employees?', re.I),
-        re.compile(r'Company\s*size[:\s;]+(\d{1,3}(?:,\d{3})*(?:\+|\s*[-–—]\s*\d{1,3}(?:,\d{3})*)?)(?:\s|$|\.)', re.I),
-        re.compile(r'(\d{1,3}(?:,\d{3})*\s*[-–—]\s*\d{1,3}(?:,\d{3})*)\s*employees?', re.I),
-        re.compile(r'(\d{1,3}(?:,\d{3})*\+)\s*employees?', re.I),
+        # "Company size: X-Y employees" (any language)
+        re.compile(rf'(?:{size_labels})[:\s;]+(\d{{1,3}}(?:,\d{{3}})*(?:\+|\s*[-–—]\s*\d{{1,3}}(?:,\d{{3}})*)?)\s*(?:{emp_words})', re.I),
+        # "Company size: X-Y" without employee word
+        re.compile(rf'(?:{size_labels})[:\s;]+(\d{{1,3}}(?:,\d{{3}})*(?:\+|\s*[-–—]\s*\d{{1,3}}(?:,\d{{3}})*)?)\s*(?:\.|;|$)', re.I),
+        # "X-Y employees" (any language)
+        re.compile(rf'(\d{{1,3}}(?:,\d{{3}})*\s*[-–—]\s*\d{{1,3}}(?:,\d{{3}})*)\s*(?:{emp_words})', re.I),
+        # "X+ employees" (any language)
+        re.compile(rf'(\d{{1,3}}(?:,\d{{3}})*\+)\s*(?:{emp_words})', re.I),
     ]
     for p in patterns:
         m = p.search(text)
@@ -3342,29 +3358,64 @@ async def check_stage5_unified(lead: dict) -> Tuple[bool, dict]:
 
         # Extract size from snippet and validate using same logic as Q1/Q2/Q3
         size_confirmed = False
+        s4_extracted = None
         for r in s4_result.get('results', []):
             if _check_exact_slug_match(r.get('link', ''), slug):
                 combined = f"{r.get('title', '')} {r.get('snippet', '')}"
                 extracted_size = _extract_company_size_from_snippet(combined)
                 if extracted_size:
+                    s4_extracted = extracted_size
                     match, reason = _validate_size_match(claimed_employee_count, extracted_size)
                     if match:
                         size_confirmed = True
-                        break
+                    break  # Found size from exact slug — decision is final
 
         if size_confirmed:
-            print(f"   ✅ S4: Employee count '{claimed_employee_count}' confirmed (extracted: '{extracted_size}')")
+            print(f"   ✅ S4: Employee count '{claimed_employee_count}' confirmed (extracted: '{s4_extracted}')")
             lead["_update_employee_count"] = True
             lead["_new_employee_count"] = claimed_employee_count
             return True, None
-        else:
-            print(f"   ❌ S4: Employee count '{claimed_employee_count}' not confirmed")
+
+        # If S4 extracted a size but it doesn't match — fail immediately, no fallback
+        if s4_extracted:
+            print(f"   ❌ S4: Mismatch - claimed '{claimed_employee_count}', LinkedIn shows '{s4_extracted}'")
             return False, {
                 "stage": "Stage 5: Employee Count",
                 "check_name": "check_stage5_unified",
-                "message": f"Employee count '{claimed_employee_count}' not found in LinkedIn",
+                "message": f"Employee count mismatch: claimed '{claimed_employee_count}', LinkedIn shows '{s4_extracted}'",
                 "failed_fields": ["employee_count"]
             }
+
+        # S4 couldn't extract — fallback to broader search queries (handles foreign-language pages)
+        print(f"   ⚠️ S4 couldn't extract, trying GSE fallback for employee count...")
+        gse_results = await asyncio.to_thread(
+            _gse_search_employee_count_sync, company, slug
+        )
+        if gse_results:
+            gse_extracted = extract_employee_count_from_results(gse_results, company, slug)
+            if gse_extracted:
+                match, reason = rule_based_match_employee_count(claimed_employee_count, gse_extracted)
+                if match:
+                    print(f"   ✅ GSE fallback: Employee count confirmed '{gse_extracted}' ({reason})")
+                    lead["_update_employee_count"] = True
+                    lead["_new_employee_count"] = claimed_employee_count
+                    return True, None
+                else:
+                    print(f"   ❌ GSE fallback: Mismatch - claimed '{claimed_employee_count}', found '{gse_extracted}' ({reason})")
+                    return False, {
+                        "stage": "Stage 5: Employee Count",
+                        "check_name": "check_stage5_unified",
+                        "message": f"Employee count mismatch: claimed '{claimed_employee_count}', LinkedIn shows '{gse_extracted}'",
+                        "failed_fields": ["employee_count"]
+                    }
+
+        print(f"   ❌ Employee count '{claimed_employee_count}' not found in LinkedIn")
+        return False, {
+            "stage": "Stage 5: Employee Count",
+            "check_name": "check_stage5_unified",
+            "message": f"Employee count '{claimed_employee_count}' not found in LinkedIn",
+            "failed_fields": ["employee_count"]
+        }
 
     # ========================================================================
     # CASE 3: NEW COMPANY - Full validate-as-you-go pipeline
@@ -3605,28 +3656,63 @@ async def check_stage5_unified(lead: dict) -> Tuple[bool, dict]:
         s4_result = await asyncio.to_thread(_gse_search_sync, s4_query, 10)
 
         size_confirmed = False
+        s4_extracted = None
         for r in s4_result.get('results', []):
             if _check_exact_slug_match(r.get('link', ''), slug):
                 combined = f"{r.get('title', '')} {r.get('snippet', '')}"
                 extracted_size = _extract_company_size_from_snippet(combined)
                 if extracted_size:
+                    s4_extracted = extracted_size
                     match, reason = _validate_size_match(claimed_employee_count, extracted_size)
                     if match:
                         size_confirmed = True
                         merged['company_size'] = claimed_employee_count
                         sources['company_size'] = 's4'
-                        break
+                    break  # Found size from exact slug — decision is final
 
         if size_confirmed:
-            print(f"   ✅ S4: Size '{claimed_employee_count}' confirmed (extracted: '{extracted_size}')")
-        else:
-            print(f"   ❌ S4: Size '{claimed_employee_count}' not found - FAIL")
+            print(f"   ✅ S4: Size '{claimed_employee_count}' confirmed (extracted: '{s4_extracted}')")
+        elif s4_extracted:
+            # S4 extracted a size but it doesn't match — fail immediately, no fallback
+            print(f"   ❌ S4: Mismatch - claimed '{claimed_employee_count}', LinkedIn shows '{s4_extracted}'")
             return False, {
                 "stage": "Stage 5: Employee Count",
                 "check_name": "check_stage5_unified",
-                "message": f"Employee count '{claimed_employee_count}' not found in LinkedIn after Q1-Q3 and S4",
+                "message": f"Size mismatch: claimed '{claimed_employee_count}' vs LinkedIn '{s4_extracted}'",
                 "failed_fields": ["employee_count"]
             }
+        else:
+            # S4 couldn't extract — fallback to broader search queries
+            print(f"   ⚠️ S4 couldn't extract, trying GSE fallback for employee count...")
+            gse_results = await asyncio.to_thread(
+                _gse_search_employee_count_sync, company, slug
+            )
+            if gse_results:
+                gse_extracted = extract_employee_count_from_results(gse_results, company, slug)
+                if gse_extracted:
+                    match, reason = rule_based_match_employee_count(claimed_employee_count, gse_extracted)
+                    if match:
+                        print(f"   ✅ GSE fallback: Size confirmed '{gse_extracted}' ({reason})")
+                        merged['company_size'] = gse_extracted
+                        sources['company_size'] = 'gse_fallback'
+                        size_confirmed = True
+                    else:
+                        print(f"   ❌ GSE fallback: Mismatch - claimed '{claimed_employee_count}', found '{gse_extracted}' ({reason})")
+                        return False, {
+                            "stage": "Stage 5: Employee Count",
+                            "check_name": "check_stage5_unified",
+                            "message": f"Size mismatch: claimed '{claimed_employee_count}' vs LinkedIn '{gse_extracted}'",
+                            "failed_fields": ["employee_count"]
+                        }
+
+            if not size_confirmed:
+                print(f"   ❌ S4+GSE: Size '{claimed_employee_count}' not found - FAIL")
+                return False, {
+                    "stage": "Stage 5: Employee Count",
+                    "check_name": "check_stage5_unified",
+                    "message": f"Employee count '{claimed_employee_count}' not found in LinkedIn after Q1-Q3, S4, and GSE",
+                    "failed_fields": ["employee_count"]
+                }
 
     # ========================================================================
     # CHECK REQUIRED FIELDS
