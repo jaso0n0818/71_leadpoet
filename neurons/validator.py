@@ -5759,17 +5759,37 @@ class Validator(BaseValidatorNeuron):
                             if eval_resp.status_code == 200:
                                 eval_data = eval_resp.json()
                                 if eval_data.get("has_work"):
-                                    rebenchmark_model = {
-                                        "evaluation_id": eval_data.get("evaluation_id"),
-                                        "model_id": eval_data.get("model_id"),
-                                        "model_name": eval_data.get("model_name"),
-                                        "miner_hotkey": eval_data.get("miner_hotkey"),
-                                        "agent_code": eval_data.get("agent_code"),
-                                        "evaluation_runs": [run.__dict__ if hasattr(run, '__dict__') else run for run in eval_data.get("evaluation_runs", [])],
-                                        "icp_set_hash": eval_data.get("icp_set_hash", ""),
-                                        "is_rebenchmark": True
-                                    }
-                                    print(f"   ✅ Got rebenchmark work item: {rebenchmark_model['model_name']}")
+                                    returned_model_id = eval_data.get("model_id")
+                                    if returned_model_id != champion_model_id:
+                                        # Gateway returned a DIFFERENT model — NOT the champion.
+                                        # Do NOT label it as rebenchmark. Treat as regular model.
+                                        print(f"   ⚠️ Gateway returned wrong model for rebenchmark!")
+                                        print(f"      Expected: {champion_data.get('model_name')} ({champion_model_id[:12]})")
+                                        print(f"      Got: {eval_data.get('model_name')} ({returned_model_id[:12] if returned_model_id else 'None'})")
+                                        print(f"      Treating as regular model (NOT rebenchmark)")
+                                        # Add it to regular models instead
+                                        all_models.append({
+                                            "evaluation_id": eval_data.get("evaluation_id"),
+                                            "model_id": returned_model_id,
+                                            "model_name": eval_data.get("model_name"),
+                                            "miner_hotkey": eval_data.get("miner_hotkey"),
+                                            "agent_code": eval_data.get("agent_code"),
+                                            "evaluation_runs": [run.__dict__ if hasattr(run, '__dict__') else run for run in eval_data.get("evaluation_runs", [])],
+                                            "icp_set_hash": eval_data.get("icp_set_hash", ""),
+                                            "is_rebenchmark": False
+                                        })
+                                    else:
+                                        rebenchmark_model = {
+                                            "evaluation_id": eval_data.get("evaluation_id"),
+                                            "model_id": returned_model_id,
+                                            "model_name": eval_data.get("model_name"),
+                                            "miner_hotkey": eval_data.get("miner_hotkey"),
+                                            "agent_code": eval_data.get("agent_code"),
+                                            "evaluation_runs": [run.__dict__ if hasattr(run, '__dict__') else run for run in eval_data.get("evaluation_runs", [])],
+                                            "icp_set_hash": eval_data.get("icp_set_hash", ""),
+                                            "is_rebenchmark": True
+                                        }
+                                        print(f"   ✅ Got rebenchmark work item: {rebenchmark_model['model_name']} (model_id verified)")
                         else:
                             print(f"   ⚠️ Failed to queue rebenchmark: {rebench_resp.status_code}")
                 else:
@@ -6146,7 +6166,7 @@ class Validator(BaseValidatorNeuron):
                 score_breakdown = result.get("score_breakdown")
                 was_dethroned = False
 
-                if is_rebenchmark:
+                if is_rebenchmark and model_id == current_champion_id:
                     # Rebenchmark failed with an evaluation error (API timeout, proxy
                     # failure, infrastructure issue, etc.).  Do NOT dethrone — the
                     # champion's previous score is still valid.  It will be
@@ -6188,9 +6208,13 @@ class Validator(BaseValidatorNeuron):
             became_champion = False
             was_dethroned = False
             
+            # Verify rebenchmark: model_id MUST match current champion
+            if is_rebenchmark and model_id != current_champion_id:
+                print(f"      ⚠️ REBENCHMARK FLAG MISMATCH: model {model_name} ({model_id[:12]}) != champion ({str(current_champion_id)[:12]})")
+                print(f"         Gateway returned wrong model — treating as regular challenger")
+                is_rebenchmark = False
+            
             if is_rebenchmark:
-                # Rebenchmark - check if champion still meets minimum threshold
-                print(f"      🔄 Rebenchmark - checking champion status")
                 
                 if avg_score < MINIMUM_CHAMPION_SCORE:
                     # Champion score dropped below minimum - DETHRONE with no replacement
