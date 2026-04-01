@@ -1167,6 +1167,12 @@ async def fetch_url_content(url: str, source: str) -> str:
     elif source_lower == "company_website":
         return await scrapingdog_generic(url)
     elif source_lower == "social_media":
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if hostname in ("twitter.com", "www.twitter.com", "x.com", "www.x.com", "mobile.twitter.com"):
+            if "/status/" in url:
+                return await scrapingdog_x_post(url)
+            return await scrapingdog_x_profile(url)
         return await scrapingdog_generic(url)
     elif source_lower == "review_site":
         return await scrapingdog_generic(url)
@@ -1333,6 +1339,88 @@ async def scrapingdog_jobs(url: str) -> str:
         response = await client.get(api_url, params=params, timeout=30.0)
         response.raise_for_status()
         return response.text
+
+
+async def scrapingdog_x_post(url: str) -> str:
+    """
+    Fetch X/Twitter post via ScrapingDog's dedicated X Post API (5 credits).
+    Falls back to profile lookup if the Post API fails.
+
+    Endpoint: api.scrapingdog.com/x/post
+    Parameter: tweetId (numeric status ID from the URL)
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    tweet_id_match = re.search(r'/status/(\d+)', url)
+    if not tweet_id_match:
+        logger.warning(f"Could not extract tweet ID from X URL: {url[:100]}")
+        username_match = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)', url)
+        if username_match and username_match.group(1).lower() not in ("i", "search", "explore", "home", "hashtag"):
+            return await scrapingdog_x_profile_by_id(username_match.group(1))
+        return ""
+
+    tweet_id = tweet_id_match.group(1)
+
+    try:
+        api_url = "https://api.scrapingdog.com/x/post"
+        params = {"api_key": SCRAPINGDOG_API_KEY, "tweetId": tweet_id}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            if response.status_code == 200:
+                text = response.text
+                if len(text) > 50 and "something went wrong" not in text.lower():
+                    return text
+            logger.info(f"X Post API returned {response.status_code}, falling back to profile: {url[:80]}")
+    except Exception as e:
+        logger.warning(f"X Post API failed ({e}), falling back to profile")
+
+    username_match = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)', url)
+    if username_match and username_match.group(1).lower() not in ("i", "search", "explore", "home", "hashtag"):
+        return await scrapingdog_x_profile_by_id(username_match.group(1))
+    return ""
+
+
+async def scrapingdog_x_profile(url: str) -> str:
+    """
+    Fetch X/Twitter profile via ScrapingDog's dedicated X Profile API (5 credits).
+
+    Endpoint: api.scrapingdog.com/x/profile
+    Parameter: profileId (username/handle)
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    username_match = re.match(r'^([A-Za-z0-9_]+)', path)
+    if not username_match:
+        logger.warning(f"Could not extract username from X URL: {url[:100]}")
+        return ""
+
+    username = username_match.group(1)
+    if username.lower() in ("i", "search", "explore", "home", "hashtag", "status"):
+        return ""
+
+    return await scrapingdog_x_profile_by_id(username)
+
+
+async def scrapingdog_x_profile_by_id(profile_id: str) -> str:
+    """
+    Fetch X/Twitter profile by handle via ScrapingDog X Profile API (5 credits).
+    Returns JSON string with profile data including recent/pinned tweets.
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/x/profile"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "profileId": profile_id}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return json.dumps(data)
 
 
 async def scrapingdog_generic(url: str) -> str:
