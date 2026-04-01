@@ -1225,20 +1225,24 @@ async def scrapingdog_linkedin(url: str) -> str:
     if not SCRAPINGDOG_API_KEY:
         raise ValueError("SCRAPINGDOG_API_KEY not configured")
     
-    # Determine URL type
-    # ScrapingDog LinkedIn API supports: profile, company, post
-    # Job posting URLs (/jobs/) are NOT supported by the LinkedIn API —
-    # they must be scraped via the generic scraper instead.
+    # Route to correct ScrapingDog API based on LinkedIn URL type
     if "/jobs/" in url:
-        logger.info(f"LinkedIn job URL detected — routing to generic scraper: {url[:80]}")
-        return await scrapingdog_generic(url)
+        return await scrapingdog_linkedin_jobs(url)
     
     if "/in/" in url:
         url_type = "profile"
     elif "/company/" in url:
         url_type = "company"
+    elif "/posts/" in url or "/feed/" in url or "/pulse/" in url:
+        url_type = "profile"
+        link_id_match = re.search(r'/in/([^/?]+)', url) or re.search(r'/company/([^/?]+)', url)
+        if link_id_match:
+            link_id = link_id_match.group(1)
+        else:
+            logger.warning(f"LinkedIn post URL without identifiable author, falling back: {url[:80]}")
+            return await scrapingdog_generic(url)
     else:
-        url_type = "post"
+        url_type = "company"
     
     link_id = extract_linkedin_id(url)
     
@@ -1254,6 +1258,35 @@ async def scrapingdog_linkedin(url: str) -> str:
         response.raise_for_status()
         data = response.json()
         return json.dumps(data)
+
+
+async def scrapingdog_linkedin_jobs(url: str) -> str:
+    """
+    Fetch LinkedIn job posting via ScrapingDog's dedicated Jobs API (5 credits).
+    Falls back to dynamic generic scrape if the Jobs API fails.
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+    
+    job_id_match = re.search(r'/jobs/view/(\d+)', url)
+    if not job_id_match:
+        job_id_match = re.search(r'/jobs/(\d+)', url)
+    
+    if job_id_match:
+        try:
+            api_url = "https://api.scrapingdog.com/jobs"
+            params = {"api_key": SCRAPINGDOG_API_KEY, "job_id": job_id_match.group(1)}
+            async with httpx.AsyncClient() as client:
+                response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+                if response.status_code == 200:
+                    text = response.text
+                    if "does not exist" not in text:
+                        return text
+                logger.info(f"LinkedIn Jobs API returned no data, trying dynamic scrape: {url[:80]}")
+        except Exception as e:
+            logger.warning(f"LinkedIn Jobs API failed ({e}), trying dynamic scrape")
+    
+    return await scrapingdog_jobs(url)
 
 
 async def scrapingdog_indeed(url: str) -> str:
