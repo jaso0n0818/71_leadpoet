@@ -47,6 +47,8 @@ from .stage4_helpers import (
     should_reject_city_match,
     GEO_LOOKUP,
     CITY_EQUIVALENTS,
+    COUNTRY_ALIASES,
+    get_linkedin_url_country,
 )
 
 _SAINT_PREFIX_RE = re.compile(r'^(?:saint|st\.?)\s+')
@@ -680,6 +682,56 @@ async def run_lead_validation_stage4(
 
         if not location_passed:
             print(f"   ❌ Q5 failed: \"{city}, {state}\" not found on profile")
+
+    # 6c-uae. Q5 UAE Location Fallback - runs for UAE leads without state
+    if not location_passed and city and linkedin_url and not state and country:
+        country_lower = country.lower().strip()
+        uae_names = {'united arab emirates'} | set(COUNTRY_ALIASES.get('united arab emirates', []))
+        if country_lower in uae_names:
+            # Build city variants from equivalents
+            city_names_uae = [city]
+            city_lower_uae = city.lower().strip()
+            city_equiv = CITY_EQUIVALENTS.get(city_lower_uae)
+            if city_equiv and city_equiv.lower() != city_lower_uae:
+                city_names_uae.append(city_equiv.title())
+            for key, val in CITY_EQUIVALENTS.items():
+                if val == city_lower_uae and key != city_lower_uae:
+                    city_names_uae.append(key.title())
+
+            for city_variant in city_names_uae:
+                q5_uae_query = f'site:linkedin.com/in/{expected_lid} "{city_variant}"'
+                print(f"   🔍 Q5-UAE: {q5_uae_query}")
+                q5_uae_results, q5_uae_error = await search_google_async(q5_uae_query, api_key)
+                queries_used.append('Q5-UAE')
+
+                for r in q5_uae_results:
+                    if get_linkedin_id(r.get('link', '')) == expected_lid:
+                        r_text = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
+                        r_link = r.get('link', '')
+
+                        # Check 1: ae.linkedin.com domain
+                        url_country = get_linkedin_url_country(r_link)
+                        if url_country and url_country == 'united arab emirates':
+                            location_passed = True
+                            location_method = 'q5_slug_uae_domain'
+                            print(f"   ✅ Q5-UAE passed: '{city_variant}' on profile + ae.linkedin.com domain")
+                            break
+
+                        # Check 2: country name/alias in text
+                        uae_text_variants = {'united arab emirates', 'uae', 'u.a.e.'}
+                        if any(v in r_text for v in uae_text_variants):
+                            location_passed = True
+                            location_method = 'q5_slug_uae_text'
+                            print(f"   ✅ Q5-UAE passed: '{city_variant}' on profile + UAE in text")
+                            break
+
+                        print(f"   ⚠️ Q5-UAE: '{city_variant}' found on profile but no UAE country signal")
+
+                if location_passed:
+                    break
+
+            if not location_passed:
+                print(f"   ❌ Q5-UAE failed: \"{city}\" with UAE confirmation not found on profile")
 
     # 6d. Q3 Location Fallback
     if not location_passed and city and linkedin_url:
