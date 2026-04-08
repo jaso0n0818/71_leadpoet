@@ -1359,7 +1359,7 @@ async def run_batch_automated_checks(
         print(f"   ⏳ Polling for TrueList results from coordinator...")
 
         poll_interval = 5  # seconds
-        max_poll_time = 1200  # 20 minutes max wait
+        max_poll_time = 1800  # 30 minutes max wait
         poll_start = time.time()
         poll_waited = 0
 
