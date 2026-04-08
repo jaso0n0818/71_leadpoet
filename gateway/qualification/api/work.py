@@ -531,13 +531,18 @@ async def request_rebenchmark(request: RebenchmarkRequest):
         
         logger.info(f"Rebenchmark: s3_path={s3_path}, extracted s3_key={s3_key}")
         
-        # Check if already in queue
-        for work_item in _work_queue:
+        # Check if already in queue — if so, move to front so the validator's
+        # immediate /request-evaluation call picks up the champion, not a random model
+        for i, work_item in enumerate(_work_queue):
             if work_item.get("model_id") == request.model_id:
-                logger.info(f"Model {request.model_id[:8]}... already in queue, skipping rebenchmark")
+                if i > 0:
+                    _work_queue.insert(0, _work_queue.pop(i))
+                    logger.info(f"Model {request.model_id[:8]}... already in queue at pos {i}, moved to front for rebenchmark")
+                else:
+                    logger.info(f"Model {request.model_id[:8]}... already at front of queue")
                 return {
                     "status": "already_queued",
-                    "message": "Model is already queued for evaluation"
+                    "message": "Model is already queued for evaluation (moved to front)"
                 }
         
         # Queue for re-evaluation

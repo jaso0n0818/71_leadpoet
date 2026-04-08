@@ -5484,6 +5484,39 @@ class Validator(BaseValidatorNeuron):
             bt.logging.warning(f"Failed to request champion rebenchmark: {e}")
             return False
     
+    def _mark_rebenchmark_attempted_today(self, champion_data: Dict[str, Any]):
+        """
+        Update last_evaluated_utc_date in the champion JSON to today's date.
+        
+        Prevents infinite rebenchmark retry loops when the gateway consistently
+        returns the wrong model_id (e.g. miner resubmitted same model name).
+        The rebenchmark will be retried tomorrow with the next ICP set.
+        """
+        try:
+            from datetime import datetime, timezone
+            today_str = datetime.now(timezone.utc).date().isoformat()
+            
+            champion_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "validator_weights", "qualification_champion.json"
+            )
+            champion_file = os.path.normpath(champion_file)
+            
+            if os.path.exists(champion_file):
+                with open(champion_file, 'r') as f:
+                    data = json.load(f)
+                
+                if data.get("current_champion"):
+                    old_date = data["current_champion"].get("last_evaluated_utc_date")
+                    data["current_champion"]["last_evaluated_utc_date"] = today_str
+                    
+                    with open(champion_file, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    
+                    print(f"   📅 Updated last_evaluated_utc_date: {old_date} → {today_str} (rebenchmark failed, will retry tomorrow)")
+        except Exception as e:
+            bt.logging.warning(f"Failed to update rebenchmark date: {e}")
+    
     async def _qualification_report_error(
         self,
         evaluation_run_id: str,
@@ -5718,6 +5751,7 @@ class Validator(BaseValidatorNeuron):
         # Check if rebenchmark is needed
         rebenchmark_needed = self._check_champion_rebenchmark_needed()
         rebenchmark_model = None
+        all_models = []  # Initialize before rebenchmark section (fallback path appends here)
         
         # Determine max models to pull
         if rebenchmark_needed:
@@ -5778,6 +5812,9 @@ class Validator(BaseValidatorNeuron):
                                             "icp_set_hash": eval_data.get("icp_set_hash", ""),
                                             "is_rebenchmark": False
                                         })
+                                        # Mark rebenchmark as attempted for today to prevent
+                                        # infinite retry loop (gateway can't serve correct model_id)
+                                        self._mark_rebenchmark_attempted_today(champion_data)
                                     else:
                                         rebenchmark_model = {
                                             "evaluation_id": eval_data.get("evaluation_id"),
@@ -5796,13 +5833,17 @@ class Validator(BaseValidatorNeuron):
                     print(f"   ⚠️ No champion found for rebenchmark")
             except Exception as rebench_err:
                 print(f"   ⚠️ Rebenchmark request failed: {rebench_err}")
+                # Mark as attempted to prevent infinite retry on persistent errors
+                champion_data_for_date = self._read_qualification_champion()
+                if champion_data_for_date:
+                    self._mark_rebenchmark_attempted_today(champion_data_for_date)
         else:
             # All 5 workers get 1 each = 5 from queue
             max_models = QUALIFICATION_MAX_MODELS_PER_EPOCH
             print(f"   📦 No rebenchmark - pulling max {max_models} models from queue")
         
         # Fetch batch of NEW models from gateway (DB query - excludes rebenchmark)
-        all_models = []
+        # Note: all_models may already contain a model from rebenchmark mismatch fallback
         try:
             gateway_url = os.environ.get("GATEWAY_URL", "http://52.91.135.79:8000")
             
@@ -5838,7 +5879,7 @@ class Validator(BaseValidatorNeuron):
                 
                 response.raise_for_status()
                 batch_response = response.json()
-                all_models = batch_response.get("models", [])
+                all_models.extend(batch_response.get("models", []))
                 
         except Exception as e:
             print(f"   ❌ Failed to fetch models from gateway: {type(e).__name__}: {e or '(empty - likely timeout)'}")
