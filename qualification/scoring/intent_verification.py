@@ -605,6 +605,85 @@ def check_date_precision(claimed_date: str, content: str) -> str:
     return "no_match"
 
 
+def extract_most_recent_date_from_content(content: str) -> Optional[str]:
+    """
+    Extract the most recent date found in content (already stripped of boilerplate).
+
+    Used to detect date omission: when a model submits date=null but the content
+    clearly contains dates, the model may be hiding the date to avoid time decay.
+
+    Returns:
+        ISO date string (YYYY-MM-DD) of the most recent date found, or None
+    """
+    from datetime import date as _date
+
+    content_lower = content.lower()
+    today = _date.today()
+    found_dates: list = []
+
+    # ISO dates: 2025-01-15
+    for m in re.finditer(r'(\d{4})-(\d{2})-(\d{2})', content):
+        try:
+            dt = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            if _date(2020, 1, 1) <= dt <= today:
+                found_dates.append(dt)
+        except ValueError:
+            pass
+
+    # "January 15, 2025" / "Jan 15, 2025" / "15 January 2025"
+    for month_num, (full_name, abbrev) in _MONTH_NAMES.items():
+        for name in (full_name, abbrev):
+            for m in re.finditer(rf'\b{name}\s+(\d{{1,2}})\b[,]?\s*(\d{{4}})', content_lower):
+                try:
+                    dt = _date(int(m.group(2)), month_num, int(m.group(1)))
+                    if _date(2020, 1, 1) <= dt <= today:
+                        found_dates.append(dt)
+                except ValueError:
+                    pass
+            for m in re.finditer(rf'\b(\d{{1,2}})\s+{name}\b[,]?\s*(\d{{4}})', content_lower):
+                try:
+                    dt = _date(int(m.group(2)), month_num, int(m.group(1)))
+                    if _date(2020, 1, 1) <= dt <= today:
+                        found_dates.append(dt)
+                except ValueError:
+                    pass
+
+    # JSON-LD / schema.org: "datePublished":"2025-01-15"
+    for m in re.finditer(r'date\w*["\']?\s*[:=]\s*["\']?(\d{4}-\d{2}-\d{2})', content_lower):
+        try:
+            dt = _date.fromisoformat(m.group(1))
+            if _date(2020, 1, 1) <= dt <= today:
+                found_dates.append(dt)
+        except ValueError:
+            pass
+
+    # MM/DD/YYYY
+    for m in re.finditer(r'(\d{2})/(\d{2})/(\d{4})', content):
+        try:
+            dt = _date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+            if _date(2020, 1, 1) <= dt <= today:
+                found_dates.append(dt)
+        except ValueError:
+            pass
+
+    # Month Year (approximate — use 1st of month)
+    for month_num, (full_name, abbrev) in _MONTH_NAMES.items():
+        for name in (full_name, abbrev):
+            for m in re.finditer(rf'\b{name}\s+(\d{{4}})\b', content_lower):
+                try:
+                    yr = int(m.group(1))
+                    if 2020 <= yr <= today.year:
+                        found_dates.append(_date(yr, month_num, 1))
+                except ValueError:
+                    pass
+
+    if not found_dates:
+        return None
+
+    most_recent = max(found_dates)
+    return most_recent.isoformat()
+
+
 # =============================================================================
 # Pre-check Utilities (cheap checks that run before LLM / ScrapingDog calls)
 # =============================================================================
@@ -820,7 +899,7 @@ async def verify_intent_signal(
     icp_criteria: Optional[str] = None,
     company_name: Optional[str] = None,
     company_website: Optional[str] = None
-) -> Tuple[bool, int, str, str]:
+) -> Tuple[bool, int, str, str, Optional[str]]:
     """
     Verify an intent signal claim AND check for ICP evidence.
     
@@ -841,8 +920,9 @@ async def verify_intent_signal(
         company_name: Name of the company for verification
     
     Returns:
-        Tuple of (verified: bool, confidence: int 0-100, reason: str, date_status: str)
-        date_status is one of: "verified", "no_date", "fabricated"
+        Tuple of (verified, confidence, reason, date_status, content_found_date)
+        date_status is one of: "verified", "no_date", "fabricated", "date_omitted"
+        content_found_date: ISO date string found in content when model omitted it, or None
     """
     # Defensive URL normalization (Pydantic handles this at entry, but this
     # function may be called directly in tests or non-Pydantic code paths)
@@ -860,24 +940,24 @@ async def verify_intent_signal(
     is_generic, generic_reason = is_generic_intent_description(intent_signal.description)
     if is_generic:
         logger.warning(f"Rejected generic intent: {generic_reason}")
-        return False, 5, f"Generic fallback intent rejected: {generic_reason}", "fabricated"
+        return False, 5, f"Generic fallback intent rejected: {generic_reason}", "fabricated", None
     
     # Additional pre-check: "other" source type with vague description is suspicious
     if source_str.lower() == "other" and len(intent_signal.description) < 100:
         logger.warning("Rejected: 'other' source with short description")
-        return False, 10, "Low-value source type 'other' with insufficient description", "fabricated"
+        return False, 10, "Low-value source type 'other' with insufficient description", "fabricated", None
     
     # PRE-CHECK: Reject future dates (obviously fabricated)
     future_err = check_future_date(intent_signal.date)
     if future_err:
         logger.warning(f"❌ Future date rejected: {future_err}")
-        return False, 0, future_err, "fabricated"
+        return False, 0, future_err, "fabricated", None
 
     # PRE-CHECK: Source type vs URL domain mismatch
     mismatch_err = check_source_url_mismatch(source_str, intent_signal.url)
     if mismatch_err:
         logger.warning(f"❌ Source/URL mismatch: {mismatch_err}")
-        return False, 0, mismatch_err, "fabricated"
+        return False, 0, mismatch_err, "fabricated", None
 
     # PRE-CHECK: If source is "company_website", the signal URL domain must match
     # the lead's actual company_website domain. A signal from prnewswire.com or
@@ -912,25 +992,25 @@ async def verify_intent_signal(
     if cached:
         logger.info(f"Using cached verification: verified={cached.verification_result}")
         # Legacy cache entries don't have date_status — default to "verified"
-        return cached.verification_result, cached.verification_confidence, cached.verification_reason, "verified"
+        return cached.verification_result, cached.verification_confidence, cached.verification_reason, "verified", None
     
     # Fetch URL content via ScrapingDog
     try:
         content = await fetch_url_content(intent_signal.url, source_str)
     except Exception as e:
         logger.warning(f"Failed to fetch URL {intent_signal.url}: {e}")
-        return False, 0, f"Failed to fetch URL: {str(e)[:100]}", "fabricated"
+        return False, 0, f"Failed to fetch URL: {str(e)[:100]}", "fabricated", None
     
     if not content:
         logger.warning(f"URL returned no content: {intent_signal.url}")
-        return False, 0, "URL returned no content", "fabricated"
+        return False, 0, "URL returned no content", "fabricated", None
     
     # Extract relevant text from content
     text = extract_verification_content(content, source_str)
     
     if not text or len(text.strip()) < 50:
         logger.warning(f"Insufficient content extracted from URL: {intent_signal.url}")
-        return False, 0, "Insufficient content to verify claim", "fabricated"
+        return False, 0, "Insufficient content to verify claim", "fabricated", None
 
     # ── URL-to-company check (BEFORE LLM — catch misattributed articles cheaply) ──
     # A model might find a great article about Company A and attribute it to Company B.
@@ -999,7 +1079,7 @@ async def verify_intent_signal(
             return False, 0, (
                 f"Intent signal words ({', '.join(ungrounded)}) not found in source content. "
                 f"The description likely contains LLM-injected action verbs not supported by evidence."
-            ), "fabricated"
+            ), "fabricated", None
         elif total_signal > 0:
             logger.info(
                 f"✓ Signal word grounding: {grounded_count}/{total_signal} grounded"
@@ -1020,12 +1100,28 @@ async def verify_intent_signal(
         )
     except Exception as e:
         logger.error(f"LLM verification failed: {e}")
-        return False, 0, f"LLM verification error: {str(e)[:100]}", "fabricated"
+        return False, 0, f"LLM verification error: {str(e)[:100]}", "fabricated", None
     
     # If miner submitted no date, force no_date regardless of LLM response
+    content_found_date = None
     if not intent_signal.date:
         date_status = "no_date"
         logger.info("No date provided by miner — treating as no_date")
+
+        # ── Date omission detection ──
+        # Check if the re-scraped content actually contains dates that the model
+        # chose not to report. Models may strip real dates to avoid time-decay
+        # penalties while still submitting the (stale) content as dateless.
+        stripped_for_date_check = strip_dynamic_boilerplate_dates(
+            strip_copyright_founded_years(text[:CONTENT_MAX_LENGTH])
+        )
+        content_found_date = extract_most_recent_date_from_content(stripped_for_date_check)
+        if content_found_date:
+            date_status = "date_omitted"
+            logger.warning(
+                f"⚠️ Date omission detected: model submitted date=null but content "
+                f"contains date {content_found_date}. Time decay will be applied."
+            )
 
     # ── Programmatic date precision override ──
     # ALL source types: an incorrect date is always 0x (misleads clients).
@@ -1125,8 +1221,8 @@ async def verify_intent_signal(
         ttl_days=DEFAULT_CACHE_TTL_DAYS
     )
     
-    logger.info(f"Verification complete: verified={verified}, confidence={confidence}, date_status={date_status}")
-    return verified, confidence, reason, date_status
+    logger.info(f"Verification complete: verified={verified}, confidence={confidence}, date_status={date_status}, content_found_date={content_found_date}")
+    return verified, confidence, reason, date_status, content_found_date
 
 
 # =============================================================================
@@ -2100,7 +2196,7 @@ async def openrouter_chat(
 
 async def verify_intent_signals_batch(
     signals: list[IntentSignal]
-) -> list[Tuple[bool, int, str, str]]:
+) -> list[Tuple[bool, int, str, str, Optional[str]]]:
     """
     Verify multiple intent signals (with caching).
     
@@ -2108,7 +2204,7 @@ async def verify_intent_signals_batch(
         signals: List of intent signals to verify
     
     Returns:
-        List of (verified, confidence, reason, date_status) tuples
+        List of (verified, confidence, reason, date_status, content_found_date) tuples
     """
     results = []
     for signal in signals:
@@ -2117,7 +2213,7 @@ async def verify_intent_signals_batch(
             results.append(result)
         except Exception as e:
             logger.error(f"Failed to verify signal {signal.url}: {e}")
-            results.append((False, 0, f"Verification error: {str(e)[:50]}", "fabricated"))
+            results.append((False, 0, f"Verification error: {str(e)[:50]}", "fabricated", None))
     
     return results
 

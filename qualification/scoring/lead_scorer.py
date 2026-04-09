@@ -425,6 +425,7 @@ def _apply_signal_time_decay(
     signal_date: Optional[str],
     date_status: str,
     source_str: str,
+    content_found_date: Optional[str] = None,
 ) -> Tuple[float, float]:
     """
     Apply time decay to a single signal's raw score.
@@ -434,6 +435,24 @@ def _apply_signal_time_decay(
     """
     NO_DATE_DECAY_MULTIPLIER = 0.5
     source_lower = (source_str or "").lower().strip()
+
+    if date_status == "date_omitted" and content_found_date:
+        # Model submitted date=null but our re-scrape found a date in the content.
+        # Apply time decay based on the date we found — the model shouldn't get to
+        # hide a real date to avoid decay.
+        try:
+            parsed_date = date.fromisoformat(content_found_date)
+        except (ValueError, AttributeError):
+            parsed_date = None
+        if parsed_date is not None:
+            age_months = calculate_age_months(parsed_date)
+            decay = calculate_time_decay_multiplier(age_months)
+            logger.info(
+                f"⚠️ Date omission: applying time decay from content date "
+                f"{content_found_date} (age={age_months:.1f}mo, decay={decay:.2f}x)"
+            )
+            return raw_score * decay, decay
+        return raw_score, 1.0
 
     if date_status == "no_date":
         if source_lower in SOURCES_DATE_NOT_REQUIRED:
@@ -516,12 +535,12 @@ async def score_intent_signal(lead: LeadOutput, icp: ICPPrompt) -> Tuple[float, 
             continue
         seen_domains.add(domain)
 
-        score, confidence, date_status = await _score_single_intent_signal(
+        score, confidence, date_status, content_found_date = await _score_single_intent_signal(
             signal, icp, icp_criteria, lead.business, lead.company_website
         )
         source_str = (signal.source.value if hasattr(signal.source, 'value') else str(signal.source))
         after_decay, decay_mult = _apply_signal_time_decay(
-            score, signal.date, date_status, source_str
+            score, signal.date, date_status, source_str, content_found_date
         )
         signal_results.append({
             "raw": score,
@@ -580,15 +599,15 @@ async def _score_single_intent_signal(
     icp_criteria: Optional[str],
     company_name: str,
     company_website: str = ""
-) -> Tuple[float, int, str]:
+) -> Tuple[float, int, str, Optional[str]]:
     """
     Verify and score a single intent signal.
     
     Returns:
-        Tuple of (score 0-60, verification_confidence 0-100, date_status)
+        Tuple of (score 0-60, verification_confidence 0-100, date_status, content_found_date)
     """
     # Verify the signal is real AND provides evidence of ICP fit
-    verified, confidence, reason, date_status = await verify_intent_signal(
+    verified, confidence, reason, date_status, content_found_date = await verify_intent_signal(
         signal,
         icp_industry=icp.industry,
         icp_criteria=icp_criteria,
@@ -598,7 +617,7 @@ async def _score_single_intent_signal(
     
     if not verified:
         logger.info(f"Intent signal not verified: {reason}")
-        return 0.0, confidence, date_status
+        return 0.0, confidence, date_status, content_found_date
     
     # Get source as string
     source_str = signal.source.value if hasattr(signal.source, 'value') else str(signal.source)
@@ -672,7 +691,7 @@ Respond with ONLY a single number (0-60):"""
     if source_multiplier < 1.0:
         logger.info(f"Applied source type penalty: {source_str} -> {source_multiplier}x")
     
-    return weighted_score, confidence, date_status
+    return weighted_score, confidence, date_status, content_found_date
 
 
 # =============================================================================

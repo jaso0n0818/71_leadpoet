@@ -33,6 +33,10 @@ from validator_models.checks_utils import (
     log_validation_metrics,
 )
 
+# Process-level tracking of the batch currently being polled.
+# delete_all_truelist_batches() checks this to avoid killing an active batch.
+_active_truelist_batch_id: Optional[str] = None
+
 
 async def check_domain_age(lead: dict) -> Tuple[bool, dict]:
     """
@@ -1555,25 +1559,27 @@ async def delete_truelist_batch(batch_id: str) -> bool:
 
 async def delete_all_truelist_batches() -> int:
     """
-    Delete ALL TrueList batches to clear duplicate detection.
+    Delete old TrueList batches to clear duplicate detection.
 
-    CRITICAL: TrueList detects duplicate emails across ALL batches ever submitted.
-    Even if a batch is "completed", TrueList remembers the emails and may return
-    incomplete CSV results for subsequent batches containing the same emails.
+    SAFE VERSION: Only deletes batches that are completed, failed, or expired.
+    Actively processing batches are preserved to prevent the race condition where
+    a new epoch's cleanup kills a still-running batch from the previous epoch.
 
-    This function queries all batches and deletes them one by one.
-    Should be called before submitting a new batch in each epoch.
+    Also preserves _active_truelist_batch_id as a second safety check.
 
     Returns:
         Number of batches deleted
     """
+    global _active_truelist_batch_id
     url = "https://api.truelist.io/api/v1/batches"
     headers = {"Authorization": f"Bearer {TRUELIST_API_KEY}"}
     deleted_count = 0
+    skipped_count = 0
+
+    SAFE_TO_DELETE_STATES = {"completed", "failed", "expired", "cancelled"}
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Get list of all batches
             async with session.get(url, headers=headers, timeout=30, proxy=HTTP_PROXY_URL) as response:
                 if response.status != 200:
                     print(f"   ⚠️ Failed to list batches (status {response.status})")
@@ -1586,21 +1592,34 @@ async def delete_all_truelist_batches() -> int:
                     print(f"   ✅ No old batches to delete")
                     return 0
 
-                print(f"   🗑️ Deleting {len(batches)} old TrueList batches to clear duplicate detection...")
+                print(f"   🗑️ Found {len(batches)} TrueList batches, cleaning up safely...")
 
-                # Delete each batch
                 for batch in batches:
                     batch_id = batch.get("id")
-                    if batch_id:
-                        delete_url = f"{url}/{batch_id}"
-                        try:
-                            async with session.delete(delete_url, headers=headers, timeout=10, proxy=HTTP_PROXY_URL) as del_response:
-                                if del_response.status == 204:
-                                    deleted_count += 1
-                        except Exception:
-                            pass  # Silently skip failed deletes
+                    if not batch_id:
+                        continue
 
-                print(f"   ✅ Deleted {deleted_count}/{len(batches)} batches")
+                    batch_state = batch.get("batch_state", "unknown")
+
+                    if batch_id == _active_truelist_batch_id:
+                        print(f"   🛡️ Skipping active batch {batch_id[:8]}... (state={batch_state})")
+                        skipped_count += 1
+                        continue
+
+                    if batch_state not in SAFE_TO_DELETE_STATES:
+                        print(f"   🛡️ Skipping batch {batch_id[:8]}... (state={batch_state}, still processing)")
+                        skipped_count += 1
+                        continue
+
+                    delete_url = f"{url}/{batch_id}"
+                    try:
+                        async with session.delete(delete_url, headers=headers, timeout=10, proxy=HTTP_PROXY_URL) as del_response:
+                            if del_response.status == 204:
+                                deleted_count += 1
+                    except Exception:
+                        pass
+
+                print(f"   ✅ Deleted {deleted_count}/{len(batches)} batches (skipped {skipped_count} active/processing)")
                 return deleted_count
 
     except Exception as e:
@@ -1620,7 +1639,7 @@ async def run_centralized_truelist_batch(leads: List[dict]) -> Dict[str, dict]:
 
     Flow:
     1. Extract all valid emails from leads
-    2. Delete old TrueList batches (clean slate)
+    2. Delete old (completed/failed) TrueList batches
     3. Submit batch with all emails
     4. Poll for completion
     5. Retry any emails with errors (up to 3 times total)
@@ -1640,6 +1659,8 @@ async def run_centralized_truelist_batch(leads: List[dict]) -> Dict[str, dict]:
     NOTE: This function is ONLY called by the coordinator.
     Workers should use precomputed_email_results parameter of run_batch_automated_checks.
     """
+    global _active_truelist_batch_id
+
     print(f"\n{'='*60}")
     print(f"📧 COORDINATOR: Centralized TrueList batch for {len(leads)} leads")
     print(f"{'='*60}")
@@ -1685,7 +1706,10 @@ async def run_centralized_truelist_batch(leads: List[dict]) -> Dict[str, dict]:
             print(f"   🚀 Submitting TrueList batch (attempt {batch_attempt + 1}/3) for {len(emails)} emails...")
 
             batch_id = await submit_truelist_batch(emails)
+            _active_truelist_batch_id = batch_id
+
             results = await poll_truelist_batch(batch_id)
+            _active_truelist_batch_id = None
 
             # Merge results
             email_results.update(results)
@@ -1716,6 +1740,7 @@ async def run_centralized_truelist_batch(leads: List[dict]) -> Dict[str, dict]:
                 emails = needs_retry  # Only retry failed emails
 
         except Exception as e:
+            _active_truelist_batch_id = None
             print(f"   ❌ TrueList batch attempt {batch_attempt + 1} failed: {e}")
 
             # Delete batch before retry
@@ -1758,6 +1783,8 @@ async def run_centralized_truelist_batch(leads: List[dict]) -> Dict[str, dict]:
     # ========================================================================
     # Step 5: Summary
     # ========================================================================
+    _active_truelist_batch_id = None
+
     elapsed = time.time() - start_time
     elapsed_mins = int(elapsed // 60)
     elapsed_secs = int(elapsed % 60)
