@@ -2418,3 +2418,159 @@ def gateway_submit_validation(wallet: bt.wallet, epoch_id: int, validation_resul
 # - Reduces latency - consensus runs same epoch instead of N+1
 # - Simplifies workflow - one submission instead of two
 # ═══════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Lead Fulfillment System — Miner Functions
+# ═══════════════════════════════════════════════════════════════════
+
+def gateway_poll_fulfillment_requests(wallet: bt.wallet) -> List[Dict]:
+    """Poll the gateway for active fulfillment ICP requests."""
+    try:
+        response = requests.get(
+            f"{GATEWAY_URL}/fulfillment/requests/active",
+            params={"miner_hotkey": wallet.hotkey.ss58_address},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        bt.logging.warning(f"Failed to poll fulfillment requests: {e}")
+        return {"requests": [], "gateway_server_time": None}
+
+
+def gateway_submit_fulfillment_commit(
+    wallet: bt.wallet,
+    request_id: str,
+    lead_hashes: List[Dict],
+    schema_version: int = 1,
+) -> Dict:
+    """Submit fulfillment lead hashes (commit phase)."""
+    import uuid
+
+    nonce = str(uuid.uuid4())
+    ts = int(time.time())
+    payload = {
+        "request_id": request_id,
+        "miner_hotkey": wallet.hotkey.ss58_address,
+        "lead_hashes": lead_hashes,
+        "schema_version": schema_version,
+        "signature": "",
+        "timestamp": ts,
+        "nonce": nonce,
+    }
+
+    msg = f"FULFILLMENT_COMMIT:{wallet.hotkey.ss58_address}:{request_id}:{nonce}:{ts}"
+    sig = base64.b64encode(wallet.hotkey.sign(msg)).decode()
+    payload["signature"] = sig
+
+    try:
+        response = requests.post(
+            f"{GATEWAY_URL}/fulfillment/commit",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 409:
+            return e.response.json().get("detail", {})
+        raise
+    except Exception as e:
+        bt.logging.error(f"Fulfillment commit failed: {e}")
+        raise
+
+
+def gateway_reveal_fulfillment(
+    wallet: bt.wallet,
+    request_id: str,
+    submission_id: str,
+    leads: List[Dict],
+) -> Dict:
+    """Reveal fulfillment lead data (reveal phase)."""
+    import uuid
+
+    nonce = str(uuid.uuid4())
+    ts = int(time.time())
+    payload = {
+        "request_id": request_id,
+        "submission_id": submission_id,
+        "miner_hotkey": wallet.hotkey.ss58_address,
+        "leads": leads,
+        "signature": "",
+        "timestamp": ts,
+        "nonce": nonce,
+    }
+
+    msg = f"FULFILLMENT_REVEAL:{wallet.hotkey.ss58_address}:{request_id}:{nonce}:{ts}"
+    sig = base64.b64encode(wallet.hotkey.sign(msg)).decode()
+    payload["signature"] = sig
+
+    try:
+        response = requests.post(
+            f"{GATEWAY_URL}/fulfillment/reveal",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        bt.logging.error(f"Fulfillment reveal failed: {e}")
+        raise
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Lead Fulfillment System — Validator Functions
+# ═══════════════════════════════════════════════════════════════════
+
+def gateway_get_fulfillment_reveals(wallet: bt.wallet, request_id: str = None) -> dict:
+    """Fetch revealed leads in scoring status, ready for scoring."""
+    try:
+        response = requests.get(
+            f"{GATEWAY_URL}/fulfillment/scoring",
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if request_id and isinstance(data, dict):
+            data["requests"] = [
+                r for r in data.get("requests", [])
+                if r.get("request_id") == request_id
+            ]
+        return data
+    except Exception as e:
+        bt.logging.warning(f"Failed to get fulfillment reveals: {e}")
+        return {}
+
+
+def gateway_submit_fulfillment_scores(
+    wallet: bt.wallet,
+    request_id: str,
+    scores: List[Dict],
+    validator_hotkey: str = "",
+) -> bool:
+    """Submit fulfillment scores for a request (validator)."""
+    vhk = validator_hotkey or wallet.hotkey.ss58_address
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(
+                f"{GATEWAY_URL}/fulfillment/score",
+                params={
+                    "request_id": request_id,
+                    "validator_hotkey": vhk,
+                },
+                json=scores,
+                timeout=30,
+            )
+            response.raise_for_status()
+            bt.logging.info(f"Fulfillment scores submitted for {request_id[:8]}...")
+            return True
+        except Exception as e:
+            if attempt < 3:
+                bt.logging.warning(f"Score submit attempt {attempt}/3 failed: {e}")
+                time.sleep(2)
+            else:
+                bt.logging.error(f"All 3 score submit attempts failed: {e}")
+                return False
+    return False

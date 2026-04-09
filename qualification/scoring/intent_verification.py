@@ -917,7 +917,8 @@ async def verify_intent_signal(
     icp_industry: Optional[str] = None,
     icp_criteria: Optional[str] = None,
     company_name: Optional[str] = None,
-    company_website: Optional[str] = None
+    company_website: Optional[str] = None,
+    api_key: str = "",
 ) -> Tuple[bool, int, str, str, Optional[str]]:
     """
     Verify an intent signal claim AND check for ICP evidence.
@@ -1115,7 +1116,8 @@ async def verify_intent_signal(
             content=text[:CONTENT_MAX_LENGTH],
             icp_industry=icp_industry,
             icp_criteria=icp_criteria,
-            company_name=company_name
+            company_name=company_name,
+            api_key=api_key,
         )
     except Exception as e:
         logger.error(f"LLM verification failed: {e}")
@@ -1890,7 +1892,8 @@ async def llm_verify_claim(
     claim: str,
     url: str,
     date: str,
-    content: str
+    content: str,
+    api_key: str = "",
 ) -> Tuple[bool, int, str]:
     """
     Use LLM to verify an intent signal claim matches the source content.
@@ -1941,7 +1944,7 @@ Examples of valid responses:
 """
     
     try:
-        response_text = await openrouter_chat(prompt, model="gpt-4o-mini")
+        response_text = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
         
         # Parse JSON response
         # Handle potential markdown code blocks
@@ -1976,7 +1979,8 @@ async def llm_verify_claim_with_icp(
     content: str,
     icp_industry: Optional[str] = None,
     icp_criteria: Optional[str] = None,
-    company_name: Optional[str] = None
+    company_name: Optional[str] = None,
+    api_key: str = "",
 ) -> Tuple[bool, int, str, str, bool]:
     """
     Use LLM to verify an intent signal AND check for ICP evidence.
@@ -2104,7 +2108,7 @@ Examples:
 """
     
     try:
-        response_text = await openrouter_chat(prompt, model="gpt-4o-mini")
+        response_text = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
         
         # Parse JSON response
         response_text = response_text.strip()
@@ -2162,14 +2166,16 @@ async def openrouter_chat(
     prompt: str,
     model: str = "gpt-4o-mini",
     max_retries: int = 2,
+    api_key: str = "",
 ) -> str:
     """
     Call OpenRouter LLM API with automatic retry on transient failures.
     
     Retries on 5xx, 429 (rate limit), and network errors.
     """
-    if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY not configured")
+    key = api_key or OPENROUTER_API_KEY
+    if not key:
+        raise ValueError("No OpenRouter API key configured (neither api_key param nor QUALIFICATION_OPENROUTER_API_KEY env var)")
     
     last_error = None
     for attempt in range(1 + max_retries):
@@ -2178,7 +2184,7 @@ async def openrouter_chat(
                 response = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Authorization": f"Bearer {key}",
                         "Content-Type": "application/json",
                         "HTTP-Referer": "https://leadpoet.ai",
                         "X-Title": "Leadpoet Qualification"

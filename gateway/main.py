@@ -46,6 +46,15 @@ from gateway.api import epoch, validate, manifest, submit, attest, weights, atte
 # Import qualification router (Lead Qualification Agent Competition - Phase 10)
 from gateway.qualification.api.router import qualification_router
 
+# Import fulfillment router (Lead Fulfillment System)
+try:
+    from gateway.fulfillment.api import fulfillment_router
+    _FULFILLMENT_ROUTER_AVAILABLE = True
+except Exception as _fulfillment_import_err:
+    _FULFILLMENT_ROUTER_AVAILABLE = False
+    import logging as _logging
+    _logging.getLogger(__name__).warning(f"Fulfillment router import failed: {_fulfillment_import_err}")
+
 # Import background tasks
 # NOTE: reveal_collector_task REMOVED (Jan 2026) - IMMEDIATE REVEAL MODE means
 # validators submit hash+values in one request. No separate reveal phase to monitor.
@@ -184,6 +193,16 @@ async def lifespan(app: FastAPI):
                 print(f"❌ FATAL: Failed to initialize AsyncSubtensor: {e}")
                 raise
     
+    # Initialize all task handles before try block to prevent NameError in finally
+    epoch_monitor_task = None
+    reveal_task = None
+    checkpoint_task_handle = None
+    anchor_task = None
+    hourly_batch_task_handle = None
+    rate_limiter_task = None
+    icp_task = None
+    fulfillment_task_handle = None
+
     # Now use async_subtensor in a try/finally to ensure cleanup
     try:
         
@@ -254,13 +273,7 @@ async def lifespan(app: FastAPI):
         if skip_bg_tasks:
             print("⚠️  DISABLE_BACKGROUND_TASKS=true - Skipping background tasks")
             print("   This is for LOCAL TESTING ONLY!")
-            epoch_monitor_task = None
-            reveal_task = None
-            checkpoint_task_handle = None
-            anchor_task = None
-            hourly_batch_task_handle = None
-            rate_limiter_task = None
-            
+
             # ICP rotation task ALWAYS runs (even with DISABLE_BACKGROUND_TASKS)
             # This is safe because it ONLY writes to qualification_private_icp_sets
             # On testnet, transparency_log writes are skipped automatically
@@ -292,6 +305,11 @@ async def lifespan(app: FastAPI):
             # Note: Initial ICP set already created above (outside skip_bg_tasks check)
             icp_task = asyncio.create_task(icp_rotation_task())
             print("✅ ICP rotation task started (resets 12 AM ET daily)")
+
+            if os.getenv("ENABLE_FULFILLMENT", "false").lower() == "true" and _FULFILLMENT_ROUTER_AVAILABLE:
+                from gateway.fulfillment.lifecycle import fulfillment_lifecycle_task
+                fulfillment_task_handle = asyncio.create_task(fulfillment_lifecycle_task())
+                print("✅ Fulfillment lifecycle task started")
         
         # Start PCR0 builder for trustless verification
         from gateway.utils.pcr0_builder import start_pcr0_builder
@@ -327,7 +345,8 @@ async def lifespan(app: FastAPI):
             anchor_task,
             hourly_batch_task_handle,
             rate_limiter_task,
-            icp_task
+            icp_task,
+            fulfillment_task_handle,
         ]
         
         # Filter out None tasks (when DISABLE_BACKGROUND_TASKS=true)
@@ -434,6 +453,9 @@ app.include_router(weights.router)  # Weights submission for auditor validators
 
 # Lead Qualification Agent Competition API (Phase 10)
 app.include_router(qualification_router)
+
+if _FULFILLMENT_ROUTER_AVAILABLE:
+    app.include_router(fulfillment_router)
 
 # ============================================================
 # Health Check Endpoints

@@ -72,6 +72,9 @@ class PriorityMiddleware(BaseHTTPMiddleware):
             "/weights",                     # POST /weights/submit
             "/qualification/validator/",    # All qualification validator endpoints
             "/qualification/proxy",         # API proxy for model evaluation
+            "/fulfillment/score",           # Validator fulfillment scoring
+            "/fulfillment/scoring",         # Validator fetching reveals to score
+            "/fulfillment/ban",             # Validator fulfillment ban requests
         ]
         return any(vpath in path for vpath in validator_paths)
     
@@ -82,8 +85,11 @@ class PriorityMiddleware(BaseHTTPMiddleware):
     def _is_miner_request(self, path: str) -> bool:
         """Check if request is a sourcing miner submission (throttled)."""
         miner_paths = [
-            "/presign",     # POST /presign
-            "/submit",      # POST /submit
+            "/presign",                 # POST /presign
+            "/submit",                  # POST /submit
+            "/fulfillment/commit",      # Miner fulfillment commit
+            "/fulfillment/reveal",      # Miner fulfillment reveal
+            "/fulfillment/requests",    # Miner polling active requests
         ]
         return any(mpath in path for mpath in miner_paths)
     

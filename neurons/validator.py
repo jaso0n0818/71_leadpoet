@@ -1677,7 +1677,27 @@ class Validator(BaseValidatorNeuron):
             # ════════════════════════════════════════════════════════════
             # Block file is now updated inline in process_gateway_validation_workflow()
             # (No separate background thread needed - eliminates websocket concurrency)
-            
+
+            # ════════════════════════════════════════════════════════════
+            # LEAD FULFILLMENT SCORING (separate task, polls every 30s)
+            # Enable with: export ENABLE_FULFILLMENT=true
+            # ════════════════════════════════════════════════════════════
+            fulfillment_scoring_task = None
+            if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+                async def _fulfillment_scoring_loop():
+                    while not self.should_exit:
+                        try:
+                            await self.process_fulfillment_scoring()
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            bt.logging.warning(f"Fulfillment scoring error: {e}")
+                        await asyncio.sleep(30)
+
+                fulfillment_scoring_task = asyncio.create_task(
+                    _fulfillment_scoring_loop(), name="fulfillment_scoring")
+                bt.logging.info("✅ Fulfillment scoring task started (30s poll)")
+
             try:
                 # Keep the validator running and continuously process leads
                 while not self.should_exit:
@@ -1739,6 +1759,15 @@ class Validator(BaseValidatorNeuron):
                 # Continue running instead of crashing
                 await asyncio.sleep(10)  # Wait longer before retrying main loop
             finally:
+                # Stop fulfillment scoring task
+                if fulfillment_scoring_task is not None:
+                    fulfillment_scoring_task.cancel()
+                    try:
+                        await fulfillment_scoring_task
+                    except asyncio.CancelledError:
+                        pass
+                    bt.logging.info("✅ Fulfillment scoring task stopped")
+
                 # Stop block subscription
                 bt.logging.info("🛑 Stopping block subscription...")
                 stop_event.set()
@@ -3850,6 +3879,92 @@ class Validator(BaseValidatorNeuron):
 
         push_curation_result({"request_id": req["request_id"], "leads": leads})
         print(f"✅ Curated {len(leads)} leads for request {req['request_id']}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LEAD FULFILLMENT SCORING WORKFLOW
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def process_fulfillment_scoring(self):
+        """Score revealed fulfillment leads and submit scores to the gateway.
+
+        Gated by ENABLE_FULFILLMENT env var. Runs once per main loop iteration
+        with an overlap guard so only one scoring pass runs at a time.
+        """
+        if os.environ.get("ENABLE_FULFILLMENT", "false").lower() != "true":
+            return
+
+        if getattr(self, "_fulfillment_scoring_in_progress", False):
+            return
+        self._fulfillment_scoring_in_progress = True
+
+        try:
+            from Leadpoet.utils.cloud_db import (
+                gateway_get_fulfillment_reveals,
+                gateway_submit_fulfillment_scores,
+            )
+            from qualification.scoring.fulfillment_scorer import (
+                score_miner_submission,
+                deduplicate_across_miners,
+                format_scores_for_gateway,
+            )
+
+            data = gateway_get_fulfillment_reveals(self.wallet)
+            active_requests = data.get("requests", []) if isinstance(data, dict) else []
+
+            for req in active_requests:
+                request_id = req.get("request_id", "")
+                status = req.get("status", "")
+                if status != "scoring":
+                    continue
+
+                icp_details = req.get("icp", {})
+                submissions = req.get("submissions", [])
+                if not submissions:
+                    continue
+
+                bt.logging.info(
+                    f"Fulfillment: scoring {len(submissions)} submission(s) "
+                    f"for {request_id[:8]}..."
+                )
+
+                scored_all: dict = {}
+                for sub in submissions:
+                    miner_hk = sub.get("miner_hotkey", "")
+                    sub_id = sub.get("submission_id", "")
+                    leads_raw = sub.get("leads", [])
+                    lead_ids = sub.get("lead_ids", [])
+                    if not leads_raw:
+                        continue
+
+                    try:
+                        results = await score_miner_submission(leads_raw, icp_details)
+                        scored_all[miner_hk] = list(zip(leads_raw, results))
+
+                        scores_payload = format_scores_for_gateway(
+                            miner_hk, lead_ids, results,
+                            request_id=request_id,
+                            submission_id=sub_id,
+                        )
+                        gateway_submit_fulfillment_scores(
+                            self.wallet, request_id, scores_payload,
+                        )
+                        bt.logging.info(
+                            f"Submitted {len(scores_payload)} scores for "
+                            f"miner {miner_hk[:8]}... on request {request_id[:8]}..."
+                        )
+                    except Exception as e:
+                        bt.logging.error(
+                            f"Scoring failed for miner {miner_hk[:8]}: {e}"
+                        )
+
+        except ImportError as e:
+            if not getattr(self, "_fulfillment_import_warned", False):
+                bt.logging.warning(f"Fulfillment scoring imports unavailable: {e}")
+                self._fulfillment_import_warned = True
+        except Exception as e:
+            bt.logging.warning(f"Fulfillment scoring error: {e}")
+        finally:
+            self._fulfillment_scoring_in_progress = False
 
     # ═══════════════════════════════════════════════════════════════════════════
     # QUALIFICATION MODEL EVALUATION WORKFLOW

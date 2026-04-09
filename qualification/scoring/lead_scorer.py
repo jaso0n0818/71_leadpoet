@@ -269,7 +269,7 @@ async def score_lead(
 # ICP Fit Scoring
 # =============================================================================
 
-async def score_icp_fit(lead: LeadOutput, icp: ICPPrompt) -> float:
+async def score_icp_fit(lead: LeadOutput, icp: ICPPrompt, api_key: str = "") -> float:
     """
     Score how well the lead matches the ICP criteria.
     
@@ -334,7 +334,7 @@ Add the three sub-scores together (max 20).
 
 Respond with ONLY a single number (0-20):"""
 
-    response = await openrouter_chat(prompt, model="gpt-4o-mini")
+    response = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
     score = extract_score(response, max_score=MAX_ICP_FIT_SCORE)
     return score
 
@@ -343,7 +343,7 @@ Respond with ONLY a single number (0-20):"""
 # Decision Maker Scoring
 # =============================================================================
 
-async def score_decision_maker(lead: LeadOutput, icp: ICPPrompt) -> float:
+async def score_decision_maker(lead: LeadOutput, icp: ICPPrompt, api_key: str = "") -> float:
     """
     Score whether this person is a decision-maker for the product/service.
     
@@ -396,7 +396,7 @@ CRITICAL: A CEO always scores high on authority (9-10) but should score LOW on r
 
 Respond with ONLY a single number (0-20):"""
 
-    response = await openrouter_chat(prompt, model="gpt-4o-mini")
+    response = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
     score = extract_score(response, max_score=MAX_DECISION_MAKER_SCORE)
     return score
 
@@ -495,7 +495,7 @@ def _extract_domain(url: str) -> str:
         return url.lower().strip()
 
 
-async def score_intent_signal(lead: LeadOutput, icp: ICPPrompt) -> Tuple[float, float, float, int, bool]:
+async def score_intent_signal(lead: LeadOutput, icp: ICPPrompt, api_key: str = "") -> Tuple[float, float, float, int, bool]:
     """
     Score ALL intent signals submitted by the model.
     
@@ -536,7 +536,7 @@ async def score_intent_signal(lead: LeadOutput, icp: ICPPrompt) -> Tuple[float, 
         seen_domains.add(domain)
 
         score, confidence, date_status, content_found_date = await _score_single_intent_signal(
-            signal, icp, icp_criteria, lead.business, lead.company_website
+            signal, icp, icp_criteria, lead.business, lead.company_website, api_key=api_key
         )
         source_str = (signal.source.value if hasattr(signal.source, 'value') else str(signal.source))
         after_decay, decay_mult = _apply_signal_time_decay(
@@ -598,7 +598,8 @@ async def _score_single_intent_signal(
     icp: ICPPrompt,
     icp_criteria: Optional[str],
     company_name: str,
-    company_website: str = ""
+    company_website: str = "",
+    api_key: str = "",
 ) -> Tuple[float, int, str, Optional[str]]:
     """
     Verify and score a single intent signal.
@@ -612,7 +613,8 @@ async def _score_single_intent_signal(
         icp_industry=icp.industry,
         icp_criteria=icp_criteria,
         company_name=company_name,
-        company_website=company_website
+        company_website=company_website,
+        api_key=api_key,
     )
     
     if not verified:
@@ -668,7 +670,7 @@ Consider:
 
 Respond with ONLY a single number (0-60):"""
 
-    response = await openrouter_chat(prompt, model="gpt-4o-mini")
+    response = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
     raw_score = extract_score(response, max_score=MAX_INTENT_SIGNAL_SCORE)
     
     # Apply source-dependent date requirements
