@@ -605,83 +605,102 @@ def check_date_precision(claimed_date: str, content: str) -> str:
     return "no_match"
 
 
-def extract_most_recent_date_from_content(content: str) -> Optional[str]:
+def _scan_dates_in_text(text: str, text_lower: str) -> list:
     """
-    Extract the most recent date found in content (already stripped of boilerplate).
-
-    Used to detect date omission: when a model submits date=null but the content
-    clearly contains dates, the model may be hiding the date to avoid time decay.
-
-    Returns:
-        ISO date string (YYYY-MM-DD) of the most recent date found, or None
+    Scan a text fragment for dates in common formats.
+    Returns a list of datetime.date objects found.
     """
     from datetime import date as _date
 
-    content_lower = content.lower()
     today = _date.today()
-    found_dates: list = []
+    found: list = []
 
-    # ISO dates: 2025-01-15
-    for m in re.finditer(r'(\d{4})-(\d{2})-(\d{2})', content):
+    for m in re.finditer(r'(\d{4})-(\d{2})-(\d{2})', text):
         try:
             dt = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             if _date(2020, 1, 1) <= dt <= today:
-                found_dates.append(dt)
+                found.append(dt)
         except ValueError:
             pass
 
-    # "January 15, 2025" / "Jan 15, 2025" / "15 January 2025"
     for month_num, (full_name, abbrev) in _MONTH_NAMES.items():
         for name in (full_name, abbrev):
-            for m in re.finditer(rf'\b{name}\s+(\d{{1,2}})\b[,]?\s*(\d{{4}})', content_lower):
+            for m in re.finditer(rf'\b{name}\s+(\d{{1,2}})\b[,]?\s*(\d{{4}})', text_lower):
                 try:
                     dt = _date(int(m.group(2)), month_num, int(m.group(1)))
                     if _date(2020, 1, 1) <= dt <= today:
-                        found_dates.append(dt)
+                        found.append(dt)
                 except ValueError:
                     pass
-            for m in re.finditer(rf'\b(\d{{1,2}})\s+{name}\b[,]?\s*(\d{{4}})', content_lower):
+            for m in re.finditer(rf'\b(\d{{1,2}})\s+{name}\b[,]?\s*(\d{{4}})', text_lower):
                 try:
                     dt = _date(int(m.group(2)), month_num, int(m.group(1)))
                     if _date(2020, 1, 1) <= dt <= today:
-                        found_dates.append(dt)
+                        found.append(dt)
                 except ValueError:
                     pass
 
-    # JSON-LD / schema.org: "datePublished":"2025-01-15"
-    for m in re.finditer(r'date\w*["\']?\s*[:=]\s*["\']?(\d{4}-\d{2}-\d{2})', content_lower):
+    for m in re.finditer(r'date\w*["\']?\s*[:=]\s*["\']?(\d{4}-\d{2}-\d{2})', text_lower):
         try:
             dt = _date.fromisoformat(m.group(1))
             if _date(2020, 1, 1) <= dt <= today:
-                found_dates.append(dt)
+                found.append(dt)
         except ValueError:
             pass
 
-    # MM/DD/YYYY
-    for m in re.finditer(r'(\d{2})/(\d{2})/(\d{4})', content):
+    for m in re.finditer(r'(\d{2})/(\d{2})/(\d{4})', text):
         try:
             dt = _date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
             if _date(2020, 1, 1) <= dt <= today:
-                found_dates.append(dt)
+                found.append(dt)
         except ValueError:
             pass
 
-    # Month Year (approximate — use 1st of month)
     for month_num, (full_name, abbrev) in _MONTH_NAMES.items():
         for name in (full_name, abbrev):
-            for m in re.finditer(rf'\b{name}\s+(\d{{4}})\b', content_lower):
+            for m in re.finditer(rf'\b{name}\s+(\d{{4}})\b', text_lower):
                 try:
                     yr = int(m.group(1))
                     if 2020 <= yr <= today.year:
-                        found_dates.append(_date(yr, month_num, 1))
+                        found.append(_date(yr, month_num, 1))
                 except ValueError:
                     pass
 
-    if not found_dates:
-        return None
+    return found
 
-    most_recent = max(found_dates)
-    return most_recent.isoformat()
+
+# Articles, blog posts, and press releases almost always place their
+# publication date within the first ~2500 characters of visible text.
+# "Related posts", sidebar dates, and footer dates appear much later.
+_HEADER_ZONE_CHARS = 2500
+
+
+def extract_most_recent_date_from_content(content: str) -> Optional[str]:
+    """
+    Extract the most relevant date from content (already stripped of boilerplate).
+
+    Uses a two-tiered strategy:
+      1. HEADER ZONE (first ~2500 chars): articles/posts put their pub date here.
+         If dates are found in the header zone, return the most recent one.
+      2. FULL CONTENT fallback: if the header zone has no dates (e.g. Wikipedia
+         intros, evergreen pages), scan the full text and return the most recent.
+
+    This prevents "Related posts" sidebar dates from overshadowing the article's
+    own publication date.
+
+    Returns:
+        ISO date string (YYYY-MM-DD) of the best date found, or None
+    """
+    header = content[:_HEADER_ZONE_CHARS]
+    header_dates = _scan_dates_in_text(header, header.lower())
+    if header_dates:
+        return max(header_dates).isoformat()
+
+    all_dates = _scan_dates_in_text(content, content.lower())
+    if all_dates:
+        return max(all_dates).isoformat()
+
+    return None
 
 
 # =============================================================================
