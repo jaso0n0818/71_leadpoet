@@ -104,7 +104,7 @@ def _tier1_check(
     """
     Return failure_reason string if the lead fails any ICP check, else None.
     """
-    if lead.industry != icp.industry:
+    if icp.industry and lead.industry != icp.industry:
         return "industry_mismatch"
 
     if icp.sub_industry and lead.sub_industry != icp.sub_industry:
@@ -112,6 +112,9 @@ def _tier1_check(
 
     if icp.target_role_types and lead.role_type not in icp.target_role_types:
         return "role_type_mismatch"
+
+    if icp.target_roles and lead.role not in icp.target_roles:
+        return "role_mismatch"
 
     if icp.target_seniority:
         try:
@@ -121,8 +124,8 @@ def _tier1_check(
         except Exception:
             return "seniority_mismatch"
 
-    if icp.country and lead.country:
-        if _normalize_country(lead.country) != _normalize_country(icp.country):
+    if icp.country and lead.company_hq_country:
+        if _normalize_country(lead.company_hq_country) != _normalize_country(icp.country):
             return "country_mismatch"
 
     if icp.employee_count and lead.employee_count:

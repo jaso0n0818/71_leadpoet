@@ -49,7 +49,7 @@ class FulfillmentICP(BaseModel):
 
     icp_id: str = Field(default="")
     prompt: str = Field(..., min_length=1)
-    industry: str
+    industry: str = ""
     sub_industry: str = ""
     target_role_types: List[str] = Field(default_factory=list)
     target_roles: List[str] = Field(default_factory=list)
@@ -67,6 +67,8 @@ class FulfillmentICP(BaseModel):
     @field_validator("industry")
     @classmethod
     def validate_industry(cls, v: str) -> str:
+        if not v:
+            return v
         if v not in VALID_INDUSTRIES:
             raise ValueError(f"Industry '{v}' not in taxonomy. Valid: {sorted(VALID_INDUSTRIES)}")
         return v
@@ -132,31 +134,40 @@ class FulfillmentICP(BaseModel):
 # ---------------------------------------------------------------------------
 
 class FulfillmentLead(BaseModel):
-    """Lead schema with PII — used in fulfillment commit-reveal."""
+    """Lead schema with PII — used in fulfillment commit-reveal.
+
+    All fields are required except ``phone``.  Miners that submit
+    sparse leads will be rejected at parse time rather than silently
+    scoring zero.
+    """
 
     # PII fields (included in hash, stripped by to_lead_output)
-    full_name: str = ""
-    email: str = ""
-    linkedin_url: str = ""
+    full_name: str
+    email: str
+    linkedin_url: str
     phone: str = ""
 
     # Company info
     business: str
-    company_linkedin: str = ""
-    company_website: str = ""
-    employee_count: str = ""
+    company_linkedin: str
+    company_website: str
+    employee_count: str
+
+    # Company HQ location (used for ICP country/state matching)
+    company_hq_country: str
+    company_hq_state: str
 
     # Industry
     industry: str
-    sub_industry: str = ""
+    sub_industry: str
 
-    # Location
-    country: str = ""
-    city: str = ""
-    state: str = ""
+    # Contact location
+    country: str
+    city: str
+    state: str
 
     # Role
-    role: str = ""
+    role: str
     role_type: str
     seniority: str
 
@@ -173,10 +184,8 @@ class FulfillmentLead(BaseModel):
     @field_validator("sub_industry")
     @classmethod
     def validate_sub_industry(cls, v: str) -> str:
-        if not v:
-            return v
         if v not in VALID_SUB_INDUSTRIES:
-            raise ValueError(f"Sub-industry '{v}' not in taxonomy")
+            raise ValueError(f"Sub-industry '{v}' not in taxonomy. Valid: {sorted(VALID_SUB_INDUSTRIES)}")
         return v
 
     @field_validator("role_type")
@@ -187,7 +196,12 @@ class FulfillmentLead(BaseModel):
         return v
 
     def to_lead_output(self) -> LeadOutput:
-        """Strip PII and convert to LeadOutput for scoring functions."""
+        """Strip PII and convert to LeadOutput for scoring functions.
+
+        LeadOutput's country/state are company-level fields, so we map
+        from the HQ fields here (contact-level country/state stay on
+        the FulfillmentLead only).
+        """
         seniority_value = self.seniority
         seniority_map = {"Senior": "Manager"}
         if seniority_value in seniority_map:
@@ -201,9 +215,9 @@ class FulfillmentLead(BaseModel):
             employee_count=self.employee_count,
             industry=self.industry,
             sub_industry=self.sub_industry,
-            country=self.country,
+            country=self.company_hq_country,
             city=self.city,
-            state=self.state,
+            state=self.company_hq_state,
             role=self.role,
             role_type=self.role_type,
             seniority=seniority_value,
