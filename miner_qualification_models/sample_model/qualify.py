@@ -666,7 +666,7 @@ if __name__ == "__main__":
     
     test_config = {
         "SUPABASE_URL": "https://qplwoislplkcegvdmbim.supabase.co",
-        "SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8",
+        "SUPABASE_ANON_KEY": "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf",
         "QUALIFICATION_LEADS_TABLE": "test_leads_for_miners",
         "PROXY_URL": "http://localhost:8001",
     }

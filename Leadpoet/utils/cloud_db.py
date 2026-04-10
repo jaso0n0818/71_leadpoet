@@ -31,7 +31,7 @@ NETWORK   = os.getenv("SUBTENSOR_NETWORK", "finney")  # Default to mainnet
 # Miners can use these to query the transparency log for duplicate checks.
 # ============================================================
 SUPABASE_URL = "https://qplwoislplkcegvdmbim.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8"
+SUPABASE_ANON_KEY = "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf"
 
 # Create a response object similar to what supabase-py returns
 class RPCResponse:

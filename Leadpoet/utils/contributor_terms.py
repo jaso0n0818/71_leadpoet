@@ -266,7 +266,7 @@ def sync_attestation_to_supabase(attestation_data: dict, token_manager=None) -> 
         import os
         
         SUPABASE_URL = "https://qplwoislplkcegvdmbim.supabase.co"
-        SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8")
+        SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf")
         
         # Create CustomSupabaseClient with JWT token (uses direct HTTP requests with proper auth)
         supabase = CustomSupabaseClient(SUPABASE_URL, jwt_token, SUPABASE_ANON_KEY)

@@ -952,7 +952,7 @@ if __name__ == "__main__":
         supabase_url = os.getenv("SUPABASE_URL", "https://qplwoislplkcegvdmbim.supabase.co")
         supabase_anon_key = os.getenv(
             "SUPABASE_ANON_KEY", 
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8"
+            "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf"
         )
         os.environ["SUPABASE_URL"] = supabase_url
         os.environ["SUPABASE_ANON_KEY"] = supabase_anon_key

@@ -5183,7 +5183,7 @@ class Validator(BaseValidatorNeuron):
             
             # Public Supabase credentials (same as in cloud_db.py)
             SUPABASE_URL = "https://qplwoislplkcegvdmbim.supabase.co"
-            SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8"
+            SUPABASE_ANON_KEY = "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf"
             
             # Create client with ANON key for public read access
             supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -5212,7 +5212,7 @@ class Validator(BaseValidatorNeuron):
             from supabase import create_client
 
             SUPABASE_URL = "https://qplwoislplkcegvdmbim.supabase.co"
-            SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8"
+            SUPABASE_ANON_KEY = "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf"
 
             supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 

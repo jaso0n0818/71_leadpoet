@@ -309,7 +309,7 @@ class TokenManager:
             }
             
             # Include Supabase anon key for Edge Function authentication
-            anon_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwbHdvaXNscGxrY2VndmRtYmltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ4NDcwMDUsImV4cCI6MjA2MDQyMzAwNX0.5E0WjAthYDXaCWY6qjzXm2k20EhadWfigak9hleKZk8"
+            anon_key = "sb_publishable_YU7GBMSX-fwEsSH7MnhSBQ_l5ACuFVf"
             
             print(f"📤 Requesting new JWT token for {self.hotkey[:10]}...")
             bt.logging.info(f"📤 Requesting new JWT token for {self.hotkey[:10]}...")
