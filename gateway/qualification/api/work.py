@@ -370,6 +370,9 @@ async def request_batch_evaluation(request: BatchEvaluationRequest):
         f"max_models={max_models}, epoch={request.epoch or 'N/A'}"
     )
     
+    # Reset any stale evaluations back to submitted before querying
+    await _reset_stale_evaluations()
+    
     # Get pending models from database (FIFO order)
     work_items = await get_pending_models_from_db(limit=max_models)
     
@@ -377,7 +380,11 @@ async def request_batch_evaluation(request: BatchEvaluationRequest):
         logger.debug("No pending models in queue")
         return BatchEvaluationResponse(has_work=False, models=[], queue_depth=0)
     
-    # Track assigned work
+    # Mark models as "evaluating" in DB to prevent double-assignment
+    model_ids = [work["model_id"] for work in work_items]
+    await _mark_models_evaluating(model_ids)
+    
+    # Track assigned work in memory
     for work in work_items:
         eval_id = work["evaluation_id"]
         _assigned_work[eval_id] = request.session_id
@@ -1025,6 +1032,62 @@ async def get_next_work() -> Optional[Dict[str, Any]]:
         return pending[0]
     
     return None
+
+
+async def _mark_models_evaluating(model_ids: List[str]) -> None:
+    """
+    Set status to 'evaluating' for the given model IDs in the database.
+    Prevents other batch requests from picking up the same models.
+    Also sets updated_at so stale detection knows when evaluation started.
+    """
+    if not model_ids:
+        return
+    try:
+        from gateway.db.client import get_write_client
+        supabase = get_write_client()
+        now = datetime.now(timezone.utc).isoformat()
+        for model_id in model_ids:
+            supabase.table("qualification_models").update({
+                "status": "evaluating",
+                "updated_at": now,
+            }).eq("id", model_id).eq("status", "submitted").execute()
+        logger.info(f"🔒 Marked {len(model_ids)} models as 'evaluating'")
+    except Exception as e:
+        logger.error(f"Failed to mark models as evaluating: {e}")
+
+
+async def _reset_stale_evaluations() -> None:
+    """
+    Reset models stuck in 'evaluating' status back to 'submitted'.
+    
+    A model can get stuck in 'evaluating' if the validator crashes or times out
+    before reporting results. Uses updated_at (set when status changed to
+    'evaluating') to detect staleness. Threshold is TOTAL_EVALUATION_TIMEOUT_MINUTES
+    (default 180 min / 3 hours).
+    """
+    try:
+        from gateway.db.client import get_write_client
+        supabase = get_write_client()
+        
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CONFIG.TOTAL_EVALUATION_TIMEOUT_MINUTES)).isoformat()
+        
+        result = supabase.table("qualification_models").update({
+            "status": "submitted"
+        }).eq(
+            "status", "evaluating"
+        ).lt(
+            "updated_at", cutoff
+        ).is_(
+            "evaluated_at", "null"
+        ).execute()
+        
+        if result.data:
+            logger.warning(
+                f"♻️ Reset {len(result.data)} stale 'evaluating' models back to 'submitted' "
+                f"(stuck longer than {CONFIG.TOTAL_EVALUATION_TIMEOUT_MINUTES} min)"
+            )
+    except Exception as e:
+        logger.error(f"Failed to reset stale evaluations: {e}")
 
 
 async def get_pending_models_from_db(limit: int = None) -> List[Dict[str, Any]]:
