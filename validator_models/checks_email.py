@@ -780,6 +780,8 @@ async def poll_truelist_batch(batch_id: str) -> Dict[str, dict]:
 
     start_time = time.time()
     poll_count = 0
+    consecutive_404s = 0
+    MAX_CONSECUTIVE_404s = 3
 
     print(f"\n⏳ TrueList Batch: Polling for completion...")
     print(f"   🆔 Batch ID: {batch_id}")
@@ -807,7 +809,12 @@ async def poll_truelist_batch(batch_id: str) -> Dict[str, dict]:
                 ) as response:
 
                     if response.status == 404:
-                        raise EmailVerificationUnavailableError(f"TrueList batch not found: {batch_id}")
+                        consecutive_404s += 1
+                        if consecutive_404s >= MAX_CONSECUTIVE_404s:
+                            raise EmailVerificationUnavailableError(f"TrueList batch not found: {batch_id} ({consecutive_404s} consecutive 404s)")
+                        print(f"   ⚠️  Poll #{poll_count}: Transient 404 ({consecutive_404s}/{MAX_CONSECUTIVE_404s}), retrying in {TRUELIST_BATCH_POLL_INTERVAL}s...")
+                        await asyncio.sleep(TRUELIST_BATCH_POLL_INTERVAL)
+                        continue
                     elif response.status == 401:
                         raise EmailVerificationUnavailableError("TrueList API: Invalid or expired API key")
                     elif response.status >= 500:
@@ -822,6 +829,7 @@ async def poll_truelist_batch(batch_id: str) -> Dict[str, dict]:
                         )
 
                     # Success (HTTP 200) - parse JSON response
+                    consecutive_404s = 0
                     data = await response.json()
 
                     batch_state = data.get("batch_state", "unknown")
