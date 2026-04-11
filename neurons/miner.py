@@ -805,63 +805,64 @@ class Miner(BaseMinerNeuron):
         num_leads: int,
         miner_hotkey: str,
     ) -> list:
-        """Source and structure leads matching a fulfillment ICP."""
+        """Source leads matching a fulfillment ICP using the fulfillment sourcer.
+
+        Uses ScrapingDog + OpenRouter to discover real companies, find real
+        decision-makers, and mine verifiable intent signals from the web.
+        Falls back to the legacy get_leads pipeline if the sourcer fails.
+        """
         from gateway.fulfillment.models import FulfillmentLead, IntentSignal
 
-        industry = icp.get("industry", None)
-        region = icp.get("geography", None) or icp.get("country", None)
+        try:
+            from miner_models.fulfillment_sourcer import source_fulfillment_leads
+            raw_leads = await source_fulfillment_leads(icp, num_leads=num_leads)
+        except Exception as e:
+            bt.logging.error(f"Fulfillment sourcer failed: {e}")
+            raw_leads = []
 
-        raw_leads = await get_leads(num_leads * 3, industry=industry, region=region)
-        validated = await self.process_generated_leads(raw_leads)
-        sanitized = [sanitize_prospect(p, miner_hotkey) for p in validated]
-
-        # Rank with ICP description for intent scoring
-        prompt = icp.get("prompt", "")
-        if prompt and sanitized:
-            sanitized = await rank_leads(sanitized, description=prompt)
-
-        sanitized = sanitized[:num_leads]
+        if not raw_leads:
+            bt.logging.warning(f"No leads sourced for {icp.get('industry', '?')}")
+            return []
 
         fulfillment_leads = []
-        for lead in sanitized:
+        for lead_dict in raw_leads:
             try:
                 signals = []
-                for sig_text in icp.get("intent_signals", []):
+                for sig in lead_dict.get("intent_signals", []):
                     signals.append(IntentSignal(
-                        signal=sig_text,
-                        source="miner_sourced",
-                        url=lead.get("website", ""),
-                        date="",
+                        source=sig.get("source", "other"),
+                        description=sig.get("description", ""),
+                        url=sig.get("url", ""),
+                        date=sig.get("date"),
+                        snippet=sig.get("snippet", "")[:1000],
                     ))
                 if not signals:
-                    signals.append(IntentSignal(
-                        signal="general_interest",
-                        source="miner_sourced",
-                        url=lead.get("website", ""),
-                        date="",
-                    ))
+                    bt.logging.warning(f"Skipping lead {lead_dict.get('full_name')} — no intent signals")
+                    continue
 
                 fl = FulfillmentLead(
-                    full_name=lead.get("full_name", ""),
-                    email=lead.get("email", ""),
-                    linkedin_url=lead.get("linkedin", ""),
-                    phone="",
-                    business=lead.get("business", "Unknown"),
-                    company_linkedin=lead.get("company_linkedin", ""),
-                    company_website=lead.get("website", ""),
-                    employee_count=lead.get("employee_count", ""),
-                    industry=icp.get("industry", lead.get("industry", "")),
-                    sub_industry=icp.get("sub_industry", lead.get("sub_industry", "")),
-                    country=lead.get("country", ""),
-                    city=lead.get("city", ""),
-                    state=lead.get("state", ""),
-                    role=lead.get("role", ""),
-                    role_type=icp.get("target_role_types", ["Other"])[0]
-                        if icp.get("target_role_types") else "Other",
-                    seniority=icp.get("target_seniority", "Manager") or "Manager",
+                    full_name=lead_dict.get("full_name", ""),
+                    email=lead_dict.get("email", ""),
+                    linkedin_url=lead_dict.get("linkedin_url", ""),
+                    phone=lead_dict.get("phone", ""),
+                    business=lead_dict.get("business", ""),
+                    company_linkedin=lead_dict.get("company_linkedin", ""),
+                    company_website=lead_dict.get("company_website", ""),
+                    employee_count=lead_dict.get("employee_count", ""),
+                    company_hq_country=lead_dict.get("company_hq_country", ""),
+                    company_hq_state=lead_dict.get("company_hq_state", ""),
+                    industry=lead_dict.get("industry", ""),
+                    sub_industry=lead_dict.get("sub_industry", ""),
+                    country=lead_dict.get("country", ""),
+                    city=lead_dict.get("city", ""),
+                    state=lead_dict.get("state", ""),
+                    role=lead_dict.get("role", ""),
+                    role_type=lead_dict.get("role_type", "Sales"),
+                    seniority=lead_dict.get("seniority", "VP"),
                     intent_signals=signals,
                 )
                 fulfillment_leads.append(fl)
+                bt.logging.info(f"✅ Built FulfillmentLead: {fl.full_name} @ {fl.business}")
             except Exception as e:
                 bt.logging.warning(f"Skipping lead — validation error: {e}")
                 continue
