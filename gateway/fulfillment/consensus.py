@@ -55,6 +55,42 @@ def _group_scores_by_lead(scores: List[dict]) -> Dict[tuple, List[dict]]:
     return groups
 
 
+def _build_consensus_row(
+    request_id: str,
+    submission_id: str,
+    miner_hotkey: str,
+    lead_id: str,
+    weighted_scores: List[dict],
+    *,
+    tier2_passed: bool,
+    intent_final: float = 0.0,
+    final_score: float = 0.0,
+    rep_score: float = 0.0,
+) -> dict:
+    """Build a single consensus result row with verification fields."""
+    total_weight = sum(ws["weight"] for ws in weighted_scores)
+
+    def _weighted_majority(field: str) -> bool:
+        w = sum(ws["weight"] for ws in weighted_scores if ws.get(field))
+        return w / total_weight > 0.5 if total_weight else False
+
+    return {
+        "request_id": request_id,
+        "submission_id": submission_id,
+        "miner_hotkey": miner_hotkey,
+        "lead_id": lead_id,
+        "num_validators": len(weighted_scores),
+        "consensus_intent_signal_final": round(intent_final, 4),
+        "consensus_final_score": round(final_score, 4),
+        "consensus_tier2_passed": tier2_passed,
+        "consensus_email_verified": _weighted_majority("email_verified"),
+        "consensus_person_verified": _weighted_majority("person_verified"),
+        "consensus_company_verified": _weighted_majority("company_verified"),
+        "consensus_rep_score": round(rep_score, 2),
+        "any_fabricated": any(ws.get("all_fabricated") for ws in weighted_scores),
+    }
+
+
 async def compute_fulfillment_consensus(request_id: str) -> List[dict]:
     """
     Compute v_trust x stake weighted consensus for all leads in a request.
@@ -94,17 +130,10 @@ async def compute_fulfillment_consensus(request_id: str) -> List[dict]:
 
         # Tier 1: unanimous hard-gate
         if any(not ws.get("tier1_passed") for ws in weighted_scores):
-            consensus_results.append({
-                "request_id": request_id,
-                "submission_id": submission_id,
-                "miner_hotkey": miner_hotkey,
-                "lead_id": lead_id,
-                "num_validators": len(weighted_scores),
-                "consensus_intent_signal_final": 0.0,
-                "consensus_final_score": 0.0,
-                "consensus_tier2_passed": False,
-                "any_fabricated": any(ws.get("all_fabricated") for ws in weighted_scores),
-            })
+            consensus_results.append(_build_consensus_row(
+                request_id, submission_id, miner_hotkey, lead_id,
+                weighted_scores, tier2_passed=False,
+            ))
             continue
 
         # Tier 2: stake-weighted gate
@@ -113,17 +142,10 @@ async def compute_fulfillment_consensus(request_id: str) -> List[dict]:
         ) / total_weight
 
         if weighted_tier2_pass <= 0.5:
-            consensus_results.append({
-                "request_id": request_id,
-                "submission_id": submission_id,
-                "miner_hotkey": miner_hotkey,
-                "lead_id": lead_id,
-                "num_validators": len(weighted_scores),
-                "consensus_intent_signal_final": 0.0,
-                "consensus_final_score": 0.0,
-                "consensus_tier2_passed": False,
-                "any_fabricated": any(ws.get("all_fabricated") for ws in weighted_scores),
-            })
+            consensus_results.append(_build_consensus_row(
+                request_id, submission_id, miner_hotkey, lead_id,
+                weighted_scores, tier2_passed=False,
+            ))
             continue
 
         # Tier 3: stake-weighted scoring
@@ -140,16 +162,17 @@ async def compute_fulfillment_consensus(request_id: str) -> List[dict]:
             for ws in passing_scores
         ) / passing_weight
 
-        consensus_results.append({
-            "request_id": request_id,
-            "submission_id": submission_id,
-            "miner_hotkey": miner_hotkey,
-            "lead_id": lead_id,
-            "num_validators": len(weighted_scores),
-            "consensus_intent_signal_final": round(consensus_intent, 4),
-            "consensus_final_score": round(consensus_final, 4),
-            "consensus_tier2_passed": True,
-            "any_fabricated": any(ws.get("all_fabricated") for ws in weighted_scores),
-        })
+        consensus_rep = sum(
+            float(ws.get("rep_score", 0) or 0) * ws["weight"]
+            for ws in passing_scores
+        ) / passing_weight
+
+        consensus_results.append(_build_consensus_row(
+            request_id, submission_id, miner_hotkey, lead_id,
+            weighted_scores, tier2_passed=True,
+            intent_final=consensus_intent,
+            final_score=consensus_final,
+            rep_score=consensus_rep,
+        ))
 
     return consensus_results

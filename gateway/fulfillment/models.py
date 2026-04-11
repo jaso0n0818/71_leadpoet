@@ -224,6 +224,24 @@ class FulfillmentLead(BaseModel):
             intent_signals=self.intent_signals,
         )
 
+    def to_validator_dict(self) -> dict:
+        """Convert to dict with keys expected by validator_models check functions.
+
+        The validator extraction utilities (get_website, get_linkedin,
+        get_first_name, get_last_name, etc.) expect specific key names
+        that differ from FulfillmentLead fields.  The returned dict is
+        intentionally mutable — Stage 0-2 checks add fields like
+        ``domain_age_days``, ``has_mx``, etc. in-place, and Stage 4-5
+        reads them back.
+        """
+        d = self.model_dump(exclude={"intent_signals"})
+        d["website"] = self.company_website
+        d["linkedin"] = self.linkedin_url
+        parts = self.full_name.strip().split(None, 1)
+        d["first"] = parts[0] if parts else ""
+        d["last"] = parts[1] if len(parts) > 1 else ""
+        return d
+
 
 # ---------------------------------------------------------------------------
 # Commit / Reveal request models
@@ -271,6 +289,10 @@ class FulfillmentScoreResult(BaseModel):
     lead_id: str = ""
     tier1_passed: bool = False
     tier2_passed: bool = False
+    email_verified: bool = False
+    person_verified: bool = False
+    company_verified: bool = False
+    rep_score: float = 0.0
     intent_signal_raw: float = 0.0
     intent_signal_final: float = 0.0
     intent_decay_multiplier: float = 0.0

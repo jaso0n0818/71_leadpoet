@@ -2,13 +2,14 @@
 Fulfillment scoring pipeline: three-tier gate-then-score architecture.
 
 Tier 1: ICP Fit Gate ($0 — free exact-match checks)
-Tier 2: Data Accuracy Gate ($low — external API calls, no LLM)
+Tier 2: Data Accuracy Gate (Stage 0-2 + Stage 3 email + Stage 4 person + Stage 5 company)
 Tier 3: Intent Scoring ($moderate — LLM calls, peak-weighted aggregation)
 """
 
+import asyncio
 import logging
 import re
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from gateway.fulfillment.config import (
     get_fulfillment_api_key,
@@ -156,32 +157,63 @@ async def score_fulfillment_lead(
     lead: FulfillmentLead,
     icp: FulfillmentICP,
     seen_companies: Set[str],
-    email_results: Optional[dict] = None,
+    email_result: Optional[dict] = None,
 ) -> FulfillmentScoreResult:
-    """Score a single fulfillment lead through the three-tier pipeline."""
+    """Score a single fulfillment lead through the full verification + scoring pipeline.
+
+    Pipeline order:
+      Tier 1  – ICP fit (free, deterministic)
+      Tier 2  – Stage 0-2 data accuracy (DNS, DNSBL, basic checks)
+              – Stage 3   email verification (TrueList result)
+              – Stage 4   person verification (LinkedIn/GSE)
+              – Stage 5   company verification + rep score
+      Tier 3  – Intent scoring (LLM, peak-weighted aggregation)
+    """
     lead_output = lead.to_lead_output()
     icp_prompt = icp.to_icp_prompt()
 
-    # --- Tier 1 ---
+    # --- Tier 1: ICP Fit ---
     t1_failure = _tier1_check(lead, lead_output, icp, seen_companies)
     if t1_failure:
         return FulfillmentScoreResult(
-            tier1_passed=False, tier2_passed=False,
+            tier1_passed=False,
             failure_reason=t1_failure,
         )
 
-    # --- Tier 2 (data accuracy) ---
-    try:
-        t2_failure = await _run_tier2(lead, email_results)
-        if t2_failure:
-            return FulfillmentScoreResult(
-                tier1_passed=True, tier2_passed=False,
-                failure_reason=t2_failure,
-            )
-    except Exception as e:
-        logger.warning(f"Tier 2 error (soft pass): {e}")
+    # Build a mutable dict that validator check functions can annotate in-place
+    # (they add domain_age_days, has_mx, gse_search_count, etc.)
+    validator_dict = lead.to_validator_dict()
 
-    # --- Tier 3 (intent scoring) ---
+    # --- Tier 2a: Stage 0-2 data accuracy ---
+    t2_failure, stage0_2_data = await _run_fulfillment_stage0_2(validator_dict)
+    if t2_failure:
+        return FulfillmentScoreResult(
+            tier1_passed=True, tier2_passed=False,
+            failure_reason=t2_failure,
+        )
+
+    # --- Tier 2b: Stage 3+4+5 verification ---
+    verif_failure, verif_data = await _run_verification_stages(
+        validator_dict, email_result, stage0_2_data,
+    )
+
+    email_verified = verif_data.get("stage_3_email", {}).get("email_status") == "valid"
+    person_verified = verif_data.get("stage_4_linkedin", {}).get("linkedin_verified", False)
+    stage5 = verif_data.get("stage_5_verification", {})
+    company_verified = stage5.get("role_verified", False) and stage5.get("industry_verified", False)
+    rep_score_val = float(verif_data.get("rep_score", {}).get("total_score", 0))
+
+    if verif_failure:
+        return FulfillmentScoreResult(
+            tier1_passed=True, tier2_passed=True,
+            email_verified=email_verified,
+            person_verified=person_verified,
+            company_verified=company_verified,
+            rep_score=rep_score_val,
+            failure_reason=verif_failure,
+        )
+
+    # --- Tier 3: Intent Scoring ---
     api_key = get_fulfillment_api_key()
     from qualification.scoring.lead_scorer import (
         _score_single_intent_signal,
@@ -227,25 +259,29 @@ async def score_fulfillment_lead(
 
     all_fabricated = bool(signal_results) and all(r["confidence"] == 0 for r in signal_results)
 
+    shared_fields = dict(
+        tier1_passed=True,
+        tier2_passed=True,
+        email_verified=email_verified,
+        person_verified=person_verified,
+        company_verified=company_verified,
+        rep_score=rep_score_val,
+        intent_signal_raw=max(after_decay_scores) if after_decay_scores else 0.0,
+        intent_signal_final=intent_signal_final,
+        intent_decay_multiplier=_avg([r["decay_mult"] for r in signal_results]),
+        all_fabricated=all_fabricated,
+    )
+
     if intent_signal_final < FULFILLMENT_MIN_INTENT_SCORE:
         return FulfillmentScoreResult(
-            tier1_passed=True, tier2_passed=True,
-            intent_signal_raw=max(after_decay_scores) if after_decay_scores else 0.0,
-            intent_signal_final=intent_signal_final,
-            intent_decay_multiplier=_avg([r["decay_mult"] for r in signal_results]),
+            **shared_fields,
             final_score=0.0,
-            all_fabricated=all_fabricated,
             failure_reason="insufficient_intent",
         )
 
     return FulfillmentScoreResult(
-        tier1_passed=True,
-        tier2_passed=True,
-        intent_signal_raw=max(after_decay_scores) if after_decay_scores else 0.0,
-        intent_signal_final=intent_signal_final,
-        intent_decay_multiplier=_avg([r["decay_mult"] for r in signal_results]),
+        **shared_fields,
         final_score=intent_signal_final,
-        all_fabricated=all_fabricated,
     )
 
 
@@ -253,12 +289,18 @@ async def score_fulfillment_batch(
     leads: List[FulfillmentLead],
     icp: FulfillmentICP,
 ) -> List[FulfillmentScoreResult]:
-    """Score a batch of fulfillment leads with cross-lead dedup and batch email verification."""
+    """Score a batch of fulfillment leads with batch email verification."""
     seen_companies: Set[str] = set()
-    results: List[FulfillmentScoreResult] = []
 
+    # Run batch email verification up-front so individual leads get results
+    email_results_map = await _run_batch_email_verification(leads)
+
+    results: List[FulfillmentScoreResult] = []
     for lead in leads:
-        result = await score_fulfillment_lead(lead, icp, seen_companies)
+        per_lead = email_results_map.get(lead.email.lower())
+        result = await score_fulfillment_lead(
+            lead, icp, seen_companies, email_result=per_lead,
+        )
         results.append(result)
 
     # Structural similarity detection on leads that passed all tiers
@@ -292,27 +334,205 @@ async def score_fulfillment_batch(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-async def _run_tier2(lead: FulfillmentLead, email_results: Optional[dict] = None) -> Optional[str]:
-    """
-    Run Tier 2 data accuracy checks. Returns failure reason or None.
-    Imports are deferred to avoid hard dependency on validator_models at import time.
-    """
-    try:
-        from validator_models.automated_checks import run_stage0_2_checks
-    except ImportError:
-        logger.warning("validator_models not available — skipping Tier 2")
-        return None
+async def _run_batch_email_verification(
+    leads: List[FulfillmentLead],
+) -> Dict[str, dict]:
+    """Verify all emails in the batch via TrueList inline API.
 
-    lead_dict = lead.model_dump()
+    Returns a mapping of ``email (lowercase) -> result dict``.
+    Each result dict contains at minimum ``status``, ``passed``, and
+    ``rejection_reason`` keys compatible with ``run_stage4_5_repscore``.
+
+    On failure the returned dict is empty, causing each lead to
+    individually fail with ``email_verification_unavailable`` rather
+    than crashing the entire validator scoring loop.
+    """
+    emails = list({lead.email.lower() for lead in leads if lead.email})
+    if not emails:
+        return {}
 
     try:
-        stage0_2 = run_stage0_2_checks(lead_dict)
-        if isinstance(stage0_2, dict) and stage0_2.get("hard_failure"):
-            return stage0_2.get("reason", "stage0_2_failure")
+        from validator_models.checks_email import verify_emails_inline
+        return await verify_emails_inline(emails)
     except Exception as e:
-        logger.warning(f"Stage 0-2 error (soft pass): {e}")
+        logger.error(f"Batch email verification failed: {e}")
+        return {}
 
-    return None
+
+async def _run_fulfillment_stage0_2(
+    validator_dict: dict,
+) -> Tuple[Optional[str], Optional[dict]]:
+    """Run Stage 0, 1, 2 checks adapted for fulfillment leads.
+
+    Identical to the validator pipeline's ``run_stage0_2_checks`` except
+    source-provenance checks are skipped (fulfillment leads are submitted
+    directly by miners, not scraped from a tracked source URL).
+
+    ``validator_dict`` is mutated in-place by check functions — they add
+    fields like ``domain_age_days``, ``has_mx``, etc. that Stage 4-5 and
+    the rep-score pipeline read later.
+
+    Returns ``(failure_reason, stage0_2_data)``.  ``failure_reason`` is
+    ``None`` when all checks pass.
+    """
+    from validator_models.automated_checks import (
+        check_required_fields, check_email_regex, check_name_email_match,
+        check_general_purpose_email, check_free_email_domain, check_disposable,
+        MAX_REP_SCORE,
+    )
+    from validator_models.checks_email import (
+        check_domain_age, check_mx_record, check_spf_dmarc,
+        check_head_request, check_dnsbl,
+    )
+
+    stage0_2_data: dict = {
+        "stage_0_hardcoded": {
+            "name_in_email": False,
+            "is_general_purpose_email": False,
+        },
+        "stage_1_dns": {
+            "has_mx": False, "has_spf": False,
+            "has_dmarc": False, "dmarc_policy": None,
+        },
+        "stage_2_domain": {
+            "dnsbl_checked": False, "dnsbl_blacklisted": False,
+            "dnsbl_list": None, "domain_age_days": None,
+            "domain_registrar": None, "domain_nameservers": None,
+            "whois_updated_days_ago": None,
+        },
+        "stage_3_email": {
+            "email_status": "unknown", "email_score": 0,
+            "is_disposable": False, "is_role_based": False, "is_free": False,
+        },
+        "stage_4_linkedin": {
+            "linkedin_verified": False, "gse_search_count": 0,
+            "llm_confidence": "none",
+        },
+        "stage_5_verification": {
+            "role_verified": False, "region_verified": False,
+            "industry_verified": False, "extracted_role": None,
+            "extracted_region": None, "extracted_industry": None,
+            "early_exit": None,
+        },
+        "rep_score": {
+            "total_score": 0, "max_score": MAX_REP_SCORE,
+            "breakdown": {
+                "wayback_machine": 0, "uspto_trademarks": 0,
+                "sec_edgar": 0, "whois_dnsbl": 0,
+                "gdelt": 0, "companies_house": 0,
+            },
+        },
+        "passed": False,
+        "rejection_reason": None,
+    }
+
+    def _collect_dns_data() -> None:
+        stage0_2_data["stage_1_dns"]["has_mx"] = validator_dict.get("has_mx", False)
+        stage0_2_data["stage_1_dns"]["has_spf"] = validator_dict.get("has_spf", False)
+        stage0_2_data["stage_1_dns"]["has_dmarc"] = validator_dict.get("has_dmarc", False)
+        stage0_2_data["stage_1_dns"]["dmarc_policy"] = (
+            "strict" if validator_dict.get("dmarc_policy_strict") else "none"
+        )
+        stage0_2_data["stage_2_domain"]["domain_age_days"] = validator_dict.get("domain_age_days")
+        stage0_2_data["stage_2_domain"]["domain_registrar"] = validator_dict.get("domain_registrar")
+        stage0_2_data["stage_2_domain"]["domain_nameservers"] = validator_dict.get("domain_nameservers")
+        stage0_2_data["stage_2_domain"]["whois_updated_days_ago"] = validator_dict.get("whois_updated_days_ago")
+
+    def _fail(rejection: Optional[dict]) -> Tuple[str, dict]:
+        stage0_2_data["passed"] = False
+        stage0_2_data["rejection_reason"] = rejection
+        rej = rejection or {}
+        return rej.get("check_name", "stage0_2_failure"), stage0_2_data
+
+    # -- Stage 0: instant checks --
+    for check_func in [
+        check_required_fields, check_email_regex, check_name_email_match,
+        check_general_purpose_email, check_free_email_domain, check_disposable,
+    ]:
+        passed, rejection = await check_func(validator_dict)
+        if not passed:
+            return _fail(rejection)
+
+    stage0_2_data["stage_0_hardcoded"]["name_in_email"] = True
+    stage0_2_data["stage_0_hardcoded"]["is_general_purpose_email"] = False
+
+    # -- Stage 0 (continued): HEAD request runs in background --
+    head_task = asyncio.create_task(check_head_request(validator_dict))
+
+    # -- Stage 1: DNS checks in parallel --
+    dns_results = await asyncio.gather(
+        check_domain_age(validator_dict),
+        check_mx_record(validator_dict),
+        check_spf_dmarc(validator_dict),
+        return_exceptions=True,
+    )
+
+    for result in dns_results:
+        if isinstance(result, Exception):
+            _collect_dns_data()
+            head_task.cancel()
+            return _fail({
+                "stage": "Stage 1: DNS Layer",
+                "check_name": "stage1_dns_failure",
+                "message": str(result),
+                "failed_fields": ["domain"],
+            })
+        passed, rejection = result
+        if not passed:
+            _collect_dns_data()
+            head_task.cancel()
+            return _fail(rejection)
+
+    _collect_dns_data()
+
+    # -- Stage 0 HEAD result --
+    passed, rejection = await head_task
+    if not passed:
+        return _fail(rejection)
+
+    # -- Stage 2: DNSBL --
+    passed, rejection = await check_dnsbl(validator_dict)
+
+    stage0_2_data["stage_2_domain"]["dnsbl_checked"] = validator_dict.get("dnsbl_checked", False)
+    stage0_2_data["stage_2_domain"]["dnsbl_blacklisted"] = validator_dict.get("dnsbl_blacklisted", False)
+    stage0_2_data["stage_2_domain"]["dnsbl_list"] = validator_dict.get("dnsbl_list")
+
+    if not passed:
+        return _fail(rejection)
+
+    stage0_2_data["passed"] = True
+    return None, stage0_2_data
+
+
+async def _run_verification_stages(
+    validator_dict: dict,
+    email_result: Optional[dict],
+    stage0_2_data: Optional[dict],
+) -> Tuple[Optional[str], dict]:
+    """Run Stage 3 (email) + Stage 4 (person) + Stage 5 (company) + rep score.
+
+    Delegates to the validator pipeline's ``run_stage4_5_repscore`` which
+    expects pre-computed TrueList email results and the Stage 0-2 data dict.
+
+    Returns ``(failure_reason, verification_data)``.
+    """
+    from validator_models.automated_checks import run_stage4_5_repscore
+
+    if not email_result:
+        return "email_verification_unavailable", stage0_2_data or {}
+
+    if not stage0_2_data:
+        return "stage0_2_data_missing", {}
+
+    passed, full_data = await run_stage4_5_repscore(
+        validator_dict, email_result, stage0_2_data,
+    )
+    if not passed:
+        rej = full_data.get("rejection_reason") or {}
+        reason = rej.get("check_name", "verification_failure")
+        return reason, full_data
+
+    return None, full_data
 
 
 def _avg(vals: list) -> float:

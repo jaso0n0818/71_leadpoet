@@ -465,7 +465,7 @@ async def get_results(request_id: str):
 
     leads = []
     for row in (consensus_resp.data or []):
-        leads.append({
+        lead_row = {
             "lead_id": row["lead_id"],
             "miner_hotkey": row["miner_hotkey"],
             "consensus_final_score": row["consensus_final_score"],
@@ -474,7 +474,12 @@ async def get_results(request_id: str):
             "num_validators": row["num_validators"],
             "any_fabricated": row["any_fabricated"],
             "consensus_tier2_passed": row["consensus_tier2_passed"],
-        })
+            "consensus_email_verified": row.get("consensus_email_verified"),
+            "consensus_person_verified": row.get("consensus_person_verified"),
+            "consensus_company_verified": row.get("consensus_company_verified"),
+            "consensus_rep_score": row.get("consensus_rep_score"),
+        }
+        leads.append(lead_row)
 
     result = {
         "request_id": request_id,
