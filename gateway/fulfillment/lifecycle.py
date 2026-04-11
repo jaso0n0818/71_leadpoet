@@ -2,7 +2,7 @@
 Fulfillment lifecycle background task.
 
 Manages request state transitions, consensus aggregation, reward expiry,
-PII cleanup, and request recycling.
+and request recycling.
 """
 
 import asyncio
@@ -14,8 +14,6 @@ from gateway.fulfillment.config import (
     FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS,
     FULFILLMENT_MIN_VALIDATORS,
     FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES,
-    PII_RETENTION_DAYS,
-    PII_CLEANUP_INTERVAL_HOURS,
     L_EPOCHS,
     Z_PERCENT,
 )
@@ -24,12 +22,24 @@ from gateway.models.events import EventType
 
 logger = logging.getLogger(__name__)
 
-_last_pii_cleanup: datetime = datetime.min.replace(tzinfo=timezone.utc)
-
 
 def _get_supabase():
     from gateway.db.client import get_write_client
     return get_write_client()
+
+
+def _get_tempo(supabase) -> int:
+    """Fetch current subnet tempo from DB, default 360."""
+    try:
+        resp = supabase.table("subnet_state") \
+            .select("tempo") \
+            .limit(1) \
+            .execute()
+        if resp.data:
+            return int(resp.data[0].get("tempo", 360))
+    except Exception:
+        pass
+    return 360
 
 
 def _log_event(event_type: EventType, payload: dict) -> None:
@@ -149,8 +159,9 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 logger.error(f"Error transitioning {rid[:8]}... to scoring: {e}")
         else:
             new_id = str(uuid4())
-            from gateway.fulfillment.config import T_HOURS, M_MINUTES
-            new_window_end = now + timedelta(hours=T_HOURS)
+            from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, epochs_to_seconds
+            tempo = _get_tempo(supabase)
+            new_window_end = now + timedelta(seconds=epochs_to_seconds(T_EPOCHS, tempo))
             new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
 
             try:
@@ -242,30 +253,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
         except Exception as e:
             logger.error(f"Error in consensus for {rid[:8]}...: {e}")
 
-    # Step 4: PII cleanup (throttled)
-    global _last_pii_cleanup
-    hours_since = (now - _last_pii_cleanup).total_seconds() / 3600
-    if hours_since >= PII_CLEANUP_INTERVAL_HOURS:
-        try:
-            cutoff = (now - timedelta(days=PII_RETENTION_DAYS)).isoformat()
-            old_fulfilled = supabase.table("fulfillment_requests") \
-                .select("request_id") \
-                .eq("status", "fulfilled") \
-                .lt("created_at", cutoff) \
-                .execute()
-
-            for r in (old_fulfilled.data or []):
-                supabase.table("fulfillment_submissions").update({
-                    "lead_data": None,
-                }).eq("request_id", r["request_id"]).execute()
-
-            _last_pii_cleanup = now
-            if old_fulfilled.data:
-                logger.info(f"PII cleanup: nulled lead_data for {len(old_fulfilled.data)} old requests")
-        except Exception as e:
-            logger.error(f"PII cleanup error: {e}")
-
-    # Step 5: reward expiry
+    # Step 4: reward expiry
     try:
         _expire_rewards(supabase)
     except Exception as e:

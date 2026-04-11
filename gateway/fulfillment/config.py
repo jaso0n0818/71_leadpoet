@@ -7,14 +7,13 @@ All values are read from environment variables with sensible defaults.
 import os
 import logging
 
-T_HOURS = int(os.getenv("FULFILLMENT_T_HOURS", "4"))
+T_EPOCHS = int(os.getenv("FULFILLMENT_T_EPOCHS", "2"))
 M_MINUTES = int(os.getenv("FULFILLMENT_M_MINUTES", "15"))
+BLOCK_TIME_SECONDS = 12
 Z_PERCENT = float(os.getenv("FULFILLMENT_Z_PERCENT", "0.001"))
 L_EPOCHS = int(os.getenv("FULFILLMENT_L_EPOCHS", "30"))
 FULFILLMENT_MAX_CONCURRENT_SOURCES = int(os.getenv("FULFILLMENT_MAX_CONCURRENT_SOURCES", "2"))
 FULFILLMENT_OPENROUTER_API_KEY = os.getenv("FULFILLMENT_OPENROUTER_API_KEY", "")
-PII_RETENTION_DAYS = int(os.getenv("FULFILLMENT_PII_RETENTION_DAYS", "30"))
-PII_CLEANUP_INTERVAL_HOURS = int(os.getenv("FULFILLMENT_PII_CLEANUP_INTERVAL_HOURS", "6"))
 FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS = int(os.getenv("FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS", "30"))
 FULFILLMENT_MIN_VALIDATORS = int(os.getenv("FULFILLMENT_MIN_VALIDATORS", "1"))
 FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "5"))
@@ -30,6 +29,11 @@ if os.getenv("ENABLE_FULFILLMENT", "false").lower() == "true" and not FULFILLMEN
         "Fulfillment scoring will fail when the first request is processed. "
         "Set the env var or disable fulfillment with ENABLE_FULFILLMENT=false."
     )
+
+
+def epochs_to_seconds(num_epochs: int, tempo: int = 360) -> int:
+    """Convert an epoch count to wall-clock seconds using the subnet tempo."""
+    return num_epochs * tempo * BLOCK_TIME_SECONDS
 
 
 def get_fulfillment_api_key() -> str:

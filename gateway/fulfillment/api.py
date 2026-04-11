@@ -14,7 +14,7 @@ from typing import List
 
 from fastapi import APIRouter, HTTPException
 
-from gateway.fulfillment.config import T_HOURS, M_MINUTES, FULFILLMENT_BANS_ENABLED
+from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, FULFILLMENT_BANS_ENABLED, epochs_to_seconds
 from gateway.fulfillment.hashing import HASH_SCHEMA_VERSION, hash_request, verify_commit
 from gateway.fulfillment.models import (
     FulfillmentICP,
@@ -41,6 +41,20 @@ def _enable_fulfillment() -> bool:
 def _get_supabase():
     from gateway.db.client import get_write_client
     return get_write_client()
+
+
+def _get_tempo(supabase) -> int:
+    """Fetch current subnet tempo from DB, default 360."""
+    try:
+        resp = supabase.table("subnet_state") \
+            .select("tempo") \
+            .limit(1) \
+            .execute()
+        if resp.data:
+            return int(resp.data[0].get("tempo", 360))
+    except Exception:
+        pass
+    return 360
 
 
 def _log_event(event_type: EventType, payload: dict) -> None:
@@ -92,7 +106,10 @@ async def create_request(icp: FulfillmentICP):
     supabase = _get_supabase()
     now = datetime.now(timezone.utc)
     request_id = str(uuid4())
-    window_end = now + timedelta(hours=T_HOURS)
+
+    tempo = _get_tempo(supabase)
+    commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
+    window_end = now + timedelta(seconds=commit_seconds)
     reveal_window_end = window_end + timedelta(minutes=M_MINUTES)
     icp_dict = icp.model_dump(mode="json")
     req_hash = hash_request(icp_dict)
