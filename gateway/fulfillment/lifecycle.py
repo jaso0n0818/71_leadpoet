@@ -43,6 +43,14 @@ def _get_tempo(supabase) -> int:
 
 
 def _log_event(event_type: EventType, payload: dict) -> None:
+    from gateway.config import BITTENSOR_NETWORK
+
+    if BITTENSOR_NETWORK == "test":
+        logger.info(
+            f"⚠️ TESTNET MODE: Skipping {event_type.value} log to protect production transparency_log"
+        )
+        return
+
     try:
         supabase = _get_supabase()
         supabase.table("transparency_log").insert({

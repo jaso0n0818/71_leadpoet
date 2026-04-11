@@ -262,24 +262,38 @@ async def lifespan(app: FastAPI):
         # ════════════════════════════════════════════════════════════════
         # ICP SET INITIALIZATION (ALWAYS runs, even with DISABLE_BACKGROUND_TASKS)
         # This is required for qualification model evaluation to work
+        # TESTNET GUARD: Skip on testnet to prevent writing to production
+        # qualification_private_icp_sets (testnet and mainnet share same Supabase)
         # ════════════════════════════════════════════════════════════════
-        try:
-            await ensure_icp_set_exists()
-            print("✅ ICP set initialized (benchmark ICPs ready)")
-        except Exception as e:
-            print(f"⚠️  Failed to initialize ICP set: {e}")
-            print("   Qualification model evaluation may not work!")
+        from gateway.config import BITTENSOR_NETWORK
+        if BITTENSOR_NETWORK == "test":
+            print("⚠️  TESTNET MODE: Skipping ICP set initialization (protect production qualification_private_icp_sets)")
+        else:
+            try:
+                await ensure_icp_set_exists()
+                print("✅ ICP set initialized (benchmark ICPs ready)")
+            except Exception as e:
+                print(f"⚠️  Failed to initialize ICP set: {e}")
+                print("   Qualification model evaluation may not work!")
         
         if skip_bg_tasks:
             print("⚠️  DISABLE_BACKGROUND_TASKS=true - Skipping background tasks")
             print("   This is for LOCAL TESTING ONLY!")
 
             # ICP rotation task ALWAYS runs (even with DISABLE_BACKGROUND_TASKS)
-            # This is safe because it ONLY writes to qualification_private_icp_sets
-            # On testnet, transparency_log writes are skipped automatically
-            icp_task = asyncio.create_task(icp_rotation_task())
-            print("✅ ICP rotation task started (EXCEPTION: runs even with DISABLE_BACKGROUND_TASKS)")
-            print("   → Only writes to: qualification_private_icp_sets")
+            # TESTNET GUARD: Skip on testnet to prevent writing to production DB
+            if BITTENSOR_NETWORK == "test":
+                print("⚠️  TESTNET MODE: Skipping ICP rotation task (protect production qualification_private_icp_sets)")
+            else:
+                icp_task = asyncio.create_task(icp_rotation_task())
+                print("✅ ICP rotation task started (EXCEPTION: runs even with DISABLE_BACKGROUND_TASKS)")
+                print("   → Only writes to: qualification_private_icp_sets")
+
+            if os.getenv("ENABLE_FULFILLMENT", "false").lower() == "true" and _FULFILLMENT_ROUTER_AVAILABLE:
+                from gateway.fulfillment.lifecycle import fulfillment_lifecycle_task
+                fulfillment_task_handle = asyncio.create_task(fulfillment_lifecycle_task())
+                print("✅ Fulfillment lifecycle task started (EXCEPTION: runs even with DISABLE_BACKGROUND_TASKS)")
+                print("   → Only writes to: fulfillment_* tables")
         else:
             # Start epoch monitor (polling loop - bulletproof)
             epoch_monitor_task = asyncio.create_task(epoch_monitor.start())

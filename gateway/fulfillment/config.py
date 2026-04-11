@@ -8,6 +8,7 @@ import os
 import logging
 
 T_EPOCHS = int(os.getenv("FULFILLMENT_T_EPOCHS", "2"))
+T_SECONDS_OVERRIDE = int(os.getenv("FULFILLMENT_T_SECONDS", "0"))
 M_MINUTES = int(os.getenv("FULFILLMENT_M_MINUTES", "15"))
 BLOCK_TIME_SECONDS = 12
 Z_PERCENT = float(os.getenv("FULFILLMENT_Z_PERCENT", "0.001"))

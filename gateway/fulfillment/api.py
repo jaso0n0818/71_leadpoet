@@ -14,7 +14,7 @@ from typing import List
 
 from fastapi import APIRouter, HTTPException
 
-from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, FULFILLMENT_BANS_ENABLED, epochs_to_seconds
+from gateway.fulfillment.config import T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES, FULFILLMENT_BANS_ENABLED, epochs_to_seconds
 from gateway.fulfillment.hashing import HASH_SCHEMA_VERSION, hash_request, verify_commit
 from gateway.fulfillment.models import (
     FulfillmentICP,
@@ -59,6 +59,14 @@ def _get_tempo(supabase) -> int:
 
 def _log_event(event_type: EventType, payload: dict) -> None:
     """Best-effort transparency log insert."""
+    from gateway.config import BITTENSOR_NETWORK
+
+    if BITTENSOR_NETWORK == "test":
+        logger.info(
+            f"⚠️ TESTNET MODE: Skipping {event_type.value} log to protect production transparency_log"
+        )
+        return
+
     try:
         supabase = _get_supabase()
         supabase.table("transparency_log").insert({
@@ -107,8 +115,11 @@ async def create_request(icp: FulfillmentICP):
     now = datetime.now(timezone.utc)
     request_id = str(uuid4())
 
-    tempo = _get_tempo(supabase)
-    commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
+    if T_SECONDS_OVERRIDE > 0:
+        commit_seconds = T_SECONDS_OVERRIDE
+    else:
+        tempo = _get_tempo(supabase)
+        commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
     window_end = now + timedelta(seconds=commit_seconds)
     reveal_window_end = window_end + timedelta(minutes=M_MINUTES)
     icp_dict = icp.model_dump(mode="json")
