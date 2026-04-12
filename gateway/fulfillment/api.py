@@ -504,6 +504,33 @@ async def get_results(request_id: str):
 
 
 # ---------------------------------------------------------------
+# GET /fulfillment/rewards/active  — validator fetches active rewards
+# ---------------------------------------------------------------
+@fulfillment_router.get("/rewards/active")
+async def get_active_rewards(current_epoch: int):
+    """Return active (unexpired) fulfillment rewards grouped by miner hotkey.
+
+    Used by the validator during weight calculation to determine the
+    fulfillment emission carve-out from the sourcing allocation.
+    """
+    supabase = _get_supabase()
+
+    resp = supabase.table("fulfillment_score_consensus") \
+        .select("miner_hotkey, reward_pct, reward_expires_epoch") \
+        .not_.is_("reward_pct", "null") \
+        .gt("reward_expires_epoch", current_epoch) \
+        .execute()
+
+    per_miner: dict = {}
+    for row in (resp.data or []):
+        hk = row["miner_hotkey"]
+        pct = float(row["reward_pct"])
+        per_miner[hk] = per_miner.get(hk, 0.0) + pct
+
+    return {"rewards": per_miner, "total_active_rows": len(resp.data or [])}
+
+
+# ---------------------------------------------------------------
 # POST /fulfillment/ban/{hotkey}  — validator requests a ban
 # ---------------------------------------------------------------
 @fulfillment_router.post("/ban/{hotkey}")

@@ -2885,7 +2885,57 @@ class Validator(BaseValidatorNeuron):
             
         except Exception as e:
             bt.logging.error(f"Failed to accumulate miner weights: {e}")
-    
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FULFILLMENT EMISSION SHARE (Phase 2)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_fulfillment_emission_share(
+        self, current_epoch: int, max_sourcing_share: float,
+    ) -> tuple:
+        """Compute the fulfillment emission carve-out from the sourcing allocation.
+
+        Queries the gateway for active (unexpired) fulfillment rewards, sums them
+        per miner, and applies the FULFILLMENT_MAX_EMISSION_SHARE cap.  If the raw
+        total exceeds the cap, each miner's share is reduced pro-rata so the total
+        stays at the cap.
+
+        Args:
+            current_epoch: the current Bittensor epoch number
+            max_sourcing_share: the sourcing pool size (0.9 with champion, 1.0 without)
+
+        Returns:
+            (effective_fulfillment_share, {hotkey: effective_pct})
+            On any error returns (0.0, {}).
+        """
+        FULFILLMENT_MAX_EMISSION_SHARE = float(
+            os.getenv("FULFILLMENT_MAX_EMISSION_SHARE", "0.50")
+        )
+
+        try:
+            from Leadpoet.utils.cloud_db import gateway_get_all_fulfillment_rewards
+            per_miner = gateway_get_all_fulfillment_rewards(self.wallet, current_epoch)
+
+            if not per_miner:
+                return 0.0, {}
+
+            raw_total = sum(per_miner.values())
+            if raw_total <= 0:
+                return 0.0, {}
+
+            max_allowed = FULFILLMENT_MAX_EMISSION_SHARE * max_sourcing_share
+
+            if raw_total <= max_allowed:
+                return raw_total, dict(per_miner)
+
+            scale_factor = max_allowed / raw_total
+            scaled = {hk: pct * scale_factor for hk, pct in per_miner.items()}
+            return max_allowed, scaled
+
+        except Exception as e:
+            bt.logging.warning(f"Fulfillment emission share error (safe fallback): {e}")
+            return 0.0, {}
+
     async def submit_weights_at_epoch_end(self):
         """
         Submit accumulated weights to Bittensor chain at end of epoch (block 345+).
@@ -3173,6 +3223,30 @@ class Validator(BaseValidatorNeuron):
             # Effective sourcing share for registered miners only
             effective_sourcing_to_miners = effective_sourcing_share - dereg_burn
             
+            # ════════════════════════════════════════════════════════════════
+            # FULFILLMENT EMISSION CARVE-OUT (Phase 2)
+            # Carved from the sourcing allocation, NOT additive.
+            # Champion's 10% is never touched.
+            # On any error, fulfillment_share stays 0 — sourcing keeps full allocation.
+            # ════════════════════════════════════════════════════════════════
+            fulfillment_share = 0.0
+            fulfillment_per_miner = {}
+            try:
+                if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+                    fulfillment_share, fulfillment_per_miner = self._get_fulfillment_emission_share(
+                        current_epoch, MAX_SOURCING_SHARE,
+                    )
+                    if fulfillment_share > 0:
+                        effective_sourcing_to_miners -= fulfillment_share
+                        ff_cap = float(os.getenv("FULFILLMENT_MAX_EMISSION_SHARE", "0.50"))
+                        ff_max = ff_cap * MAX_SOURCING_SHARE
+                        print(f"      Fulfillment carve-out: {fulfillment_share*100:.4f}% "
+                              f"(cap {ff_max*100:.1f}%, {len(fulfillment_per_miner)} miners)")
+            except Exception as e:
+                fulfillment_share = 0.0
+                fulfillment_per_miner = {}
+                print(f"      Fulfillment emission error (safe fallback — 0% carved): {e}")
+            
             # Calculate total burn share
             # When no champion: MAX_SOURCING_SHARE=100%, so burn = only threshold shortfall + dereg
             # When champion active: MAX_SOURCING_SHARE=90%, champion gets 10%, burn = shortfall + dereg
@@ -3186,6 +3260,7 @@ class Validator(BaseValidatorNeuron):
             print(f"      ─────────────────────────────")
             print(f"      Total burn → UID 0:   {total_burn_share*100:.2f}%")
             print(f"      Champion → UID {champion_uid if champion_uid else '?'}:     {effective_champion_share*100:.0f}%")
+            print(f"      Fulfillment miners:   {fulfillment_share*100:.4f}%")
             print(f"      Sourcing miners:      {effective_sourcing_to_miners*100:.2f}%")
             print()
             
@@ -3203,6 +3278,21 @@ class Validator(BaseValidatorNeuron):
                     uid_weights[champion_uid] = 0
                 uid_weights[champion_uid] += effective_champion_share
                 print(f"   👑 Champion (UID {champion_uid}): {effective_champion_share*100:.0f}%")
+            
+            # Fulfillment miners get their carved share (Phase 2)
+            if fulfillment_per_miner:
+                ff_registered = 0
+                for ff_hotkey, ff_pct in fulfillment_per_miner.items():
+                    if ff_hotkey in self.metagraph.hotkeys:
+                        ff_uid = self.metagraph.hotkeys.index(ff_hotkey)
+                        if ff_uid not in uid_weights:
+                            uid_weights[ff_uid] = 0
+                        uid_weights[ff_uid] += ff_pct
+                        ff_registered += 1
+                        print(f"   🎯 Fulfillment (UID {ff_uid}): {ff_pct*100:.4f}%")
+                    else:
+                        uid_weights[UID_ZERO] = uid_weights.get(UID_ZERO, 0) + ff_pct
+                        print(f"   🎯 Fulfillment ({ff_hotkey[:12]}...): {ff_pct*100:.4f}% → BURN (deregistered)")
             
             # ═══════════════════════════════════════════════════════════════════
             # DISTRIBUTE SOURCING SHARE BY REP SCORE
@@ -3939,6 +4029,21 @@ class Validator(BaseValidatorNeuron):
                     try:
                         results = await score_miner_submission(leads_raw, icp_details)
                         scored_all[miner_hk] = list(zip(leads_raw, results))
+
+                        print(f"\n{'='*60}")
+                        print(f"📊 FULFILLMENT SCORES — Request {request_id[:8]}...")
+                        print(f"   Miner: {miner_hk[:16]}...")
+                        print(f"{'='*60}")
+                        for idx, sr in enumerate(results):
+                            lead_name = leads_raw[idx].get("full_name", "?") if idx < len(leads_raw) else "?"
+                            lead_biz = leads_raw[idx].get("business", "?") if idx < len(leads_raw) else "?"
+                            t1 = "✅" if sr.tier1_passed else "❌"
+                            t2 = "✅" if sr.tier2_passed else "❌"
+                            score = sr.final_score
+                            reason = sr.failure_reason or "passed"
+                            print(f"   Lead {idx+1}: {lead_name} @ {lead_biz}")
+                            print(f"     Tier1(ICP): {t1}  Tier2(Data): {t2}  Score: {score:.1f}  [{reason}]")
+                        print(f"{'='*60}\n")
 
                         scores_payload = format_scores_for_gateway(
                             miner_hk, lead_ids, results,

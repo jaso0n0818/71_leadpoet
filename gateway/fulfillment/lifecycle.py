@@ -258,6 +258,24 @@ async def _lifecycle_tick_inner(supabase) -> None:
             }).eq("request_id", rid).execute()
             logger.info(f"Request {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
 
+            # Print final ranked results
+            ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
+            num_requested = r.get("icp_details", {}).get("num_leads", len(ranked)) if isinstance(r.get("icp_details"), dict) else len(ranked)
+            print(f"\n{'='*60}")
+            print(f"🏆 FULFILLMENT RESULTS — Request {rid[:8]}...")
+            print(f"   {len(ranked)} leads scored, client requested {num_requested}")
+            print(f"{'='*60}")
+            for i, cr in enumerate(ranked, 1):
+                miner = cr.get("miner_hotkey", "?")[:16]
+                score = cr.get("consensus_final_score", 0)
+                t2 = "✅" if cr.get("consensus_tier2_passed") else "❌"
+                winner = "👑" if cr.get("is_winner") else "  "
+                lid = cr.get("lead_id", "?")[:8]
+                print(f"   {winner} #{i}: score={score:.1f} tier2={t2} miner={miner}... lead={lid}...")
+            winners = [c for c in ranked if c.get("is_winner")]
+            print(f"\n   Winners: {len(winners)}/{len(ranked)} leads")
+            print(f"{'='*60}\n")
+
         except Exception as e:
             logger.error(f"Error in consensus for {rid[:8]}...: {e}")
 

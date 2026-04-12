@@ -2574,3 +2574,24 @@ def gateway_submit_fulfillment_scores(
                 bt.logging.error(f"All 3 score submit attempts failed: {e}")
                 return False
     return False
+
+
+def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -> Dict[str, float]:
+    """Fetch active fulfillment rewards grouped by miner hotkey.
+
+    Returns {miner_hotkey: sum_of_reward_pct} for all rewards where
+    reward_expires_epoch > current_epoch. Used by the validator during
+    weight calculation to determine the fulfillment emission carve-out.
+    """
+    try:
+        response = requests.get(
+            f"{GATEWAY_URL}/fulfillment/rewards/active",
+            params={"current_epoch": current_epoch},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("rewards", {})
+    except Exception as e:
+        bt.logging.warning(f"Failed to fetch fulfillment rewards: {e}")
+        return {}
