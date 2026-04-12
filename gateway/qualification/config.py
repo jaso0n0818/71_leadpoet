@@ -45,7 +45,7 @@ class QualificationConfig:
     # =========================================================================
     # Cost/Time Limits (per-lead base values - totals are computed dynamically)
     # =========================================================================
-    MAX_COST_PER_LEAD_USD: float = 0.05  # $0.05 average per lead (total = leads × $0.05)
+    MAX_COST_PER_LEAD_USD: float = 0.07  # $0.07 average per lead (total = leads × $0.07)
     MAX_TIME_PER_LEAD_SECONDS: float = 45.0  # 45s average per lead (total = leads × 45s)
     RUNNING_MODEL_TIMEOUT_SECONDS: int = 80  # 80s HARD max per single lead - if exceeded, INSTANT FAIL
     TOTAL_EVALUATION_TIMEOUT_MINUTES: int = 180  # 3 hour absolute max (safety net, 100 leads × 90s = 150min)
@@ -107,7 +107,7 @@ class QualificationConfig:
     # =========================================================================
     # Submission Rules
     # =========================================================================
-    SUBMISSION_COST_USD: float = 5.00  # $5 TAO to submit a model
+    SUBMISSION_COST_USD: float = 7.00  # $7 TAO to submit a model
     MIN_TIME_BETWEEN_SUBMISSIONS_EPOCHS: int = 20  # Minimum epochs between submissions
     MAX_SUBMISSIONS_PER_SET: int = 1  # Submissions allowed per hotkey per evaluation set
     
@@ -130,13 +130,13 @@ class QualificationConfig:
     # =========================================================================
     # NEW SYSTEM: No penalty if within budget, small penalty for high variability
     #
-    # - NO penalty if cost ≤ MAX_COST_PER_LEAD_USD ($0.05)
+    # - NO penalty if cost ≤ MAX_COST_PER_LEAD_USD ($0.07)
     # - NO penalty if time ≤ MAX_TIME_PER_LEAD_SECONDS (45s)
-    # - 5-point penalty if cost > 2× MAX_COST_PER_LEAD_USD ($0.10)
+    # - 5-point penalty if cost > 2× MAX_COST_PER_LEAD_USD ($0.14)
     # - 5-point penalty if time > 2× MAX_TIME_PER_LEAD_SECONDS (90s)
     #
     # These thresholds are DYNAMIC: if you change MAX_COST_PER_LEAD_USD from
-    # $0.05 to $0.10, the penalty threshold automatically becomes $0.20.
+    # $0.07 to $0.14, the penalty threshold automatically becomes $0.28.
     # =========================================================================
     VARIABILITY_PENALTY_POINTS: int = 5  # Points deducted for high-variability leads
     COST_VARIABILITY_THRESHOLD_MULTIPLIER: float = 2.0  # Penalty if cost > 2× average
@@ -313,7 +313,7 @@ class QualificationConfig:
             EVALUATION_SET_ROTATION_EPOCHS=int(os.getenv("QUAL_EVALUATION_SET_ROTATION_EPOCHS", 20)),
             
             # Cost/Time Limits (per-lead base values)
-            MAX_COST_PER_LEAD_USD=float(os.getenv("QUAL_MAX_COST_PER_LEAD_USD", 0.05)),
+            MAX_COST_PER_LEAD_USD=float(os.getenv("QUAL_MAX_COST_PER_LEAD_USD", 0.07)),
             MAX_TIME_PER_LEAD_SECONDS=float(os.getenv("QUAL_MAX_TIME_PER_LEAD_SECONDS", 45.0)),
             RUNNING_MODEL_TIMEOUT_SECONDS=int(os.getenv("QUAL_RUNNING_MODEL_TIMEOUT_SECONDS", 90)),
             TOTAL_EVALUATION_TIMEOUT_MINUTES=int(os.getenv("QUAL_TOTAL_EVALUATION_TIMEOUT_MINUTES", 180)),
@@ -336,7 +336,7 @@ class QualificationConfig:
             QUALIFICATION_BLOCK_CUTOFF=int(os.getenv("QUAL_BLOCK_CUTOFF", 320)),
             
             # Submission Rules
-            SUBMISSION_COST_USD=float(os.getenv("QUAL_SUBMISSION_COST_USD", 5.00)),
+            SUBMISSION_COST_USD=float(os.getenv("QUAL_SUBMISSION_COST_USD", 7.00)),
             MIN_TIME_BETWEEN_SUBMISSIONS_EPOCHS=int(os.getenv("QUAL_MIN_TIME_BETWEEN_SUBMISSIONS_EPOCHS", 20)),
             MAX_SUBMISSIONS_PER_SET=int(os.getenv("QUAL_MAX_SUBMISSIONS_PER_SET", 1)),
             
@@ -414,9 +414,9 @@ class QualificationConfig:
         Formula: total_leads × MAX_COST_PER_LEAD_USD
         
         Examples:
-            100 leads × $0.05 = $5.00
-            50 leads × $0.05 = $2.50
-            200 leads × $0.05 = $10.00
+            100 leads × $0.07 = $7.00
+            50 leads × $0.07 = $3.50
+            200 leads × $0.07 = $14.00
         """
         return self.get_total_leads() * self.MAX_COST_PER_LEAD_USD
     
@@ -450,8 +450,8 @@ class QualificationConfig:
         Formula: MAX_COST_PER_LEAD_USD × COST_VARIABILITY_THRESHOLD_MULTIPLIER
         
         Examples:
-            $0.05 × 2.0 = $0.10 (penalty if cost > $0.10 per lead)
-            $0.10 × 2.0 = $0.20 (penalty if cost > $0.20 per lead)
+            $0.07 × 2.0 = $0.14 (penalty if cost > $0.14 per lead)
+            $0.14 × 2.0 = $0.28 (penalty if cost > $0.28 per lead)
         """
         return self.MAX_COST_PER_LEAD_USD * self.COST_VARIABILITY_THRESHOLD_MULTIPLIER
     
