@@ -206,7 +206,8 @@ extract a structured list of real companies. For each company provide:
 - website: their website URL
 - description: one sentence about what they do
 - employee_estimate: estimated employee count range (e.g. "50-200", "200-500")
-- hq_state: US state where HQ is located (best guess)
+- hq_city: US city where HQ is located (e.g. "San Francisco")
+- hq_state: US state where HQ is located (e.g. "California")
 
 Search results:
 {json.dumps(companies_raw[:15], indent=2)}
@@ -256,6 +257,9 @@ Only include companies that are real businesses (not articles, directories, or l
 async def find_contact(company: dict, icp: dict) -> Optional[Dict]:
     """Find a real decision-maker at a company matching the ICP's target roles.
 
+    The returned role MUST be one of the ICP's target_roles (exact match)
+    because the Tier 1 gate checks ``lead.role in icp.target_roles``.
+
     Returns {full_name, email, linkedin_url, role, city, state} or None.
     """
     company_name = company.get("name", "")
@@ -291,23 +295,33 @@ async def find_contact(company: dict, icp: dict) -> Optional[Dict]:
     snippet_text = best.get("snippet", "")
     linkedin_url = best.get("link", "").split("?")[0]
 
-    prompt = f"""Extract the person's details from this LinkedIn search result.
+    roles_json = json.dumps(target_roles)
+    prompt = f"""Extract the person's details from this LinkedIn search result and determine
+if their role matches any of the target roles.
 
 Title: {title_text}
 Snippet: {snippet_text}
 LinkedIn URL: {linkedin_url}
-Company we're looking for: {company_name}
+Company: {company_name}
+Target roles (MUST match one exactly): {roles_json}
 
-Return ONLY a JSON object with these fields:
+Return ONLY a JSON object:
 - full_name: their full name
-- role: their job title
-- city: their city
-- state: their US state
-- email_guess: their likely work email (firstname.lastname@{company.get('domain', 'company.com')})
+- actual_role: their actual job title from LinkedIn
+- matched_role: which target role best matches (MUST be one from the list above, or "" if none match)
+- city: their city (e.g. "San Francisco")
+- state: their US state (e.g. "California")
+- email_guess: likely work email (firstname.lastname@{company.get('domain', 'company.com')})
 
-If you cannot determine any field, use empty string."""
+Rules:
+- matched_role MUST be copied exactly from the target roles list if the person's actual role is close enough
+  (e.g. actual "VP, Sales" matches target "VP of Sales"; actual "Head of Revenue Operations" matches "Head of Revenue")
+- If their role doesn't match ANY target role, set matched_role to ""
+- city and state are required for US-based contacts"""
 
     resp = await _llm_call(prompt)
+    domain = company.get("domain", "company.com")
+
     if not resp:
         name_parts = title_text.split(" - ")[0].strip().split("–")[0].strip()
         return {
@@ -325,19 +339,25 @@ If you cannot determine any field, use empty string."""
             resp = re.sub(r'^```(?:json)?\s*', '', resp)
             resp = re.sub(r'\s*```$', '', resp)
         data = json.loads(resp)
-        domain = company.get("domain", "company.com")
+
+        matched_role = data.get("matched_role", "")
+        if not matched_role:
+            logger.info(f"  Contact at {company_name} role '{data.get('actual_role')}' doesn't match target roles — skipping")
+            return None
+
         email = data.get("email_guess", "")
         if not email and data.get("full_name"):
             parts = data["full_name"].lower().split()
             if len(parts) >= 2:
                 email = f"{parts[0]}.{parts[-1]}@{domain}"
+
         return {
             "full_name": data.get("full_name", ""),
             "linkedin_url": linkedin_url,
-            "role": data.get("role", target_roles[0] if target_roles else ""),
-            "email": email,
+            "role": matched_role,
             "city": data.get("city", ""),
-            "state": data.get("state", company.get("hq_state", "")),
+            "state": data.get("state", "") or company.get("hq_state", ""),
+            "email": email,
         }
     except json.JSONDecodeError:
         return {
@@ -589,6 +609,14 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             if len(parts) >= 2 and domain:
                 email = f"{parts[0]}.{parts[-1]}@{domain}"
 
+        contact_state = contact.get("state", "") or company.get("hq_state", "")
+        contact_city = contact.get("city", "")
+
+        # Validator requires city and state for US leads — skip if missing
+        if country.lower() in ("united states", "us", "usa") and not contact_state:
+            logger.info(f"  Skipping {company_name} — missing state (required for US leads)")
+            continue
+
         lead = {
             "full_name": contact.get("full_name", ""),
             "email": email,
@@ -599,13 +627,13 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             "company_website": company.get("website", f"https://{domain}"),
             "employee_count": company.get("employee_estimate", icp.get("employee_count", "")),
             "company_hq_country": country,
-            "company_hq_state": contact.get("state", "") or company.get("hq_state", ""),
+            "company_hq_state": contact_state,
             "industry": industry,
             "sub_industry": sub_industry,
             "country": country,
-            "city": contact.get("city", ""),
-            "state": contact.get("state", "") or company.get("hq_state", ""),
-            "role": contact.get("role", icp.get("target_roles", [""])[0] if icp.get("target_roles") else ""),
+            "city": contact_city or company.get("hq_city", ""),
+            "state": contact_state,
+            "role": contact.get("role", ""),
             "role_type": target_role_types[0] if target_role_types else "Sales",
             "seniority": target_seniority,
             "intent_signals": [
@@ -620,8 +648,14 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             ],
         }
 
+        # Verify role is in target_roles (Tier 1 will reject otherwise)
+        target_roles_list = icp.get("target_roles", [])
+        if target_roles_list and lead["role"] not in target_roles_list:
+            logger.info(f"  Skipping {company_name} — role '{lead['role']}' not in target_roles")
+            continue
+
         leads.append(lead)
-        logger.info(f"  ✅ Lead: {contact['full_name']} @ {company_name} ({len(signals)} signals)")
+        logger.info(f"  ✅ Lead: {contact['full_name']} @ {company_name} role='{lead['role']}' ({len(signals)} signals)")
 
     logger.info(f"Sourced {len(leads)}/{num_leads} leads")
     return leads
