@@ -1,16 +1,15 @@
 """
-Fulfillment lead sourcing model.
+Web-based company and contact discovery for the Fulfillment Lead Model.
 
-Given an ICP (Ideal Customer Profile), discovers real companies, finds real
-decision-makers, mines verifiable intent signals from the web, and returns
-fully-structured FulfillmentLead objects ready for commit-reveal.
+Functions:
+  - discover_companies  — ScrapingDog Google Search for ICP-matching companies
+  - find_contact        — LinkedIn search + LLM for role-matched contacts
+  - _verify_email       — TrueList email_ok verification
+  - _google_search      — ScrapingDog Google Search wrapper
+  - _scrape_url         — ScrapingDog web scraping wrapper
+  - _llm_call           — OpenRouter LLM call wrapper
 
-Architecture:
-  1. Company Discovery   — ScrapingDog Google Search for companies matching ICP
-  2. Contact Discovery    — ScrapingDog Google/LinkedIn for decision-makers
-  3. Intent Signal Mining — ScrapingDog web scrape for buying signals
-  4. LLM Enrichment      — OpenRouter GPT-4o-mini for structuring/verification
-  5. Lead Assembly        — Build FulfillmentLead with real, verifiable data
+Intent signal mining and lead orchestration live in discovery.py.
 """
 
 import asyncio
@@ -293,6 +292,109 @@ Only include companies that are real businesses (not articles, directories, or l
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Location extraction — mirrors validator Stage 4 logic
+# ═══════════════════════════════════════════════════════════════════════════
+
+_US_STATE_ABBR = {
+    'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
+    'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
+    'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
+    'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
+    'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
+    'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
+    'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
+    'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
+    'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
+    'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
+    'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
+    'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
+    'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia',
+}
+_US_STATE_NAMES = {v.lower(): v for v in _US_STATE_ABBR.values()}
+_US_ABBR_SET = set(_US_STATE_ABBR.keys())
+
+_KNOWN_COUNTRIES = {
+    'united states', 'united kingdom', 'canada', 'australia', 'germany',
+    'france', 'spain', 'italy', 'netherlands', 'india', 'singapore',
+    'japan', 'brazil', 'mexico', 'ireland', 'switzerland', 'sweden',
+    'norway', 'denmark', 'belgium', 'austria', 'new zealand', 'israel',
+}
+
+
+def _extract_person_location(title: str, snippet: str) -> Dict[str, str]:
+    """Extract a person's city and state from LinkedIn search result text.
+
+    Mirrors the validator's Stage 4 location extraction so the miner
+    submits the same city/state the validator will verify.
+
+    Returns {"city": "...", "state": "...", "country": "..."}.
+    """
+    text = f"{title} {snippet}"
+
+    # Pattern 1: "City, State, United States" at end of snippet
+    m = re.search(
+        r'([A-Z][a-zA-Z\s\-]+),\s*([A-Z][a-zA-Z\s\-]+),\s*(United States|United Kingdom|Canada|Australia|Germany|France|India)\b',
+        text,
+    )
+    if m:
+        city, state_or_region, country = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        if country.lower() == "united states":
+            state_full = _US_STATE_NAMES.get(state_or_region.lower(), state_or_region)
+            return {"city": city, "state": state_full, "country": country}
+        return {"city": city, "state": state_or_region, "country": country}
+
+    # Pattern 2: "City, ST" (US state abbreviation)
+    m = re.search(r'([A-Z][a-zA-Z\s\-]+),\s*([A-Z]{2})\b', text)
+    if m:
+        city, abbr = m.group(1).strip(), m.group(2)
+        if abbr in _US_ABBR_SET:
+            return {
+                "city": city,
+                "state": _US_STATE_ABBR[abbr],
+                "country": "United States",
+            }
+
+    # Pattern 3: "City, Full State Name" (e.g., "Austin, Texas")
+    m = re.search(r'([A-Z][a-zA-Z\s\-]+),\s*([A-Z][a-zA-Z\s]+)', text)
+    if m:
+        city, maybe_state = m.group(1).strip(), m.group(2).strip()
+        if maybe_state.lower() in _US_STATE_NAMES:
+            return {
+                "city": city,
+                "state": _US_STATE_NAMES[maybe_state.lower()],
+                "country": "United States",
+            }
+
+    # Pattern 4: follower count pattern — "City, State. 500+ followers"
+    m = re.search(
+        r'([A-Z][a-zA-Z\s\-]+(?:,\s*[A-Z][a-zA-Z\s\-]+)*)\.\s*\d+[KMk]?\+?\s*(?:followers?|connections?)',
+        text,
+    )
+    if m:
+        loc_text = m.group(1).strip()
+        parts = [p.strip() for p in loc_text.split(",")]
+        if len(parts) >= 2:
+            city = parts[0]
+            state_part = parts[1]
+            if state_part.lower() in _US_STATE_NAMES:
+                return {
+                    "city": city,
+                    "state": _US_STATE_NAMES[state_part.lower()],
+                    "country": "United States",
+                }
+            if state_part in _US_ABBR_SET:
+                return {
+                    "city": city,
+                    "state": _US_STATE_ABBR[state_part],
+                    "country": "United States",
+                }
+            if state_part.lower() in _KNOWN_COUNTRIES:
+                return {"city": city, "state": "", "country": state_part}
+
+    return {"city": "", "state": "", "country": ""}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Step 2: Contact Discovery
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -337,7 +439,13 @@ async def find_contact(company: dict, icp: dict) -> Optional[Dict]:
     snippet_text = best.get("snippet", "")
     linkedin_url = best.get("link", "").split("?")[0]
 
+    # Extract location from the LinkedIn search result using the same
+    # regex patterns the validator uses in Stage 4.  This ensures the
+    # miner submits the PERSON's location, not the company HQ.
+    person_loc = _extract_person_location(title_text, snippet_text)
+
     roles_json = json.dumps(target_roles)
+    domain = company.get("domain", "company.com")
     prompt = f"""Extract the person's details from this LinkedIn search result and determine
 if their role matches any of the target roles.
 
@@ -351,18 +459,15 @@ Return ONLY a JSON object:
 - full_name: their full name
 - actual_role: their actual job title from LinkedIn
 - matched_role: which target role best matches (MUST be one from the list above, or "" if none match)
-- city: their city (e.g. "San Francisco")
-- state: their US state (e.g. "California")
-- email_guess: likely work email (firstname.lastname@{company.get('domain', 'company.com')})
+- email_guess: likely work email (firstname.lastname@{domain})
 
 Rules:
 - matched_role MUST be copied exactly from the target roles list if the person's actual role is close enough
   (e.g. actual "VP, Sales" matches target "VP of Sales"; actual "Head of Revenue Operations" matches "Head of Revenue")
 - If their role doesn't match ANY target role, set matched_role to ""
-- city and state are required for US-based contacts"""
+"""
 
     resp = await _llm_call(prompt)
-    domain = company.get("domain", "company.com")
 
     if not resp:
         name_parts = title_text.split(" - ")[0].strip().split("–")[0].strip()
@@ -371,8 +476,8 @@ Rules:
             "linkedin_url": linkedin_url,
             "role": target_roles[0] if target_roles else "VP of Sales",
             "email": "",
-            "city": "",
-            "state": company.get("hq_state", ""),
+            "city": person_loc.get("city", ""),
+            "state": person_loc.get("state", ""),
         }
 
     try:
@@ -397,8 +502,8 @@ Rules:
             "full_name": data.get("full_name", ""),
             "linkedin_url": linkedin_url,
             "role": matched_role,
-            "city": data.get("city", ""),
-            "state": data.get("state", "") or company.get("hq_state", ""),
+            "city": person_loc.get("city", ""),
+            "state": person_loc.get("state", ""),
             "email": email,
         }
     except json.JSONDecodeError:
@@ -407,246 +512,6 @@ Rules:
             "linkedin_url": linkedin_url,
             "role": target_roles[0] if target_roles else "",
             "email": "",
-            "city": "",
-            "state": company.get("hq_state", ""),
+            "city": person_loc.get("city", ""),
+            "state": person_loc.get("state", ""),
         }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Step 3: Intent Signal Mining
-# ═══════════════════════════════════════════════════════════════════════════
-
-async def mine_intent_signals(
-    company: dict, icp: dict, max_signals: int = 3
-) -> List[Dict]:
-    """Find real, verifiable intent signals for a company that match the
-    specific intent signals requested in the ICP.
-
-    Searches for EACH intent signal individually (e.g. "hiring SDRs",
-    "evaluating sales tools", "researching competitors") rather than
-    doing one generic search.  Each found signal includes a real URL,
-    a verbatim snippet from the page, and a date if visible.
-
-    Returns list of {source, description, url, date, snippet}.
-    """
-    company_name = company.get("name", "")
-    intent_keywords = icp.get("intent_signals", [])
-    product = icp.get("product_service", "")
-
-    if not intent_keywords:
-        intent_keywords = ["hiring", "expansion", "new product"]
-
-    signals = []
-    seen_urls = set()
-
-    for keyword in intent_keywords:
-        if len(signals) >= max_signals:
-            break
-
-        # Search specifically for this intent signal + company
-        query = f'"{company_name}" "{keyword}"'
-        results = await _google_search(query, num_results=5)
-
-        # Also try a broader version
-        if not results:
-            query = f'"{company_name}" {keyword} {product}'
-            results = await _google_search(query, num_results=5)
-
-        for r in results[:3]:
-            if len(signals) >= max_signals:
-                break
-
-            link = r.get("link", "")
-            if not link or link in seen_urls:
-                continue
-            seen_urls.add(link)
-
-            domain = _extract_domain(link)
-            snippet = r.get("snippet", "")
-
-            # Determine source type
-            if any(jb in domain for jb in [
-                "greenhouse.io", "lever.co", "indeed.com", "glassdoor.com",
-                "boards.greenhouse.io", "jobs.lever.co", "workable.com",
-                "builtin.com", "jobvite.com", "linkedin.com/jobs",
-            ]):
-                source_type = "job_board"
-            elif any(ns in domain for ns in [
-                "techcrunch.com", "bloomberg.com", "reuters.com", "forbes.com",
-                "cnbc.com", "venturebeat.com", "prnewswire.com",
-                "businesswire.com", "globenewswire.com", "crunchbase.com",
-                "zdnet.com", "siliconangle.com",
-            ]):
-                source_type = "news"
-            elif "linkedin.com" in domain:
-                source_type = "linkedin"
-            elif domain == company.get("domain", ""):
-                source_type = "company_website"
-            else:
-                source_type = "other"
-
-            # Scrape the page and verify the signal is real
-            html = await _scrape_url(link)
-            page_text = _extract_text_from_html(html, 3000) if html else snippet
-
-            if not page_text or len(page_text) < 50:
-                continue
-
-            verify_prompt = f"""You are verifying an intent signal for {company_name}.
-
-The client is looking for this specific signal: "{keyword}"
-The client sells: {product}
-
-Page content from {link}:
-{page_text[:2000]}
-
-Does this page provide SPECIFIC evidence that {company_name} is "{keyword}"?
-
-Rules:
-- The evidence must be SPECIFIC to {company_name} (not a generic industry article)
-- The evidence must relate to "{keyword}" specifically
-- Quote the exact text that proves this signal
-
-Return ONLY JSON:
-If YES: {{"found": true, "description": "One sentence: how {company_name} shows '{keyword}'", "snippet": "Verbatim 1-2 sentence quote from the page proving this", "date": "YYYY-MM-DD if visible, null otherwise"}}
-If NO: {{"found": false}}"""
-
-            resp = await _llm_call(verify_prompt)
-            if resp:
-                try:
-                    resp = resp.strip()
-                    if resp.startswith("```"):
-                        resp = re.sub(r'^```(?:json)?\s*', '', resp)
-                        resp = re.sub(r'\s*```$', '', resp)
-                    sig_data = json.loads(resp)
-                    if sig_data.get("found"):
-                        signals.append({
-                            "source": source_type,
-                            "description": sig_data.get("description", ""),
-                            "url": link,
-                            "date": sig_data.get("date"),
-                            "snippet": sig_data.get("snippet", snippet[:200]),
-                        })
-                        logger.info(f"    Found signal: '{keyword}' → {link[:60]}")
-                        break  # Found signal for this keyword, move to next
-                except json.JSONDecodeError:
-                    pass
-
-    return signals
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Step 4: Full Pipeline — Source Leads for ICP
-# ═══════════════════════════════════════════════════════════════════════════
-
-async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
-    """End-to-end pipeline: ICP → discovered, verified FulfillmentLead dicts.
-
-    Returns list of dicts matching the FulfillmentLead schema.
-    """
-    logger.info(f"Sourcing {num_leads} leads for ICP: {icp.get('industry')}/{icp.get('sub_industry')}")
-
-    # Discover more companies than needed (some won't yield contacts)
-    companies = await discover_companies(icp, num_companies=num_leads * 5)
-    logger.info(f"Discovered {len(companies)} candidate companies")
-
-    if not companies:
-        logger.warning("No companies discovered — cannot source leads")
-        return []
-
-    industry = icp.get("industry", "")
-    sub_industry = icp.get("sub_industry", "")
-    country = icp.get("country", "United States")
-    target_seniority = icp.get("target_seniority", "VP")
-    target_role_types = icp.get("target_role_types", ["Sales"])
-
-    leads = []
-    for company in companies:
-        if len(leads) >= num_leads:
-            break
-
-        company_name = company.get("name", "Unknown")
-        logger.info(f"Processing {company_name}...")
-
-        # Find contact
-        contact = await find_contact(company, icp)
-        if not contact or not contact.get("full_name"):
-            logger.info(f"  No contact found at {company_name}, skipping")
-            continue
-
-        # Build email
-        domain = company.get("domain", _extract_domain(company.get("website", "")))
-        email = contact.get("email", "")
-        if not email and contact.get("full_name"):
-            parts = contact["full_name"].lower().split()
-            if len(parts) >= 2 and domain:
-                email = f"{parts[0]}.{parts[-1]}@{domain}"
-
-        if not email:
-            logger.info(f"  No email for contact at {company_name}, skipping")
-            continue
-
-        # Verify email via TrueList BEFORE spending on intent mining
-        if TRUELIST_API_KEY:
-            email_valid, email_status = await _verify_email(email)
-            if not email_valid:
-                logger.info(f"  Email {email} failed TrueList ({email_status}), skipping {company_name}")
-                continue
-            logger.info(f"  Email {email} verified ({email_status})")
-
-        # Mine intent signals (expensive — only after email is verified)
-        signals = await mine_intent_signals(company, icp, max_signals=2)
-        if not signals:
-            logger.info(f"  No intent signals found for {company_name}, skipping")
-            continue
-
-        contact_state = contact.get("state", "") or company.get("hq_state", "")
-        contact_city = contact.get("city", "")
-
-        # Validator requires city and state for US leads — skip if missing
-        if country.lower() in ("united states", "us", "usa") and not contact_state:
-            logger.info(f"  Skipping {company_name} — missing state (required for US leads)")
-            continue
-
-        lead = {
-            "full_name": contact.get("full_name", ""),
-            "email": email,
-            "linkedin_url": contact.get("linkedin_url", ""),
-            "phone": "",
-            "business": company_name,
-            "company_linkedin": f"https://linkedin.com/company/{company_name.lower().replace(' ', '-')}",
-            "company_website": company.get("website", f"https://{domain}"),
-            "employee_count": company.get("employee_estimate", icp.get("employee_count", "")),
-            "company_hq_country": country,
-            "company_hq_state": contact_state,
-            "industry": industry,
-            "sub_industry": sub_industry,
-            "country": country,
-            "city": contact_city or company.get("hq_city", ""),
-            "state": contact_state,
-            "role": contact.get("role", ""),
-            "role_type": target_role_types[0] if target_role_types else "Sales",
-            "seniority": target_seniority,
-            "intent_signals": [
-                {
-                    "source": s["source"],
-                    "description": s["description"],
-                    "url": s["url"],
-                    "date": s.get("date"),
-                    "snippet": s.get("snippet", "")[:1000],
-                }
-                for s in signals
-            ],
-        }
-
-        # Verify role is in target_roles (Tier 1 will reject otherwise)
-        target_roles_list = icp.get("target_roles", [])
-        if target_roles_list and lead["role"] not in target_roles_list:
-            logger.info(f"  Skipping {company_name} — role '{lead['role']}' not in target_roles")
-            continue
-
-        leads.append(lead)
-        logger.info(f"  ✅ Lead: {contact['full_name']} @ {company_name} role='{lead['role']}' ({len(signals)} signals)")
-
-    logger.info(f"Sourced {len(leads)}/{num_leads} leads")
-    return leads

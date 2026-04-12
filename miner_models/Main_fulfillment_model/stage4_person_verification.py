@@ -19,17 +19,15 @@ Usage in automated_checks.py:
         return False, result['rejection_reason']
 """
 
-import json
 import logging
 import os
 import re
 import time
 import asyncio
-import requests
 from typing import Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from .stage4_helpers import (
+from stage4_helpers import (
     check_name_in_result,
     check_company_in_result,
     extract_location_from_text,
@@ -49,8 +47,6 @@ from .stage4_helpers import (
     should_reject_city_match,
     GEO_LOOKUP,
     CITY_EQUIVALENTS,
-    COUNTRY_ALIASES,
-    get_linkedin_url_country,
 )
 
 _SAINT_PREFIX_RE = re.compile(r'^(?:saint|st\.?)\s+')
@@ -72,197 +68,6 @@ if not OPENROUTER_KEY:
 
 # Thread pool for running sync functions
 _executor = ThreadPoolExecutor(max_workers=4)
-
-
-# =========================================================================
-# AI Mode Role Verification (Step 7.5)
-# =========================================================================
-
-_AIMODE_QUERY_TEMPLATE = (
-    'For LinkedIn profile {url}, is the current job title "{role}" at "{company}"? '
-    'You may use any of these sources from the exact LinkedIn profile: '
-    '(1) the page title (e.g., "Name - Title at Company | LinkedIn"), '
-    '(2) the headline tagline at the top of the profile, OR '
-    '(3) the current Experience section entry. '
-    'Return JSON only: {{"answer":"yes|no|unknown","source":"title|headline|experience","evidence":""}}. '
-    'Rules: '
-    '"yes" if any of those sources confirms "{role}" at "{company}" as the current/most recent role. '
-    '"no" if the sources show a different current role or company. '
-    '"unknown" if you cannot find any of these sources for the exact profile {url}. '
-    'Do NOT use any other person with a similar name. '
-    'In "source" indicate which source you used (title, headline, or experience). '
-    'In "evidence" quote the literal text from that source.'
-)
-
-_AIMODE_DEFAULT = {"answer": "unknown", "source": "", "evidence": ""}
-
-
-def _parse_aimode_json(text: str) -> Optional[dict]:
-    """Try to extract {"answer":...} JSON from AI Mode response text."""
-    for pattern in [r'\{[^{}]*"answer"[^{}]*\}', r'\{.*?\}']:
-        m = re.search(pattern, text, re.DOTALL)
-        if m:
-            for raw in [m.group(), re.sub(r'\\_', '_', m.group())]:
-                try:
-                    obj = json.loads(raw)
-                    if "answer" in obj:
-                        return obj
-                except Exception:
-                    pass
-    return None
-
-
-async def _aimode_llm_fallback(
-    prose: str,
-    claimed_role: str,
-    claimed_company: str,
-    openrouter_key: str,
-) -> dict:
-    """Tier 3: Use a cheap LLM to extract yes/no/unknown from AI Mode prose."""
-    if not openrouter_key or not prose:
-        return dict(_AIMODE_DEFAULT)
-
-    prompt = (
-        f'You are a strict role verification assistant. '
-        f'Based on the search context below, decide if the claim is correct.\n\n'
-        f'Question: Is the current job title "{claimed_role}" at "{claimed_company}"?\n\n'
-        f'Search context:\n"""\n{prose[:1500]}\n"""\n\n'
-        f'Rules:\n'
-        f'- "yes" if the context confirms the role and company match\n'
-        f'- "no" if the context shows a different role or company\n'
-        f'- "unknown" if not enough information\n\n'
-        f'Return JSON only: {{"answer":"yes|no|unknown"}}'
-    )
-
-    def _call():
-        try:
-            resp = requests.post(
-                'https://openrouter.ai/api/v1/chat/completions',
-                headers={'Authorization': f'Bearer {openrouter_key}',
-                         'Content-Type': 'application/json'},
-                json={'model': 'google/gemini-2.5-flash-lite',
-                      'messages': [{'role': 'user', 'content': prompt}],
-                      'temperature': 0, 'max_tokens': 100},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                content = resp.json()['choices'][0]['message']['content']
-                parsed = _parse_aimode_json(content)
-                if parsed:
-                    return parsed
-        except Exception:
-            pass
-        return None
-
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(_executor, _call)
-    return result or dict(_AIMODE_DEFAULT)
-
-
-async def _check_role_via_aimode(
-    linkedin_url: str,
-    claimed_role: str,
-    claimed_company: str,
-    scrapingdog_api_key: str,
-    openrouter_api_key: str = "",
-) -> dict:
-    """
-    Verify role via ScrapingDog Google AI Mode (Step 7.5).
-
-    3-tier pipeline:
-      Tier 1: AI Mode call → parse JSON answer
-      Tier 2: Retry on transient HTTP errors (up to 3x)
-      Tier 3: LLM fallback for prose responses (Gemini Flash via OpenRouter)
-
-    Returns: {"answer": "yes"|"no"|"unknown", "source": str, "evidence": str}
-    """
-    if not scrapingdog_api_key or not linkedin_url or not claimed_role:
-        return dict(_AIMODE_DEFAULT)
-
-    # Escape quotes in role/company to prevent prompt injection
-    safe_role = claimed_role.replace('"', "'")
-    safe_company = claimed_company.replace('"', "'")
-
-    query = _AIMODE_QUERY_TEMPLATE.format(
-        url=linkedin_url, role=safe_role, company=safe_company,
-    )
-
-    # Tier 1 + Tier 2: call with retry
-    last_markdown = ""
-
-    def _call_aimode():
-        nonlocal last_markdown
-        for attempt in range(3):
-            try:
-                resp = requests.get(
-                    'https://api.scrapingdog.com/google/ai_mode',
-                    params={'api_key': scrapingdog_api_key, 'query': query},
-                    timeout=90,
-                )
-                if resp.status_code in (502, 503, 429):
-                    if attempt < 2:
-                        time.sleep(2 + attempt * 2)
-                        continue
-                    return None
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        if attempt < 2:
-                            continue
-                        return None
-                    md = data.get('markdown', '') or ''
-                    last_markdown = md
-
-                    # Try parsing JSON from markdown
-                    parsed = _parse_aimode_json(md)
-                    if parsed:
-                        return parsed
-
-                    # Try text_blocks
-                    for tb in data.get('text_blocks', []):
-                        snip = tb.get('snippet', '') or ''
-                        parsed = _parse_aimode_json(snip)
-                        if parsed:
-                            return parsed
-
-                    # Got 200 but no JSON → prose response, handled by Tier 3
-                    return None
-                else:
-                    if attempt < 2:
-                        time.sleep(2 + attempt * 2)
-                        continue
-                    return None
-            except Exception:
-                if attempt < 2:
-                    time.sleep(2 + attempt * 2)
-                    continue
-                return None
-        return None
-
-    loop = asyncio.get_running_loop()
-    parsed = await loop.run_in_executor(_executor, _call_aimode)
-
-    if parsed and parsed.get("answer") in ("yes", "no", "unknown"):
-        return {
-            "answer": parsed["answer"],
-            "source": parsed.get("source", ""),
-            "evidence": (parsed.get("evidence", "") or "")[:500],
-        }
-
-    # Tier 3: LLM fallback for prose responses
-    if last_markdown and openrouter_api_key:
-        llm_result = await _aimode_llm_fallback(
-            last_markdown, claimed_role, claimed_company, openrouter_api_key,
-        )
-        if llm_result and llm_result.get("answer") in ("yes", "no", "unknown"):
-            return {
-                "answer": llm_result["answer"],
-                "source": "llm_prose_fallback",
-                "evidence": last_markdown[:300],
-            }
-
-    return dict(_AIMODE_DEFAULT)
 
 
 async def search_google_async(query: str, api_key: str, max_results: int = 10) -> Tuple[list, Optional[str]]:
@@ -876,56 +681,6 @@ async def run_lead_validation_stage4(
         if not location_passed:
             print(f"   ❌ Q5 failed: \"{city}, {state}\" not found on profile")
 
-    # 6c-uae. Q5 UAE Location Fallback - runs for UAE leads without state
-    if not location_passed and city and linkedin_url and not state and country:
-        country_lower = country.lower().strip()
-        uae_names = {'united arab emirates'} | set(COUNTRY_ALIASES.get('united arab emirates', []))
-        if country_lower in uae_names:
-            # Build city variants from equivalents
-            city_names_uae = [city]
-            city_lower_uae = city.lower().strip()
-            city_equiv = CITY_EQUIVALENTS.get(city_lower_uae)
-            if city_equiv and city_equiv.lower() != city_lower_uae:
-                city_names_uae.append(city_equiv.title())
-            for key, val in CITY_EQUIVALENTS.items():
-                if val == city_lower_uae and key != city_lower_uae:
-                    city_names_uae.append(key.title())
-
-            for city_variant in city_names_uae:
-                q5_uae_query = f'site:linkedin.com/in/{expected_lid} "{city_variant}"'
-                print(f"   🔍 Q5-UAE: {q5_uae_query}")
-                q5_uae_results, q5_uae_error = await search_google_async(q5_uae_query, api_key)
-                queries_used.append('Q5-UAE')
-
-                for r in q5_uae_results:
-                    if get_linkedin_id(r.get('link', '')) == expected_lid:
-                        r_text = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
-                        r_link = r.get('link', '')
-
-                        # Check 1: ae.linkedin.com domain
-                        url_country = get_linkedin_url_country(r_link)
-                        if url_country and url_country == 'united arab emirates':
-                            location_passed = True
-                            location_method = 'q5_slug_uae_domain'
-                            print(f"   ✅ Q5-UAE passed: '{city_variant}' on profile + ae.linkedin.com domain")
-                            break
-
-                        # Check 2: country name/alias in text
-                        uae_text_variants = {'united arab emirates', 'uae', 'u.a.e.'}
-                        if any(v in r_text for v in uae_text_variants):
-                            location_passed = True
-                            location_method = 'q5_slug_uae_text'
-                            print(f"   ✅ Q5-UAE passed: '{city_variant}' on profile + UAE in text")
-                            break
-
-                        print(f"   ⚠️ Q5-UAE: '{city_variant}' found on profile but no UAE country signal")
-
-                if location_passed:
-                    break
-
-            if not location_passed:
-                print(f"   ❌ Q5-UAE failed: \"{city}\" with UAE confirmation not found on profile")
-
     # 6d. Q3 Location Fallback
     if not location_passed and city and linkedin_url:
         print(f"   🔍 Q3: Fallback \"{full_name}\" \"{company}\" \"{city}\" \"{linkedin_url}\"")
@@ -982,172 +737,129 @@ async def run_lead_validation_stage4(
             print(f"   ✅ Role verified (rule-based): {role_method}")
         else:
             # =========================================================================
-            # STEP 7.5: AI Mode Role Check
+            # STEP 8: Role Query + LLM Fallback
             # =========================================================================
-            if api_key:
-                print(f"   🔍 AI Mode: checking role '{role}' at '{company}' via Google AI Mode")
-                aimode_result = await _check_role_via_aimode(
-                    linkedin_url, role, company, api_key,
-                    openrouter_api_key=openrouter_api_key or OPENROUTER_KEY,
+            # Try a targeted role query before LLM
+            role_query_result = None
+            rq_query = f'linkedin.com/in/{expected_lid}+role'
+            print(f"   🔍 RQ: Role query: {rq_query}")
+            rq_results, rq_error = await search_google_async(rq_query, api_key)
+
+            if rq_results:
+                for r in rq_results:
+                    if get_linkedin_id(r.get('link', '')) == expected_lid:
+                        role_query_result = r
+                        break
+
+            if rq_results:
+                # Rule-based check on RQ results (LinkedIn profile only)
+                rq_passed, rq_method = validate_role_rule_based(
+                    role, rq_results, linkedin_url, full_name
                 )
-                if aimode_result["answer"] == "yes":
+                if rq_passed:
                     result['data']['role_verified'] = True
-                    result['data']['role_method'] = f'aimode_{aimode_result.get("source", "")}'
-                    print(f"   ✅ Role verified (AI Mode): {aimode_result.get('evidence', '')[:80]}")
-                elif aimode_result["answer"] == "no":
-                    # AI Mode said "no" — verify with LLM before hard-rejecting
-                    aimode_evidence = aimode_result.get("evidence", "")
-                    print(f"   ⚠️ AI Mode said 'no' — verifying with LLM: {aimode_evidence[:80]}")
-                    llm_second_opinion = await _aimode_llm_fallback(
-                        f'Claimed role: "{role}"\nAI Mode evidence: "{aimode_evidence}"',
-                        role, company,
-                        openrouter_api_key or OPENROUTER_KEY,
-                    )
-                    if llm_second_opinion.get("answer") == "yes":
-                        # LLM overrides AI Mode — evidence actually confirms the role
-                        result['data']['role_verified'] = True
-                        result['data']['role_method'] = 'aimode_corrected_by_llm'
-                        print(f"   ✅ Role verified (AI Mode corrected by LLM): {aimode_evidence[:80]}")
-                    elif llm_second_opinion.get("answer") == "no":
-                        # LLM confirms rejection
-                        result['data']['role_verified'] = False
-                        result['data']['role_method'] = 'aimode_reject_confirmed'
-                        result['rejection_reason'] = {
-                            "stage": "Stage 4: Lead Validation",
-                            "check_name": "lead_validation_stage4",
-                            "message": f"Role '{role}' rejected by AI Mode (confirmed by LLM): {aimode_evidence[:200]}",
-                            "failed_fields": ["role"],
-                            "claimed_role": role,
-                            "aimode_evidence": aimode_evidence,
-                        }
-                        print(f"   ❌ Role rejected (AI Mode + LLM confirmed): {aimode_evidence[:80]}")
-                        return result
-                    else:
-                        # LLM unsure — don't trust AI Mode's "no", fall through to Step 8
-                        print(f"   ⚠️ LLM unsure about AI Mode rejection, falling through to RQ+LLM")
+                    result['data']['role_method'] = f'role_query_{rq_method}'
+                    print(f"   ✅ Role verified (role query rule-based): {rq_method}")
                 else:
-                    print(f"   ⚠️ AI Mode inconclusive, falling through to RQ+LLM")
+                    print("   ⚠️ Role query: no rule-based match in RQ results")
+            else:
+                print("   ⚠️ Role query: no results returned")
 
             if not result['data']['role_verified']:
-                # =========================================================
-                # STEP 8: Role Query + LLM Fallback
-                # =========================================================
-                # Try a targeted role query before LLM
-                role_query_result = None
-                rq_query = f'linkedin.com/in/{expected_lid}+role'
-                print(f"   🔍 RQ: Role query: {rq_query}")
-                rq_results, rq_error = await search_google_async(rq_query, api_key)
+                print("   🤖 Trying LLM verification")
+                result['data']['llm_used'] = True
 
-                if rq_results:
-                    for r in rq_results:
-                        if get_linkedin_id(r.get('link', '')) == expected_lid:
-                            role_query_result = r
-                            break
-
-                if rq_results:
-                    # Rule-based check on RQ results (LinkedIn profile only)
-                    rq_passed, rq_method = validate_role_rule_based(
-                        role, rq_results, linkedin_url, full_name
-                    )
-                    if rq_passed:
-                        result['data']['role_verified'] = True
-                        result['data']['role_method'] = f'role_query_{rq_method}'
-                        print(f"   ✅ Role verified (role query rule-based): {rq_method}")
-                    else:
-                        print("   ⚠️ Role query: no rule-based match in RQ results")
-                else:
-                    print("   ⚠️ Role query: no results returned")
-
-                if not result['data']['role_verified']:
-                    print("   🤖 Trying LLM verification")
-                    result['data']['llm_used'] = True
-
-                    # Prepare LLM input - use role query result if available, else Q4 result
-                    exact_url_text = None
-                    if role_query_result:
-                        exact_url_text = f"Title: {role_query_result.get('title', '')}\nSnippet: {role_query_result.get('snippet', '')}"
-                    elif url_matched_result:
-                        exact_url_text = f"Title: {url_matched_result.get('title', '')}\nSnippet: {url_matched_result.get('snippet', '')}"
-
-                    # Separate LinkedIn directory pages from other results
-                    directory_text = []
-                    other_results_text = []
-                    seen_links = set()
-                    name_lower = full_name.lower()
-                    company_lower = company.lower()
-                    for r in list(all_results[:10]) + list(rq_results or []):
-                        link = r.get('link', '').lower()
-                        if link in seen_links:
-                            continue
-                        result_lid = get_linkedin_id(link)
-                        if result_lid and result_lid == expected_lid:
-                            continue
-                        seen_links.add(link)
-                        combined = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
+                # Merge all unique slug-matched snippets from Q4/Q1/RQ
+                # Different queries often return different snippets for the same profile
+                seen_snippets = set()
+                exact_parts = []
+                for r in list(all_results[:10]) + list(rq_results or []):
+                    if get_linkedin_id(r.get('link', '')) == expected_lid:
                         entry = f"Title: {r.get('title', '')}\nSnippet: {r.get('snippet', '')}"
-                        if 'linkedin.com' in link:
-                            if name_lower in combined and company_lower in combined:
-                                directory_text.append(entry)
-                        else:
-                            other_results_text.append(entry)
+                        if entry not in seen_snippets:
+                            seen_snippets.add(entry)
+                            exact_parts.append(entry)
+                exact_url_text = "\n---\n".join(exact_parts) if exact_parts else None
 
-                    # Get OpenRouter API key
-                    openrouter_key = openrouter_api_key or OPENROUTER_KEY
-
-                    if openrouter_key:
-                        llm_result = validate_role_with_llm(
-                            full_name, company, role,
-                            exact_url_text, other_results_text[:5],
-                            openrouter_key,
-                            directory_results=directory_text[:3]
-                        )
-
-                        if llm_result.get('success') and llm_result.get('role_pass'):
-                            result['data']['role_verified'] = True
-                            result['data']['role_method'] = 'llm'
-                            result['data']['llm_result'] = 'pass'
-                            print("   ✅ Role verified (LLM)")
-                        elif llm_result.get('success'):
-                            result['data']['role_verified'] = False
-                            result['data']['role_method'] = 'llm'
-                            result['data']['llm_result'] = 'fail'
-                            result['rejection_reason'] = {
-                                "stage": "Stage 4: Lead Validation",
-                                "check_name": "lead_validation_stage4",
-                                "message": f"Role '{role}' not verified by LLM",
-                                "failed_fields": ["role"],
-                                "claimed_role": role
-                            }
-                            print("   ❌ Role rejected (LLM)")
-                            return result
-                        else:
-                            # LLM error - fail safe
-                            result['data']['role_verified'] = False
-                            result['data']['role_method'] = 'llm_error'
-                            result['data']['llm_result'] = llm_result.get('error', 'unknown')
-                            result['rejection_reason'] = {
-                                "stage": "Stage 4: Lead Validation",
-                                "check_name": "lead_validation_stage4",
-                                "message": f"Role verification LLM error: {llm_result.get('error', 'unknown')}",
-                                "failed_fields": ["role"],
-                                "claimed_role": role,
-                                "llm_error": llm_result.get('error', 'unknown')
-                            }
-                            print(f"   ❌ Role LLM error: {llm_result.get('error', 'unknown')}")
-                            return result
+                # Separate LinkedIn directory pages from other results
+                directory_text = []
+                other_results_text = []
+                seen_links = set()
+                name_lower = full_name.lower()
+                company_lower = company.lower()
+                for r in list(all_results[:10]) + list(rq_results or []):
+                    link = r.get('link', '').lower()
+                    if link in seen_links:
+                        continue
+                    result_lid = get_linkedin_id(link)
+                    if result_lid and result_lid == expected_lid:
+                        continue
+                    seen_links.add(link)
+                    combined = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
+                    entry = f"Title: {r.get('title', '')}\nSnippet: {r.get('snippet', '')}"
+                    if 'linkedin.com' in link:
+                        if name_lower in combined and company_lower in combined:
+                            directory_text.append(entry)
                     else:
-                        # No API key - fail
+                        other_results_text.append(entry)
+
+                # Get OpenRouter API key
+                openrouter_key = openrouter_api_key or OPENROUTER_KEY
+
+                if openrouter_key:
+                    llm_result = validate_role_with_llm(
+                        full_name, company, role,
+                        exact_url_text, other_results_text[:5],
+                        openrouter_key,
+                        directory_results=directory_text[:3]
+                    )
+
+                    if llm_result.get('success') and llm_result.get('role_pass'):
+                        result['data']['role_verified'] = True
+                        result['data']['role_method'] = 'llm'
+                        result['data']['llm_result'] = 'pass'
+                        print("   ✅ Role verified (LLM)")
+                    elif llm_result.get('success'):
                         result['data']['role_verified'] = False
-                        result['data']['role_method'] = 'no_api_key'
+                        result['data']['role_method'] = 'llm'
+                        result['data']['llm_result'] = 'fail'
                         result['rejection_reason'] = {
                             "stage": "Stage 4: Lead Validation",
                             "check_name": "lead_validation_stage4",
-                            "message": "Role verification failed: no OpenRouter API key for LLM fallback",
+                            "message": f"Role '{role}' not verified by LLM",
                             "failed_fields": ["role"],
                             "claimed_role": role
                         }
-                        print("   ❌ Role verification failed: no OpenRouter API key")
+                        print("   ❌ Role rejected (LLM)")
                         return result
+                    else:
+                        # LLM error - fail safe
+                        result['data']['role_verified'] = False
+                        result['data']['role_method'] = 'llm_error'
+                        result['data']['llm_result'] = llm_result.get('error', 'unknown')
+                        result['rejection_reason'] = {
+                            "stage": "Stage 4: Lead Validation",
+                            "check_name": "lead_validation_stage4",
+                            "message": f"Role verification LLM error: {llm_result.get('error', 'unknown')}",
+                            "failed_fields": ["role"],
+                            "claimed_role": role,
+                            "llm_error": llm_result.get('error', 'unknown')
+                        }
+                        print(f"   ❌ Role LLM error: {llm_result.get('error', 'unknown')}")
+                        return result
+                else:
+                    # No API key - fail
+                    result['data']['role_verified'] = False
+                    result['data']['role_method'] = 'no_api_key'
+                    result['rejection_reason'] = {
+                        "stage": "Stage 4: Lead Validation",
+                        "check_name": "lead_validation_stage4",
+                        "message": "Role verification failed: no OpenRouter API key for LLM fallback",
+                        "failed_fields": ["role"],
+                        "claimed_role": role
+                    }
+                    print("   ❌ Role verification failed: no OpenRouter API key")
+                    return result
     else:
         # No role provided - skip verification
         result['data']['role_verified'] = False
