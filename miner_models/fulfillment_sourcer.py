@@ -142,12 +142,16 @@ async def _verify_email(email: str) -> Tuple[bool, str]:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    state = data.get("email_state", "unknown")
-                    sub_state = data.get("email_sub_state", "")
-                    # Accept: email_ok (verified), risky/accept_all (catch-all domain),
-                    # unknown (TrueList couldn't determine — let validator decide).
-                    # Reject: email_invalid, failed_no_mailbox (definitively bad).
-                    is_valid = state not in ("email_invalid",)
+                    # TrueList wraps results in {"emails": [{...}]}
+                    email_data = data
+                    if "emails" in data and data["emails"]:
+                        email_data = data["emails"][0]
+                    state = email_data.get("email_state", "unknown")
+                    sub_state = email_data.get("email_sub_state", "")
+                    # Accept: email_ok (verified) or risky (catch-all domain —
+                    # common for enterprise companies like Klaviyo, Google, etc.)
+                    # Reject: email_invalid / failed_* (definitively bad)
+                    is_valid = state in ("email_ok", "risky")
                     return is_valid, sub_state or state
                 if resp.status_code in (429, 502, 503):
                     await asyncio.sleep(2)
