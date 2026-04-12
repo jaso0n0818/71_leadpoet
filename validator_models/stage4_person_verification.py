@@ -1121,15 +1121,15 @@ async def run_lead_validation_stage4(
                         # No API key - fail
                         result['data']['role_verified'] = False
                         result['data']['role_method'] = 'no_api_key'
-                    result['rejection_reason'] = {
-                        "stage": "Stage 4: Lead Validation",
-                        "check_name": "lead_validation_stage4",
-                        "message": "Role verification failed: no OpenRouter API key for LLM fallback",
-                        "failed_fields": ["role"],
-                        "claimed_role": role
-                    }
-                    print("   ❌ Role verification failed: no OpenRouter API key")
-                    return result
+                        result['rejection_reason'] = {
+                            "stage": "Stage 4: Lead Validation",
+                            "check_name": "lead_validation_stage4",
+                            "message": "Role verification failed: no OpenRouter API key for LLM fallback",
+                            "failed_fields": ["role"],
+                            "claimed_role": role
+                        }
+                        print("   ❌ Role verification failed: no OpenRouter API key")
+                        return result
     else:
         # No role provided - skip verification
         result['data']['role_verified'] = False

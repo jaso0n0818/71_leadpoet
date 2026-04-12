@@ -2524,10 +2524,16 @@ def gateway_reveal_fulfillment(
 # ═══════════════════════════════════════════════════════════════════
 
 def gateway_get_fulfillment_reveals(wallet: bt.wallet, request_id: str = None) -> dict:
-    """Fetch revealed leads in scoring status, ready for scoring."""
+    """Fetch revealed leads in scoring status, ready for scoring.
+
+    Passes the validator's hotkey so the gateway excludes requests
+    this validator has already scored (avoids redundant API costs).
+    """
     try:
+        params = {"validator_hotkey": wallet.hotkey.ss58_address}
         response = requests.get(
             f"{GATEWAY_URL}/fulfillment/scoring",
+            params=params,
             timeout=30,
         )
         response.raise_for_status()

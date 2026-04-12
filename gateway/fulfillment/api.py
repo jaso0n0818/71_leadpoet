@@ -381,8 +381,21 @@ async def get_scoring_requests(validator_hotkey: str = ""):
         .eq("status", "scoring") \
         .execute()
 
+    # If validator_hotkey is provided, check which requests this validator
+    # has already scored — exclude them so the validator doesn't re-score.
+    already_scored_requests = set()
+    if validator_hotkey:
+        scored_resp = supabase.table("fulfillment_scores") \
+            .select("request_id") \
+            .eq("validator_hotkey", validator_hotkey) \
+            .execute()
+        already_scored_requests = {r["request_id"] for r in (scored_resp.data or [])}
+
     out = []
     for r in (resp.data or []):
+        if r["request_id"] in already_scored_requests:
+            continue
+
         subs_resp = supabase.table("fulfillment_submissions") \
             .select("*") \
             .eq("request_id", r["request_id"]) \

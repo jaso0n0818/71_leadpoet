@@ -94,16 +94,18 @@ def _release_advisory_lock(supabase) -> None:
 
 async def fulfillment_lifecycle_task() -> None:
     """Background loop managing fulfillment request state transitions."""
-    logger.info("Fulfillment lifecycle task started")
+    print("🔄 Fulfillment lifecycle task running (every 30s)")
 
     while True:
         try:
             await _lifecycle_tick()
         except asyncio.CancelledError:
-            logger.info("Fulfillment lifecycle task cancelled")
+            print("Fulfillment lifecycle task cancelled")
             break
         except Exception as e:
-            logger.error(f"Fulfillment lifecycle error: {e}")
+            print(f"❌ Fulfillment lifecycle error: {e}")
+            import traceback
+            traceback.print_exc()
 
         await asyncio.sleep(FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS)
 
@@ -131,15 +133,17 @@ async def _lifecycle_tick_inner(supabase) -> None:
         .eq("status", "open") \
         .lt("window_end", now_iso) \
         .execute()
+    if open_past_window.data:
+        print(f"Lifecycle: {len(open_past_window.data)} open request(s) past window_end")
     for r in (open_past_window.data or []):
         try:
             supabase.rpc("fulfillment_close_window", {
                 "p_request_id": r["request_id"],
                 "p_new_status": "commit_closed",
             }).execute()
-            logger.info(f"Request {r['request_id'][:8]}... -> commit_closed")
+            print(f"   {r['request_id'][:8]}... -> commit_closed")
         except Exception as e:
-            logger.error(f"Error closing window for {r['request_id'][:8]}...: {e}")
+            print(f"   Error closing {r['request_id'][:8]}...: {e}")
 
     # Step 2: commit_closed -> scoring or recycled (past reveal_window_end)
     closed_past_reveal = supabase.table("fulfillment_requests") \

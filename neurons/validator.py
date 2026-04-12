@@ -4012,10 +4012,7 @@ class Validator(BaseValidatorNeuron):
                 if not submissions:
                     continue
 
-                bt.logging.info(
-                    f"Fulfillment: scoring {len(submissions)} submission(s) "
-                    f"for {request_id[:8]}..."
-                )
+                print(f"\n🔍 Fulfillment: scoring {len(submissions)} submission(s) for {request_id[:8]}...")
 
                 scored_all: dict = {}
                 for sub in submissions:
@@ -4053,14 +4050,9 @@ class Validator(BaseValidatorNeuron):
                         gateway_submit_fulfillment_scores(
                             self.wallet, request_id, scores_payload,
                         )
-                        bt.logging.info(
-                            f"Submitted {len(scores_payload)} scores for "
-                            f"miner {miner_hk[:8]}... on request {request_id[:8]}..."
-                        )
+                        print(f"   ✅ Submitted {len(scores_payload)} scores for miner {miner_hk[:8]}...")
                     except Exception as e:
-                        bt.logging.error(
-                            f"Scoring failed for miner {miner_hk[:8]}: {e}"
-                        )
+                        print(f"   ❌ Scoring failed for miner {miner_hk[:8]}: {e}")
 
         except ImportError as e:
             if not getattr(self, "_fulfillment_import_warned", False):

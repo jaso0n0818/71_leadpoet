@@ -676,7 +676,7 @@ class Miner(BaseMinerNeuron):
     async def fulfillment_loop(self, miner_hotkey: str):
         """Background loop: poll for ICP fulfillment requests, source leads,
         commit hashes, then reveal after the commit window closes."""
-        bt.logging.info("Fulfillment loop started")
+        print("🔄 Fulfillment loop started (polling every 30s)")
         poll_interval = int(os.environ.get("FULFILLMENT_POLL_INTERVAL", "30"))
 
         self._load_pending_fulfillment()
@@ -708,10 +708,7 @@ class Miner(BaseMinerNeuron):
                     num_leads = req.get("num_leads", 10)
                     industry = icp.get("industry", None)
 
-                    bt.logging.info(
-                        f"Fulfillment: sourcing {num_leads} leads for "
-                        f"{request_id[:8]}... (industry={industry})"
-                    )
+                    print(f"\n🎯 Fulfillment: sourcing {num_leads} leads for {request_id[:8]}... (industry={industry})")
 
                     try:
                         async with self._fulfillment_semaphore:
@@ -719,11 +716,11 @@ class Miner(BaseMinerNeuron):
                                 icp, num_leads, miner_hotkey,
                             )
                     except Exception as e:
-                        bt.logging.error(f"Fulfillment sourcing failed for {request_id[:8]}: {e}")
+                        print(f"   ❌ Fulfillment sourcing failed for {request_id[:8]}: {e}")
                         continue
 
                     if not leads:
-                        bt.logging.warning(f"No leads sourced for {request_id[:8]}")
+                        print(f"   ⚠️ No leads sourced for {request_id[:8]}")
                         continue
 
                     # Hash each lead and build commit entries
@@ -742,7 +739,7 @@ class Miner(BaseMinerNeuron):
                         )
                         submission_id = result.get("submission_id", "")
                         if not submission_id:
-                            bt.logging.warning(f"Commit rejected for {request_id[:8]}: {result}")
+                            print(f"   ⚠️ Commit rejected for {request_id[:8]}: {result}")
                             continue
 
                         state = {
@@ -752,11 +749,9 @@ class Miner(BaseMinerNeuron):
                         }
                         self._pending_fulfillment[request_id] = state
                         self._save_pending_fulfillment(request_id, state)
-                        bt.logging.info(
-                            f"Committed {len(hashes)} hashes for {request_id[:8]}"
-                        )
+                        print(f"   ✅ Committed {len(hashes)} lead hashes for {request_id[:8]}... (reveal after {req.get('window_end', '?')})")
                     except Exception as e:
-                        bt.logging.error(f"Commit failed for {request_id[:8]}: {e}")
+                        print(f"   ❌ Commit failed for {request_id[:8]}: {e}")
 
                 # Phase 2: reveal any commits whose window has closed
                 now = datetime.now(timezone.utc)
@@ -773,7 +768,7 @@ class Miner(BaseMinerNeuron):
                     if now < deadline:
                         continue
 
-                    bt.logging.info(f"Revealing {len(state['leads'])} leads for {rid[:8]}...")
+                    print(f"\n📤 Revealing {len(state['leads'])} leads for {rid[:8]}...")
                     try:
                         gateway_reveal_fulfillment(
                             self.wallet,
@@ -781,10 +776,10 @@ class Miner(BaseMinerNeuron):
                             state["submission_id"],
                             state["leads"],
                         )
-                        bt.logging.info(f"Reveal successful for {rid[:8]}")
+                        print(f"   ✅ Reveal successful for {rid[:8]}!")
                         revealed.append(rid)
                     except Exception as e:
-                        bt.logging.error(f"Reveal failed for {rid[:8]}: {e}")
+                        print(f"   ❌ Reveal failed for {rid[:8]}: {e}")
                         revealed.append(rid)
 
                 for rid in revealed:
