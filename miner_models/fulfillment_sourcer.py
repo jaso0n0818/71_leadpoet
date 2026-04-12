@@ -417,12 +417,15 @@ Rules:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def mine_intent_signals(
-    company: dict, icp: dict, max_signals: int = 2
+    company: dict, icp: dict, max_signals: int = 3
 ) -> List[Dict]:
-    """Find real, verifiable intent signals for a company.
+    """Find real, verifiable intent signals for a company that match the
+    specific intent signals requested in the ICP.
 
-    Searches for job postings, news articles, and company activity that
-    indicate buying intent related to the ICP's product/service.
+    Searches for EACH intent signal individually (e.g. "hiring SDRs",
+    "evaluating sales tools", "researching competitors") rather than
+    doing one generic search.  Each found signal includes a real URL,
+    a verbatim snippet from the page, and a date if visible.
 
     Returns list of {source, description, url, date, snippet}.
     """
@@ -434,167 +437,100 @@ async def mine_intent_signals(
         intent_keywords = ["hiring", "expansion", "new product"]
 
     signals = []
+    seen_urls = set()
 
-    # Strategy 1: Job postings (strongest intent signal)
-    job_query = f'"{company_name}" hiring OR careers OR jobs {" OR ".join(intent_keywords[:2])}'
-    job_results = await _google_search(job_query, num_results=5)
-
-    for r in job_results[:3]:
-        link = r.get("link", "")
-        domain = _extract_domain(link)
-        if not link:
-            continue
-        is_job_board = any(jb in domain for jb in [
-            "greenhouse.io", "lever.co", "linkedin.com/jobs",
-            "indeed.com", "glassdoor.com", "boards.greenhouse.io",
-            "jobs.lever.co", "workable.com", "builtin.com",
-        ])
-        is_company_careers = "career" in link.lower() or "jobs" in link.lower()
-
-        if is_job_board or is_company_careers:
-            snippet = r.get("snippet", "")
-            html = await _scrape_url(link)
-            page_text = _extract_text_from_html(html, 3000) if html else snippet
-
-            if page_text and len(page_text) > 50:
-                signal_prompt = f"""Analyze this job posting/careers page for {company_name}.
-Does it show intent related to: {product or ', '.join(intent_keywords)}?
-
-Page content (truncated):
-{page_text[:2000]}
-
-URL: {link}
-
-If there IS relevant intent, return a JSON object:
-{{"relevant": true, "description": "one sentence describing the buying signal", "snippet": "verbatim 1-2 sentence quote from the page", "date": "YYYY-MM-DD if a date is visible, otherwise null"}}
-
-If NOT relevant, return: {{"relevant": false}}
-
-Return ONLY JSON, no markdown."""
-
-                resp = await _llm_call(signal_prompt)
-                if resp:
-                    try:
-                        resp = resp.strip()
-                        if resp.startswith("```"):
-                            resp = re.sub(r'^```(?:json)?\s*', '', resp)
-                            resp = re.sub(r'\s*```$', '', resp)
-                        sig_data = json.loads(resp)
-                        if sig_data.get("relevant"):
-                            source_type = "job_board" if is_job_board else "company_website"
-                            signals.append({
-                                "source": source_type,
-                                "description": sig_data.get("description", ""),
-                                "url": link,
-                                "date": sig_data.get("date"),
-                                "snippet": sig_data.get("snippet", snippet[:200]),
-                            })
-                    except json.JSONDecodeError:
-                        pass
-
+    for keyword in intent_keywords:
         if len(signals) >= max_signals:
             break
 
-    # Strategy 2: News/press releases
-    if len(signals) < max_signals:
-        news_query = f'"{company_name}" {product or intent_keywords[0]} 2026'
-        news_results = await _google_search(news_query, num_results=5)
+        # Search specifically for this intent signal + company
+        query = f'"{company_name}" "{keyword}"'
+        results = await _google_search(query, num_results=5)
 
-        for r in news_results[:3]:
+        # Also try a broader version
+        if not results:
+            query = f'"{company_name}" {keyword} {product}'
+            results = await _google_search(query, num_results=5)
+
+        for r in results[:3]:
             if len(signals) >= max_signals:
                 break
-            link = r.get("link", "")
-            domain = _extract_domain(link)
-            if not link or domain == company.get("domain", ""):
-                continue
-            is_news = any(ns in domain for ns in [
-                "techcrunch.com", "bloomberg.com", "reuters.com",
-                "forbes.com", "cnbc.com", "venturebeat.com",
-                "prnewswire.com", "businesswire.com", "globenewswire.com",
-                "crunchbase.com", "siliconangle.com", "zdnet.com",
-            ])
-            if not is_news:
-                continue
 
+            link = r.get("link", "")
+            if not link or link in seen_urls:
+                continue
+            seen_urls.add(link)
+
+            domain = _extract_domain(link)
             snippet = r.get("snippet", "")
+
+            # Determine source type
+            if any(jb in domain for jb in [
+                "greenhouse.io", "lever.co", "indeed.com", "glassdoor.com",
+                "boards.greenhouse.io", "jobs.lever.co", "workable.com",
+                "builtin.com", "jobvite.com", "linkedin.com/jobs",
+            ]):
+                source_type = "job_board"
+            elif any(ns in domain for ns in [
+                "techcrunch.com", "bloomberg.com", "reuters.com", "forbes.com",
+                "cnbc.com", "venturebeat.com", "prnewswire.com",
+                "businesswire.com", "globenewswire.com", "crunchbase.com",
+                "zdnet.com", "siliconangle.com",
+            ]):
+                source_type = "news"
+            elif "linkedin.com" in domain:
+                source_type = "linkedin"
+            elif domain == company.get("domain", ""):
+                source_type = "company_website"
+            else:
+                source_type = "other"
+
+            # Scrape the page and verify the signal is real
             html = await _scrape_url(link)
             page_text = _extract_text_from_html(html, 3000) if html else snippet
 
-            if page_text and len(page_text) > 50:
-                news_prompt = f"""Analyze this news article about {company_name}.
-Does it contain evidence of buying intent related to: {product or ', '.join(intent_keywords)}?
+            if not page_text or len(page_text) < 50:
+                continue
 
-Content (truncated):
+            verify_prompt = f"""You are verifying an intent signal for {company_name}.
+
+The client is looking for this specific signal: "{keyword}"
+The client sells: {product}
+
+Page content from {link}:
 {page_text[:2000]}
 
-URL: {link}
+Does this page provide SPECIFIC evidence that {company_name} is "{keyword}"?
 
-If there IS relevant intent evidence, return JSON:
-{{"relevant": true, "description": "one sentence describing the intent signal", "snippet": "verbatim 1-2 sentence quote", "date": "YYYY-MM-DD if visible, otherwise null"}}
+Rules:
+- The evidence must be SPECIFIC to {company_name} (not a generic industry article)
+- The evidence must relate to "{keyword}" specifically
+- Quote the exact text that proves this signal
 
-If NOT relevant: {{"relevant": false}}
+Return ONLY JSON:
+If YES: {{"found": true, "description": "One sentence: how {company_name} shows '{keyword}'", "snippet": "Verbatim 1-2 sentence quote from the page proving this", "date": "YYYY-MM-DD if visible, null otherwise"}}
+If NO: {{"found": false}}"""
 
-ONLY JSON, no markdown."""
-
-                resp = await _llm_call(news_prompt)
-                if resp:
-                    try:
-                        resp = resp.strip()
-                        if resp.startswith("```"):
-                            resp = re.sub(r'^```(?:json)?\s*', '', resp)
-                            resp = re.sub(r'\s*```$', '', resp)
-                        sig_data = json.loads(resp)
-                        if sig_data.get("relevant"):
-                            signals.append({
-                                "source": "news",
-                                "description": sig_data.get("description", ""),
-                                "url": link,
-                                "date": sig_data.get("date"),
-                                "snippet": sig_data.get("snippet", snippet[:200]),
-                            })
-                    except json.JSONDecodeError:
-                        pass
-
-    # Strategy 3: Company website activity (fallback)
-    if not signals:
-        website = company.get("website", "")
-        if website:
-            html = await _scrape_url(website)
-            page_text = _extract_text_from_html(html, 3000)
-            if page_text and len(page_text) > 100:
-                fallback_prompt = f"""Analyze this company website for {company_name}.
-Find ANY evidence of business activity, growth, hiring, or product updates that could
-indicate buying intent for: {product or ', '.join(intent_keywords)}.
-
-Content:
-{page_text[:2000]}
-
-URL: {website}
-
-Return JSON:
-{{"relevant": true, "description": "specific activity found", "snippet": "verbatim quote from site", "date": null}}
-OR {{"relevant": false}}
-
-ONLY JSON."""
-
-                resp = await _llm_call(fallback_prompt)
-                if resp:
-                    try:
-                        resp = resp.strip()
-                        if resp.startswith("```"):
-                            resp = re.sub(r'^```(?:json)?\s*', '', resp)
-                            resp = re.sub(r'\s*```$', '', resp)
-                        sig_data = json.loads(resp)
-                        if sig_data.get("relevant"):
-                            signals.append({
-                                "source": "company_website",
-                                "description": sig_data.get("description", ""),
-                                "url": website,
-                                "date": sig_data.get("date"),
-                                "snippet": sig_data.get("snippet", "")[:200],
-                            })
-                    except json.JSONDecodeError:
-                        pass
+            resp = await _llm_call(verify_prompt)
+            if resp:
+                try:
+                    resp = resp.strip()
+                    if resp.startswith("```"):
+                        resp = re.sub(r'^```(?:json)?\s*', '', resp)
+                        resp = re.sub(r'\s*```$', '', resp)
+                    sig_data = json.loads(resp)
+                    if sig_data.get("found"):
+                        signals.append({
+                            "source": source_type,
+                            "description": sig_data.get("description", ""),
+                            "url": link,
+                            "date": sig_data.get("date"),
+                            "snippet": sig_data.get("snippet", snippet[:200]),
+                        })
+                        logger.info(f"    Found signal: '{keyword}' → {link[:60]}")
+                        break  # Found signal for this keyword, move to next
+                except json.JSONDecodeError:
+                    pass
 
     return signals
 
