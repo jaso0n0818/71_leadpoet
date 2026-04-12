@@ -1784,7 +1784,7 @@ def run_qualification_submission_flow(wallet, config, netuid: int):
         print(" 🧪 TESTNET MODE (netuid 401)")
     print("="*80)
     print("")
-    print("Submit your lead qualification model to compete for 5% of subnet emissions!")
+    print("Submit your lead qualification model to compete for 10% of subnet emissions!")
     print(f"Submission cost: ${QUALIFICATION_SUBMISSION_COST_USD:.2f} USD (paid in TAO)")
     print("")
     
@@ -2047,7 +2047,7 @@ def run_qualification_submission_flow(wallet, config, netuid: int):
     print(f"   {QUALIFICATION_GATEWAY_URL}/qualification/model/{result.get('model_id')}/status")
     print("")
     print("   If your model scores higher than the current champion by >5%,")
-    print("   you'll become the new champion and receive 5% of subnet emissions!")
+    print("   you'll become the new champion and receive 10% of subnet emissions!")
     print("="*80)
     
     return True
@@ -2235,32 +2235,34 @@ def update_miner_stats(hotkey, valid_count):
             json.dump(miners, f, indent=2)
 
 
-async def run_miner(miner, miner_hotkey=None, interval=60, queue_maxsize=1000):
+async def run_miner(miner, miner_hotkey=None, interval=60, queue_maxsize=1000, mode="sourcing"):
     logging.getLogger('bittensor.subtensor').setLevel(logging.WARNING)
     logging.getLogger('bittensor.axon').setLevel(logging.WARNING)
     miner._loop = asyncio.get_running_loop()
     miner._bg_interval = interval
     miner._miner_hotkey = miner_hotkey
 
-    # Start all background tasks
-    miner.sourcing_task = asyncio.create_task(miner.sourcing_loop(
-        interval, miner_hotkey),
-                                              name="sourcing_loop")
+    tasks = []
 
-    task_count = 1
+    if mode == "sourcing":
+        miner.sourcing_task = asyncio.create_task(
+            miner.sourcing_loop(interval, miner_hotkey), name="sourcing_loop")
+        tasks.append("sourcing_loop - Continuous lead sourcing via trustless gateway")
 
-    if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+        if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+            miner.fulfillment_task = asyncio.create_task(
+                miner.fulfillment_loop(miner_hotkey), name="fulfillment_loop")
+            tasks.append("fulfillment_loop - Lead fulfillment commit-reveal system")
+
+    elif mode == "fulfillment":
         miner.fulfillment_task = asyncio.create_task(
-            miner.fulfillment_loop(miner_hotkey),
-            name="fulfillment_loop",
-        )
-        task_count += 1
-        print("   2. fulfillment_loop - Lead fulfillment commit-reveal system")
+            miner.fulfillment_loop(miner_hotkey), name="fulfillment_loop")
+        tasks.append("fulfillment_loop - Lead fulfillment commit-reveal system (ONLY)")
 
-    print(f"✅ Started {task_count} background task(s):")
-    print("   1. sourcing_loop - Continuous lead sourcing via trustless gateway")
+    for i, t in enumerate(tasks, 1):
+        print(f"   {i}. {t}")
+    print(f"✅ Started {len(tasks)} background task(s) in {mode.upper()} mode")
 
-    # Keep alive
     while True:
         await asyncio.sleep(1)
 
@@ -2423,47 +2425,39 @@ def main():
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     print("\n" + "="*80)
-    print(" 🏆 QUALIFICATION MODEL COMPETITION")
+    print(" LEADPOET MINER — SELECT MODE")
     print("="*80)
     print("")
-    print("Would you like to submit a qualification model for the Lead Qualification")
-    print("Agent Competition? Champions receive 5% of subnet emissions!")
+    print("  1. Sourcing       — Continuously source and submit leads (default)")
+    print("  2. Fulfillment    — Poll for client ICP requests and fulfill them")
+    print("  3. Qualification  — Submit a qualification model (10% of emissions)")
     print("")
-    print("This is OPTIONAL. If you just want to mine leads, select 'N'.")
+    print("  You can run multiple modes simultaneously in separate terminals.")
     print("")
-    
-    use_qualification = input("❓ Submit a qualification model? (Y/N): ").strip().upper()
-    
-    if use_qualification == "Y":
-        # Load wallet first (no network connection needed)
-        # Subtensor is created INSIDE run_qualification_submission_flow AFTER user input
-        # to avoid WebSocket timeout while user is typing
+
+    mode_input = input("❓ Select mode (1/2/3) [default: 1]: ").strip()
+    if mode_input not in ("1", "2", "3"):
+        mode_input = "1"
+
+    miner_mode = {"1": "sourcing", "2": "fulfillment", "3": "qualification"}[mode_input]
+    print(f"\n✅ Selected mode: {miner_mode.upper()}")
+
+    if miner_mode == "qualification":
         try:
             temp_wallet = bt.wallet(config=config)
             print(f"\n✅ Wallet loaded: {temp_wallet.hotkey.ss58_address}")
-            
-            # Run the qualification submission flow (pass config so it can create subtensor later)
             success = run_qualification_submission_flow(temp_wallet, config, config.netuid)
-            
             if success:
-                print("\n✅ Qualification model submitted! Starting miner...")
+                print("\n✅ Qualification model submitted!")
             else:
                 print("\n⚠️  Qualification submission was not completed.")
-                continue_mining = input("   Continue with normal mining? (Y/N): ").strip().upper()
-                if continue_mining != "Y":
-                    print("\n👋 Exiting. Run the miner again when ready.")
-                    sys.exit(0)
-                    
         except Exception as e:
             bt.logging.error(f"❌ Error during qualification submission: {e}")
             import traceback
             traceback.print_exc()
-            continue_mining = input("\n   Continue with normal mining? (Y/N): ").strip().upper()
-            if continue_mining != "Y":
-                sys.exit(1)
-    else:
-        print("\n✅ Skipping qualification submission. Starting normal miner...")
-    
+        print("\n👋 Done. Run the miner again to select another mode.")
+        sys.exit(0)
+
     print("")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2509,15 +2503,13 @@ def main():
     import time
     time.sleep(3)
 
-    # Run the sourcing loop in the main thread
-    async def run_sourcing():
+    async def run_selected_mode():
         miner_hotkey = miner.wallet.hotkey.ss58_address
         interval = 60
         queue_maxsize = 1000
-        await run_miner(miner, miner_hotkey, interval, queue_maxsize)
+        await run_miner(miner, miner_hotkey, interval, queue_maxsize, mode=miner_mode)
 
-    # Run the sourcing loop
-    asyncio.run(run_sourcing())
+    asyncio.run(run_selected_mode())
 
 
 if __name__ == "__main__":
