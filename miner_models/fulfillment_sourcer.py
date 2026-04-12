@@ -148,10 +148,9 @@ async def _verify_email(email: str) -> Tuple[bool, str]:
                         email_data = data["emails"][0]
                     state = email_data.get("email_state", "unknown")
                     sub_state = email_data.get("email_sub_state", "")
-                    # Accept: email_ok (verified) or risky (catch-all domain —
-                    # common for enterprise companies like Klaviyo, Google, etc.)
-                    # Reject: email_invalid / failed_* (definitively bad)
-                    is_valid = state in ("email_ok", "risky")
+                    # Only accept email_ok — the validator rejects everything
+                    # else (accept_all, risky, unknown, failed_*)
+                    is_valid = state == "email_ok"
                     return is_valid, sub_state or state
                 if resp.status_code in (429, 502, 503):
                     await asyncio.sleep(2)
@@ -612,7 +611,7 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
     logger.info(f"Sourcing {num_leads} leads for ICP: {icp.get('industry')}/{icp.get('sub_industry')}")
 
     # Discover more companies than needed (some won't yield contacts)
-    companies = await discover_companies(icp, num_companies=num_leads * 3)
+    companies = await discover_companies(icp, num_companies=num_leads * 5)
     logger.info(f"Discovered {len(companies)} candidate companies")
 
     if not companies:
