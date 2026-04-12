@@ -28,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("FULFILLMENT_OPENROUTER_API_KEY", "") or os.getenv("OPENROUTER_KEY", "")
+TRUELIST_API_KEY = os.getenv("TRUELIST_API_KEY", "")
 _GOOGLE_SEARCH_URL = "https://api.scrapingdog.com/google"
 _SCRAPE_URL = "https://api.scrapingdog.com/scrape"
 _LINKEDIN_URL = "https://api.scrapingdog.com/linkedin"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_TRUELIST_VERIFY_URL = "https://api.truelist.io/api/v1/verify_inline"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -118,6 +120,43 @@ async def _llm_call(prompt: str, model: str = "gpt-4o-mini") -> str:
             except Exception as e:
                 logger.warning(f"LLM call attempt {attempt+1} failed: {e}")
     return ""
+
+
+async def _verify_email(email: str) -> Tuple[bool, str]:
+    """Verify an email via TrueList inline API.
+
+    Returns (is_valid, status).  ``is_valid`` is True only when TrueList
+    returns ``email_ok``.  Common statuses:
+      - email_ok: mailbox exists
+      - accept_all / risky: domain accepts any address (can't confirm)
+      - failed_no_mailbox: mailbox does not exist
+    """
+    if not TRUELIST_API_KEY or not email:
+        return False, "no_key"
+    async with httpx.AsyncClient(timeout=15) as client:
+        for attempt in range(2):
+            try:
+                resp = await client.post(
+                    f"{_TRUELIST_VERIFY_URL}?email={email}",
+                    headers={"Authorization": f"Bearer {TRUELIST_API_KEY}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    state = data.get("email_state", "unknown")
+                    sub_state = data.get("email_sub_state", "")
+                    # Accept: email_ok (verified), risky/accept_all (catch-all domain),
+                    # unknown (TrueList couldn't determine — let validator decide).
+                    # Reject: email_invalid, failed_no_mailbox (definitively bad).
+                    is_valid = state not in ("email_invalid",)
+                    return is_valid, sub_state or state
+                if resp.status_code in (429, 502, 503):
+                    await asyncio.sleep(2)
+                    continue
+            except Exception as e:
+                logger.warning(f"TrueList verify failed for {email}: {e}")
+                if attempt < 1:
+                    await asyncio.sleep(1)
+    return False, "error"
 
 
 def _extract_text_from_html(html: str, max_chars: int = 5000) -> str:
@@ -596,18 +635,31 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             logger.info(f"  No contact found at {company_name}, skipping")
             continue
 
-        # Mine intent signals
-        signals = await mine_intent_signals(company, icp, max_signals=2)
-        if not signals:
-            logger.info(f"  No intent signals found for {company_name}, skipping")
-            continue
-
+        # Build email
         domain = company.get("domain", _extract_domain(company.get("website", "")))
         email = contact.get("email", "")
         if not email and contact.get("full_name"):
             parts = contact["full_name"].lower().split()
             if len(parts) >= 2 and domain:
                 email = f"{parts[0]}.{parts[-1]}@{domain}"
+
+        if not email:
+            logger.info(f"  No email for contact at {company_name}, skipping")
+            continue
+
+        # Verify email via TrueList BEFORE spending on intent mining
+        if TRUELIST_API_KEY:
+            email_valid, email_status = await _verify_email(email)
+            if not email_valid:
+                logger.info(f"  Email {email} failed TrueList ({email_status}), skipping {company_name}")
+                continue
+            logger.info(f"  Email {email} verified ({email_status})")
+
+        # Mine intent signals (expensive — only after email is verified)
+        signals = await mine_intent_signals(company, icp, max_signals=2)
+        if not signals:
+            logger.info(f"  No intent signals found for {company_name}, skipping")
+            continue
 
         contact_state = contact.get("state", "") or company.get("hq_state", "")
         contact_city = contact.get("city", "")
