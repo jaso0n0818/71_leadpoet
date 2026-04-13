@@ -1316,16 +1316,30 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     if not lead.get("description") and lead.get("_description"):
         lead["description"] = lead["_description"]
 
+    # Save ICP industry/sub_industry — Stage 5 may overwrite with classification
+    # but Tier 1 ICP matching needs the original ICP values
+    icp_industry_original = lead.get("industry", "")
+    icp_sub_industry_original = lead.get("sub_industry", "")
+
     MAX_S5_CORRECTIONS = 10
     for s5_attempt in range(MAX_S5_CORRECTIONS):
         s5_passed, s5_rejection = await check_stage5_unified(lead)
 
         if s5_passed:
             print(f"    ✅ Stage 5 PASSED")
+            # Restore ICP industry/sub_industry — validator Tier 1 needs these to match ICP
+            lead["industry"] = icp_industry_original
+            lead["sub_industry"] = icp_sub_industry_original
+            # Sync all HQ fields to both naming conventions
             if lead.get("extracted_hq_city"):
+                lead["hq_city"] = lead.get("extracted_hq_city", "")
+                lead["company_hq_city"] = lead.get("extracted_hq_city", "")
+            if lead.get("extracted_hq_state"):
+                lead["hq_state"] = lead.get("extracted_hq_state", "")
                 lead["company_hq_state"] = lead.get("extracted_hq_state", "")
-                lead["company_hq_country"] = lead.get("extracted_hq_country", "")
+            if lead.get("extracted_hq_country"):
                 lead["hq_country"] = lead.get("extracted_hq_country", "")
+                lead["company_hq_country"] = lead.get("extracted_hq_country", "")
             break
 
         if not s5_rejection:
@@ -1335,6 +1349,10 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
         failed_fields = s5_rejection.get("failed_fields", [])
         msg = s5_rejection.get("message", "")
         print(f"    ⚠️ Stage 5 failed (attempt {s5_attempt+1}): {msg}")
+
+        # Restore ICP industry (Stage 5 may have overwritten it)
+        lead["industry"] = icp_industry_original
+        lead["sub_industry"] = icp_sub_industry_original
 
         corrected_something = False
 
