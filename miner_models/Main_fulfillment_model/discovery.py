@@ -402,8 +402,10 @@ Return at least {num_companies} companies. No explanation text."""
 
     print(f"  [Perplexity] Searching for {num_companies} companies with intent signals...")
 
-    result = await asyncio.to_thread(
-        chat_completion_json,
+    # Get raw response first so we can log what Perplexity actually said
+    from target_fit_model.openrouter import chat_completion, parse_json_response
+    raw_response = await asyncio.to_thread(
+        chat_completion,
         prompt=prompt,
         model=PERPLEXITY_MODEL,
         system_prompt=_PERPLEXITY_SYSTEM,
@@ -412,9 +414,15 @@ Return at least {num_companies} companies. No explanation text."""
         timeout=PERPLEXITY_TIMEOUT,
     )
 
+    if raw_response is None:
+        print(f"  [Perplexity] API returned None — falling back to Google Search")
+        return []
+
+    result = parse_json_response(raw_response)
+
     if not result:
-        print(f"  [Perplexity] No response (result={result!r}) — falling back to Google Search")
-        print(f"  [Perplexity] Prompt length: {len(prompt)} chars, timeout: {PERPLEXITY_TIMEOUT}s")
+        print(f"  [Perplexity] Could not parse JSON from response ({len(raw_response)} chars)")
+        print(f"  [Perplexity] First 300 chars: {raw_response[:300]}")
         return []
 
     if isinstance(result, dict):
