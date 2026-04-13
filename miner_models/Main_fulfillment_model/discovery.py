@@ -53,8 +53,10 @@ from validator_models.stage4_person_verification import (
 )
 from validator_models.stage4_helpers import (
     extract_location_from_text as _s4_extract_location,
+    extract_person_location_from_linkedin_snippet as _s4_extract_person_location,
     extract_role_from_result as _s4_extract_role,
     get_linkedin_id,
+    get_linkedin_url_country,
 )
 from validator_models.stage5_verification import (
     _gse_search_sync,
@@ -1035,18 +1037,48 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
         # Location mismatch → CORRECT using extracted data or fresh search
         elif "city" in failed or "state" in failed:
             ext_loc = s4_result["data"].get("extracted_location", "")
+            found_city, found_state, found_country = "", "", ""
 
-            # If Stage 4 didn't extract a location, search the profile directly
-            if not ext_loc or "," not in ext_loc:
+            # Method 1: Use Stage 4's extracted location (from the matched result)
+            if ext_loc and "," in ext_loc:
+                parts = ext_loc.split(",")
+                found_city = parts[0].strip()
+                found_state = parts[1].strip() if len(parts) >= 2 else ""
+                found_country = parts[2].strip() if len(parts) >= 3 else ""
+
+            # Method 2: Parse person location from search result snippets
+            if not found_city:
+                for r in s4_result["data"].get("search_results", []):
+                    snippet = r.get("snippet", "")
+                    person_loc = _s4_extract_person_location(snippet)
+                    if person_loc and "," in person_loc:
+                        parts = person_loc.split(",")
+                        found_city = parts[0].strip()
+                        found_state = parts[1].strip() if len(parts) >= 2 else ""
+                        found_country = parts[2].strip() if len(parts) >= 3 else ""
+                        break
+
+            # Method 3: Use extract_location_from_text on all results
+            if not found_city:
                 for r in s4_result["data"].get("search_results", []):
                     text = f"{r.get('title', '')} {r.get('snippet', '')}"
                     candidate = _s4_extract_location(text)
                     if candidate and "," in candidate:
-                        ext_loc = candidate
+                        parts = candidate.split(",")
+                        found_city = parts[0].strip()
+                        found_state = parts[1].strip() if len(parts) >= 2 else ""
                         break
 
-            # If still nothing, do a dedicated location search
-            if not ext_loc or "," not in ext_loc:
+            # Method 4: Infer country from LinkedIn URL subdomain (fr.linkedin.com → France)
+            if not found_city:
+                li_url = lead.get("linkedin_url", "")
+                url_country = get_linkedin_url_country(li_url)
+                if url_country:
+                    found_country = url_country.title()
+                    print(f"    LinkedIn subdomain suggests: {found_country}")
+
+            # Method 5: Dedicated profile search
+            if not found_city:
                 lid = re.search(r'linkedin\.com/in/([^/?#]+)', lead.get("linkedin_url", ""))
                 if lid:
                     slug = lid.group(1)
@@ -1054,19 +1086,31 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     loc_q = f'site:linkedin.com/in/{slug} location'
                     loc_results, _ = await search_google_async(loc_q, SCRAPINGDOG_API_KEY, max_results=3)
                     for r in loc_results:
-                        text = f"{r.get('title', '')} {r.get('snippet', '')}"
+                        snippet = r.get("snippet", "")
+                        person_loc = _s4_extract_person_location(snippet)
+                        if person_loc and "," in person_loc:
+                            parts = person_loc.split(",")
+                            found_city = parts[0].strip()
+                            found_state = parts[1].strip() if len(parts) >= 2 else ""
+                            break
+                        text = f"{r.get('title', '')} {snippet}"
                         candidate = _s4_extract_location(text)
                         if candidate and "," in candidate:
-                            ext_loc = candidate
+                            parts = candidate.split(",")
+                            found_city = parts[0].strip()
+                            found_state = parts[1].strip() if len(parts) >= 2 else ""
                             break
 
-            if ext_loc and "," in ext_loc:
-                parts = ext_loc.split(",")
+            if found_city:
                 old_city, old_state = lead.get("city", ""), lead.get("state", "")
-                lead["city"] = parts[0].strip()
-                lead["state"] = parts[1].strip()
-                lead["company_hq_state"] = lead["state"]
-                print(f"    📍 Location CORRECTED: {old_city}, {old_state} → {lead['city']}, {lead['state']}")
+                lead["city"] = found_city
+                lead["state"] = found_state
+                if found_country:
+                    lead["country"] = found_country
+                    lead["company_hq_country"] = found_country
+                lead["company_hq_state"] = found_state
+                print(f"    📍 Location CORRECTED: {old_city}, {old_state} → {found_city}, {found_state}" +
+                      (f", {found_country}" if found_country else ""))
             else:
                 print(f"    ❌ Could not determine location — skipping lead")
                 return None
