@@ -51,6 +51,7 @@ from validator_models.stage4_person_verification import (
     search_google_async,
     _check_role_via_aimode,
 )
+from validator_models.checks_linkedin import check_linkedin_gse
 from validator_models.stage4_helpers import (
     extract_location_from_text as _s4_extract_location,
     extract_person_location_from_linkedin_snippet as _s4_extract_person_location,
@@ -999,24 +1000,51 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     break
 
     # ===================================================================
-    # STAGE 4: Person verification (LinkedIn URL, name, company, location, role)
+    # STAGE 4: Person + Company LinkedIn verification
+    # Uses check_linkedin_gse which is the EXACT function the validator
+    # calls. It does:
+    #   1. run_lead_validation_stage4 (person: URL, name, company, location, role)
+    #   2. Company LinkedIn validation (scrape, verify name, cache data for Stage 5)
     # ===================================================================
+    # Build lead dict with field names check_linkedin_gse expects
     s4_lead = {
         "full_name": lead["full_name"],
         "business": lead["business"],
         "linkedin_url": lead.get("linkedin_url", ""),
+        "linkedin": lead.get("linkedin_url", ""),
         "city": lead.get("city", ""),
         "state": lead.get("state", ""),
         "country": lead.get("country", ""),
         "role": lead.get("role", ""),
         "email": lead.get("email", ""),
+        "company_linkedin": lead.get("company_linkedin", ""),
     }
 
-    s4_result = await run_lead_validation_stage4(
-        s4_lead,
-        scrapingdog_api_key=SCRAPINGDOG_API_KEY,
-        openrouter_api_key=OPENROUTER_API_KEY,
-    )
+    s4_passed, s4_rejection = await check_linkedin_gse(s4_lead)
+
+    # Build a compatible s4_result dict from check_linkedin_gse output
+    s4_result = {
+        "passed": s4_passed,
+        "rejection_reason": s4_rejection,
+        "data": s4_lead.get("lead_validation_data", {}),
+    }
+    # Copy verified flags back to the lead
+    if s4_lead.get("role_verified"):
+        lead["role_verified"] = True
+        lead["role_method"] = s4_lead.get("role_method", "")
+    if s4_lead.get("location_verified"):
+        lead["location_verified"] = True
+    if s4_lead.get("company_linkedin_verified"):
+        lead["company_linkedin"] = f"https://linkedin.com/company/{s4_lead.get('company_linkedin_slug', '')}"
+    if s4_lead.get("stage4_extracted_location"):
+        lead["city"] = s4_lead["stage4_extracted_location"].split(",")[0].strip()
+        if "," in s4_lead["stage4_extracted_location"]:
+            lead["state"] = s4_lead["stage4_extracted_location"].split(",")[1].strip()
+    if s4_lead.get("stage4_extracted_role"):
+        ext_role = s4_lead["stage4_extracted_role"]
+        latin_ratio = sum(1 for c in ext_role if c.isascii()) / max(len(ext_role), 1)
+        if latin_ratio > 0.5 and len(ext_role) < 80:
+            lead["role"] = ext_role
 
     def _apply_s4_extracted_data(s4_res, ld):
         """Apply verified extracted data from a Stage 4 result to the lead."""
@@ -1040,6 +1068,12 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     if s4_result["passed"]:
         print(f"    ✅ Stage 4 PASSED")
         _apply_s4_extracted_data(s4_result, lead)
+        # Copy all Stage 4 data to the lead for Stage 5 to use
+        for key in ["role_verified", "role_method", "location_verified",
+                     "company_linkedin_verified", "company_linkedin_slug",
+                     "company_linkedin_data", "company_linkedin_from_cache"]:
+            if s4_lead.get(key) is not None:
+                lead[key] = s4_lead[key]
     else:
         reason = s4_result.get("rejection_reason", {})
         failed = reason.get("failed_fields", [])
@@ -1199,6 +1233,11 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             else:
                 print(f"    ❌ Could not determine role — skipping lead")
                 return None
+
+        # Company LinkedIn validation failed (from check_linkedin_gse)
+        elif "company_linkedin" in failed:
+            print(f"    ❌ Company LinkedIn validation failed — skipping lead")
+            return None
 
         else:
             print(f"    ❌ Stage 4 failed on {failed} — skipping lead")
