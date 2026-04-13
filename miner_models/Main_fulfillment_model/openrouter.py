@@ -144,6 +144,7 @@ def chat_completion(
         duration = time.time() - start
 
         if resp.status_code != 200:
+            print(f"  [OpenRouter] HTTP {resp.status_code}: {resp.text[:200]}")
             logger.error(f"[OpenRouter] HTTP {resp.status_code}: {resp.text[:500]}")
             return None
 
@@ -163,9 +164,11 @@ def chat_completion(
         return content
 
     except requests.Timeout:
+        print(f"  [OpenRouter] TIMEOUT after {effective_timeout}s (model={model})")
         logger.error(f"[OpenRouter] Timed out after {effective_timeout}s (model={model})")
         return None
     except Exception as e:
+        print(f"  [OpenRouter] ERROR: {e}")
         logger.error(f"[OpenRouter] Exception: {e}")
         return None
 

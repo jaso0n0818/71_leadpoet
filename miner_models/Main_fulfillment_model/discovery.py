@@ -409,7 +409,8 @@ Return at least {num_companies} companies. No explanation text."""
     )
 
     if not result:
-        print(f"  [Perplexity] No response — falling back to Google Search")
+        print(f"  [Perplexity] No response (result={result!r}) — falling back to Google Search")
+        print(f"  [Perplexity] Prompt length: {len(prompt)} chars, timeout: {PERPLEXITY_TIMEOUT}s")
         return []
 
     if isinstance(result, dict):
