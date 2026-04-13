@@ -693,13 +693,6 @@ class Miner(BaseMinerNeuron):
                     bt.logging.debug("Fulfillment: sourcing_loop active, deferring new sourcing")
                     skip_sourcing = True
 
-                # FIFO: don't pick up new requests until all pending
-                # commits have been revealed and scored
-                if self._pending_fulfillment:
-                    pending_ids = list(self._pending_fulfillment.keys())
-                    print(f"   ⏳ FIFO: {len(pending_ids)} pending reveal(s) — skipping new requests")
-                    skip_sourcing = True
-
                 if not skip_sourcing:
                     data = gateway_poll_fulfillment_requests(self.wallet)
                     active_requests = data.get("requests", []) if isinstance(data, dict) else []
