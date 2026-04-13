@@ -1724,7 +1724,9 @@ async def _process_companies(
             )
 
             if not perplexity_result or not perplexity_result.get("signals"):
-                print(f"    No intent signals (saved to pool for batch re-check)")
+                sig_count = len(perplexity_result.get("signals", [])) if perplexity_result else 0
+                gaps = perplexity_result.get("_data_gaps", []) if perplexity_result else []
+                print(f"    No intent signals ({sig_count} returned, gaps: {gaps}) — saved to pool")
                 email_verified_pool.append(partial_lead)
                 continue
 

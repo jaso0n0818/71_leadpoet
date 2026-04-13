@@ -198,7 +198,7 @@ fit_score: how well this company matches the target profile and would benefit fr
         return None
 
     # Attempt 1: Full prompt with expanded signals + ScrapingDog data
-    logger.info(f"[Intent] Attempt 1 for {company_name} (full prompt)")
+    print(f"    [Intent] Attempt 1 for {company_name} (jobs={bool(jobs_data)}, news={bool(news_data)})")
     result = chat_completion_json(
         prompt=prompt,
         model=PERPLEXITY_MODEL,
@@ -210,10 +210,13 @@ fit_score: how well this company matches the target profile and would benefit fr
 
     parsed = _parse_result(result, data_gaps)
     if parsed:
+        sig_count = len(parsed.get("signals", []))
+        matched = sum(1 for s in parsed.get("signals", []) if s.get("match"))
+        print(f"    [Intent] Attempt 1 result: {sig_count} signals ({matched} matched)")
         return parsed
 
     # Attempt 2: Retry with shorter prompt (original signals only, no ScrapingDog data)
-    logger.warning(f"[Intent] Attempt 1 failed for {company_name}, retrying with shorter prompt...")
+    print(f"    [Intent] Attempt 1 failed (result={type(result).__name__}: {str(result)[:100] if result else 'None'}), retrying...")
 
     short_prompt = f"""## Product Being Sold
 {product_description}
@@ -256,10 +259,13 @@ Return JSON:
 
     parsed = _parse_result(result, data_gaps)
     if parsed:
+        sig_count = len(parsed.get("signals", []))
+        matched = sum(1 for s in parsed.get("signals", []) if s.get("match"))
+        print(f"    [Intent] Attempt 2 result: {sig_count} signals ({matched} matched)")
         return parsed
 
     # Both attempts failed — return empty dict (NEVER return string or None)
-    logger.warning(f"[Intent] Both attempts failed for {company_name}, returning empty result")
+    print(f"    [Intent] Both attempts FAILED for {company_name} (result={type(result).__name__}: {str(result)[:100] if result else 'None'})")
     return {
         "signals": [],
         "intent_paragraph": "",
