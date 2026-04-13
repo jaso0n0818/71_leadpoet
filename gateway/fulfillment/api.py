@@ -184,6 +184,18 @@ async def get_active_requests(miner_hotkey: str = ""):
 
     requests_out = []
     for r in (resp.data or []):
+        # If miner already committed the full num_leads, don't return this request
+        if miner_hotkey:
+            existing = supabase.table("fulfillment_submissions") \
+                .select("submission_id, lead_hashes") \
+                .eq("request_id", r["request_id"]) \
+                .eq("miner_hotkey", miner_hotkey) \
+                .execute()
+            if existing.data:
+                committed_count = len(existing.data[0].get("lead_hashes", []))
+                if committed_count >= r["num_leads"]:
+                    continue  # fully committed — hide this request
+
         icp = r.get("icp_details", {})
         requests_out.append({
             "request_id": r["request_id"],
@@ -239,39 +251,70 @@ async def commit_leads(commit: FulfillmentCommitRequest):
     if now > datetime.fromisoformat(req["window_end"]):
         raise HTTPException(400, detail="Commit window expired")
 
-    if len(commit.lead_hashes) > req["num_leads"]:
-        raise HTTPException(422, detail=(
-            f"Too many leads: submitted {len(commit.lead_hashes)}, max {req['num_leads']}"
-        ))
+    num_leads_max = req["num_leads"]
 
-    lead_hash_entries: List[dict] = []
+    # Check for existing submission (allows appending up to num_leads)
+    existing_sub = supabase.table("fulfillment_submissions") \
+        .select("submission_id, lead_hashes") \
+        .eq("request_id", commit.request_id) \
+        .eq("miner_hotkey", commit.miner_hotkey) \
+        .execute()
+
+    new_entries: List[dict] = []
     for entry in commit.lead_hashes:
-        lead_hash_entries.append({
+        new_entries.append({
             "lead_id": str(uuid4()),
             "hash": entry.hash,
         })
 
-    try:
-        sub_resp = supabase.rpc("fulfillment_accept_commit", {
-            "p_request_id": commit.request_id,
-            "p_miner_hotkey": commit.miner_hotkey,
-            "p_lead_hashes": lead_hash_entries,
-        }).execute()
-        submission_id = sub_resp.data
-    except Exception as e:
-        err_msg = str(e)
-        if "unique" in err_msg.lower() or "duplicate" in err_msg.lower():
-            existing = supabase.table("fulfillment_submissions") \
-                .select("submission_id") \
-                .eq("request_id", commit.request_id) \
-                .eq("miner_hotkey", commit.miner_hotkey) \
-                .execute()
-            existing_id = existing.data[0]["submission_id"] if existing.data else None
+    if existing_sub.data:
+        # Append to existing submission
+        sub = existing_sub.data[0]
+        submission_id = sub["submission_id"]
+        existing_hashes = sub.get("lead_hashes", []) or []
+
+        total_after = len(existing_hashes) + len(new_entries)
+        if total_after > num_leads_max:
+            raise HTTPException(422, detail=(
+                f"Too many leads: already committed {len(existing_hashes)}, "
+                f"adding {len(new_entries)} would exceed max {num_leads_max}"
+            ))
+
+        if len(existing_hashes) >= num_leads_max:
             raise HTTPException(409, detail={
-                "message": "Already committed for this request",
-                "submission_id": existing_id,
+                "message": f"Already committed {len(existing_hashes)}/{num_leads_max} leads",
+                "submission_id": submission_id,
             })
-        raise HTTPException(500, detail=f"Commit failed: {err_msg}")
+
+        merged_hashes = existing_hashes + new_entries
+        try:
+            supabase.table("fulfillment_submissions") \
+                .update({"lead_hashes": merged_hashes}) \
+                .eq("submission_id", submission_id) \
+                .execute()
+        except Exception as e:
+            raise HTTPException(500, detail=f"Append commit failed: {str(e)}")
+    else:
+        # First commit for this miner + request
+        if len(new_entries) > num_leads_max:
+            raise HTTPException(422, detail=(
+                f"Too many leads: submitted {len(new_entries)}, max {num_leads_max}"
+            ))
+
+        try:
+            sub_resp = supabase.rpc("fulfillment_accept_commit", {
+                "p_request_id": commit.request_id,
+                "p_miner_hotkey": commit.miner_hotkey,
+                "p_lead_hashes": new_entries,
+            }).execute()
+            submission_id = sub_resp.data
+        except Exception as e:
+            err_msg = str(e)
+            if "unique" in err_msg.lower() or "duplicate" in err_msg.lower():
+                raise HTTPException(409, detail="Race condition — retry")
+            raise HTTPException(500, detail=f"Commit failed: {err_msg}")
+
+    lead_hash_entries = new_entries
 
     _log_event(EventType.FULFILLMENT_COMMIT, {
         "request_id": commit.request_id,
