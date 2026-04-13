@@ -1277,9 +1277,13 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     lead["role_method"] = s4_result["data"].get("role_method", "rule_based")
     lead["location_verified"] = True
 
-    # Stage 5 reads "hq_country" not "company_hq_country"
+    # Stage 5 reads "hq_country", "hq_state", "hq_city" not "company_hq_*"
     if lead.get("company_hq_country") and not lead.get("hq_country"):
         lead["hq_country"] = lead["company_hq_country"]
+    if lead.get("company_hq_state") and not lead.get("hq_state"):
+        lead["hq_state"] = lead["company_hq_state"]
+    if lead.get("company_hq_city") and not lead.get("hq_city"):
+        lead["hq_city"] = lead.get("company_hq_city", "")
 
     # Provide a description for classification (from Perplexity discovery)
     if not lead.get("description") and lead.get("_description"):
@@ -1335,22 +1339,53 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     corrected_something = True
                     break
 
-        # HQ country mismatch → use extracted HQ from lead dict (set by Stage 5)
-        if "hq_country" in failed_fields:
+        # HQ mismatch (country, state, or city) → use extracted values
+        if any(f in failed_fields for f in ["hq_country", "hq_state", "hq_city"]):
+            extracted_val = s5_rejection.get("extracted", "")
             ext_country = lead.get("extracted_hq_country", "")
-            if not ext_country:
-                ext_country = s5_rejection.get("extracted", "")
+            ext_state = lead.get("extracted_hq_state", "")
+            ext_city = lead.get("extracted_hq_city", "")
+
+            if "hq_country" in failed_fields:
+                if not ext_country:
+                    ext_country = extracted_val
+                if ext_country:
+                    lead["hq_country"] = ext_country
+                    lead["company_hq_country"] = ext_country
+                    print(f"    🏢 HQ country CORRECTED → '{ext_country}'")
+                    corrected_something = True
+                else:
+                    print(f"    ❌ HQ country not found — skipping lead")
+                    return None
+
+            if "hq_state" in failed_fields:
+                if not ext_state:
+                    ext_state = extracted_val
+                if ext_state:
+                    lead["company_hq_state"] = ext_state
+                    print(f"    🏢 HQ state CORRECTED → '{ext_state}'")
+                    corrected_something = True
+                else:
+                    print(f"    ❌ HQ state not found — skipping lead")
+                    return None
+
+            if "hq_city" in failed_fields:
+                if not ext_city:
+                    ext_city = extracted_val
+                if ext_city:
+                    print(f"    🏢 HQ city CORRECTED → '{ext_city}'")
+                    corrected_something = True
+
+            # Always sync all HQ fields from extracted values (both naming conventions)
             if ext_country:
-                old_hq = lead.get("hq_country", "") or lead.get("company_hq_country", "")
                 lead["hq_country"] = ext_country
                 lead["company_hq_country"] = ext_country
-                if lead.get("extracted_hq_state"):
-                    lead["company_hq_state"] = lead["extracted_hq_state"]
-                print(f"    🏢 HQ CORRECTED: '{old_hq}' → '{ext_country}'")
-                corrected_something = True
-            else:
-                print(f"    ❌ HQ country not found — skipping lead")
-                return None
+            if ext_state:
+                lead["hq_state"] = ext_state
+                lead["company_hq_state"] = ext_state
+            if ext_city:
+                lead["hq_city"] = ext_city
+                lead["company_hq_city"] = ext_city
 
         # Industry/sub-industry mismatch
         if "industry" in failed_fields or "sub_industry" in failed_fields:
