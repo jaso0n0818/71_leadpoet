@@ -964,6 +964,41 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     print(f"\n    ── Validator-equivalent verification: {lead['full_name']} @ {company_name} ──")
 
     # ===================================================================
+    # PRE-STAGE 4: Find person's real location from their LinkedIn profile
+    # This mirrors what Stage 4's Q4 search does, but we use the result
+    # to SET the correct city/state BEFORE Stage 4 verifies it.
+    # This is why the validator never fails on location — miners submit
+    # correct locations from their data sources. We need to do the same.
+    # ===================================================================
+    li_url = lead.get("linkedin_url", "")
+    lid_match = re.search(r'linkedin\.com/in/([^/?#]+)', li_url)
+    if lid_match:
+        slug = lid_match.group(1)
+        pre_q = f'site:linkedin.com/in/{slug}'
+        pre_results, _ = await search_google_async(pre_q, SCRAPINGDOG_API_KEY, max_results=3)
+        for r in pre_results:
+            if slug in r.get("link", "").lower():
+                text = f"{r.get('title', '')} {r.get('snippet', '')}"
+                # Try structured location first (same as Stage 4)
+                loc = _s4_extract_location(text)
+                if loc and "," in loc:
+                    parts = loc.split(",")
+                    lead["city"] = parts[0].strip()
+                    lead["state"] = parts[1].strip() if len(parts) >= 2 else ""
+                    if len(parts) >= 3:
+                        lead["country"] = parts[2].strip()
+                    print(f"    Pre-S4 location: {lead['city']}, {lead['state']}")
+                    break
+                # Try person location from snippet
+                person_loc = _s4_extract_person_location(r.get("snippet", ""))
+                if person_loc and "," in person_loc:
+                    parts = person_loc.split(",")
+                    lead["city"] = parts[0].strip()
+                    lead["state"] = parts[1].strip() if len(parts) >= 2 else ""
+                    print(f"    Pre-S4 location (snippet): {lead['city']}, {lead['state']}")
+                    break
+
+    # ===================================================================
     # STAGE 4: Person verification (LinkedIn URL, name, company, location, role)
     # ===================================================================
     s4_lead = {
@@ -1210,22 +1245,15 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
 
         corrected_something = False
 
-        # Employee count mismatch → use the LinkedIn value from rejection
+        # Employee count mismatch → use the "extracted" field from rejection
         if "employee_count" in failed_fields:
-            # Two message patterns:
-            #   "Size mismatch: claimed 'X' vs LinkedIn 'Y'" → extract Y
-            #   "Employee count 'X' not found in LinkedIn..." → no value, can't correct
-            m = re.search(r"vs LinkedIn '([^']+)'", msg)
-            if not m:
-                m = re.search(r"LinkedIn shows '([^']+)'", msg)
-            if m:
-                new_emp = m.group(1).strip()
+            extracted_emp = s5_rejection.get("extracted", "")
+            if extracted_emp:
                 old_emp = lead.get("employee_count", "")
-                lead["employee_count"] = new_emp
-                print(f"    📊 Employee count CORRECTED: '{old_emp}' → '{new_emp}'")
+                lead["employee_count"] = extracted_emp
+                print(f"    📊 Employee count CORRECTED: '{old_emp}' → '{extracted_emp}'")
                 corrected_something = True
             else:
-                # Employee count not found at all on LinkedIn — unfixable
                 print(f"    ❌ Employee count not found on LinkedIn — skipping lead")
                 return None
 
@@ -1245,14 +1273,11 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     corrected_something = True
                     break
 
-        # HQ country mismatch → use extracted HQ (set both field names)
+        # HQ country mismatch → use extracted HQ from lead dict (set by Stage 5)
         if "hq_country" in failed_fields:
             ext_country = lead.get("extracted_hq_country", "")
             if not ext_country:
-                # Parse from rejection message
-                m = re.search(r"vs LinkedIn '([^']+)'", msg)
-                if m:
-                    ext_country = m.group(1).strip()
+                ext_country = s5_rejection.get("extracted", "")
             if ext_country:
                 old_hq = lead.get("hq_country", "") or lead.get("company_hq_country", "")
                 lead["hq_country"] = ext_country
