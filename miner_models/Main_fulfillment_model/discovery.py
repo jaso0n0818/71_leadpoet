@@ -34,7 +34,13 @@ from target_fit_model.web_discovery import (
     _extract_person_location,
     TRUELIST_API_KEY,
 )
-from target_fit_model.intent_enrichment import research_company_intent, compute_lead_score
+from target_fit_model.intent_enrichment import (
+    research_company_intent,
+    compute_lead_score,
+    compute_intent_score_from_signals,
+    _cross_source_boost,
+)
+from target_fit_model.funding_check import detect_funding_intent, check_company_funding, classify_funding_criteria
 from target_fit_model.openrouter import chat_completion_json
 from target_fit_model.config import PERPLEXITY_MODEL, PERPLEXITY_TIMEOUT
 from target_fit_model.scoring import compute_fit_score
@@ -1342,6 +1348,14 @@ async def _process_companies(
     prompt_text = icp.get("prompt", "")
     intent_signals_str = ", ".join(intent_keywords) if intent_keywords else ""
 
+    # Detect if ICP signals mention funding — if so, check each company's funding
+    _has_funding_intent = detect_funding_intent(intent_signals_str)
+    _funding_criteria = None
+    if _has_funding_intent:
+        _funding_criteria = await asyncio.to_thread(classify_funding_criteria, intent_signals_str)
+        if _funding_criteria:
+            print(f"  [Funding] Detected funding intent: {_funding_criteria.get('description', '')}")
+
     leads = []
     email_verified_pool = []
     for company in companies:
@@ -1432,10 +1446,19 @@ async def _process_companies(
         partial_lead = corrected
 
         # ── Step 4: Get intent signals ──
+        raw_perplexity_signals = []  # keep raw format for scoring
+
         if use_precomputed_signals:
             raw_signals = company.get("signals", [])
             adapted_signals = _adapt_direct_signals(raw_signals, company_domain=domain)
-            intent_score = 0.8 if adapted_signals else 0.0
+            # Convert precomputed signals to raw format for compute_intent_score_from_signals
+            raw_perplexity_signals = [
+                {"signal": s.get("signal", s.get("description", "")),
+                 "match": True,
+                 "relevance_score": 0.8,
+                 "evidence": f"{s.get('evidence', '')} {s.get('url', '')}"}
+                for s in raw_signals if isinstance(s, dict)
+            ]
         else:
             print(f"    Researching intent signals...")
             company_for_intent = {
@@ -1445,6 +1468,18 @@ async def _process_companies(
                 "industry": partial_lead.get("industry", industry),
                 "description": company.get("description", ""),
             }
+
+            # If ICP mentions funding, check funding first and pass as context
+            if _has_funding_intent:
+                funded, funding_evidence, _ = await asyncio.to_thread(
+                    check_company_funding,
+                    company_name,
+                    partial_lead.get("company_website", ""),
+                    _funding_criteria,
+                )
+                if funded:
+                    company_for_intent["_funding_evidence"] = funding_evidence
+                    print(f"    Funding: {funding_evidence[:80]}")
 
             perplexity_result = await asyncio.to_thread(
                 research_company_intent,
@@ -1459,10 +1494,10 @@ async def _process_companies(
                 email_verified_pool.append(partial_lead)
                 continue
 
+            raw_perplexity_signals = perplexity_result.get("signals", [])
             adapted_signals = _adapt_perplexity_signals(
                 perplexity_result, intent_keywords, company_domain=domain,
             )
-            intent_score = perplexity_result.get("intent_score", 0)
 
         if not adapted_signals:
             print(f"    No usable intent signals (saved to pool for batch re-check)")
@@ -1471,13 +1506,27 @@ async def _process_companies(
 
         matching_count = _count_matching_signals(adapted_signals, intent_keywords)
 
-        # ── Step 5: ICP fit scoring (original model's compute_fit_score) ──
+        # ── Step 5: Proper intent + fit scoring ──
+        # Use the founding engineer's tiered scoring (user signals 2x, coverage bonus)
+        intent_score = compute_intent_score_from_signals(
+            raw_perplexity_signals, original_signals=intent_keywords,
+        )
+
+        # Cross-source boost: reward evidence from multiple independent sources
+        intent_score, source_count = _cross_source_boost(
+            raw_perplexity_signals, intent_score,
+        )
+
+        # ICP fit scoring (multi-dimensional: industry, role, location, size, quality)
         fit_score, fit_breakdown = compute_fit_score(partial_lead, icp)
+
+        # Combined score: intent 60% + fit 40%
         lead_score = compute_lead_score(intent_score, fit_score)
 
         print(
             f"    Intent: {len(adapted_signals)} signals, "
-            f"{matching_count}/{len(intent_keywords)} ICP keywords matched"
+            f"{matching_count}/{len(intent_keywords)} ICP keywords matched, "
+            f"score={intent_score:.2f} ({source_count} sources)"
         )
         print(
             f"    Fit: {fit_score:.2f} (ind={fit_breakdown.get('industry_match', 0):.1f}, "
