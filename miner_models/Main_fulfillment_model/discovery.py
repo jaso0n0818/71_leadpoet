@@ -954,11 +954,19 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
     email_verified_pool: List[Dict] = []
     seen_companies: set = set()
 
+    consecutive_empty = 0
+
     for attempt in range(1, MAX_SOURCING_ATTEMPTS + 1):
         if len(all_leads) >= num_leads:
             break
 
         remaining = num_leads - len(all_leads)
+
+        # Back off when we keep finding nothing new
+        if consecutive_empty >= 2:
+            pause = min(10 * consecutive_empty, 60)
+            print(f"\n  ⏸  Backing off {pause}s ({consecutive_empty} empty attempts)")
+            await asyncio.sleep(pause)
 
         print(f"\n  ── Attempt {attempt}/{MAX_SOURCING_ATTEMPTS} "
               f"(have {len(all_leads)}/{num_leads}, need {remaining} more) ──")
@@ -981,7 +989,9 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
 
         if not companies:
             print(f"  No new companies found this attempt")
+            consecutive_empty += 1
         else:
+            consecutive_empty = 0
             print(f"  Found {len(companies)} new companies to process")
             new_leads, new_pool = await _process_companies(
                 companies, icp, remaining,

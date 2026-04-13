@@ -196,12 +196,17 @@ async def search_email_google(
     """Search Google for a person's publicly listed work email.
 
     Tries two queries and extracts any ``@domain`` email from the results.
-    Returns the email string or "" if nothing usable is found.
+    If nothing is found publicly, constructs common email patterns
+    (firstname.lastname@domain, firstname@domain) and verifies each
+    with TrueList — only returns an email that TrueList confirms as
+    ``email_ok``.
+
     Generic/catch-all prefixes (info@, sales@, etc.) are ignored.
     """
     if not full_name or not domain:
         return ""
 
+    # Phase 1: Try to find a publicly listed email via Google
     queries = [
         f'"{full_name}" "@{domain}" email',
         f'"{full_name}" "{company_name}" email',
@@ -218,12 +223,30 @@ async def search_email_google(
                 email_domain = email_lower.split("@")[1] if "@" in email_lower else ""
                 if prefix in _GENERIC_EMAIL_PREFIXES:
                     continue
-                # Prefer exact domain match
                 if email_domain == domain.lower():
                     return email_lower
-                # Accept subdomain match (e.g. mail.company.com)
                 if email_domain.endswith(f".{domain.lower()}"):
                     return email_lower
+
+    # Phase 2: Construct common patterns and verify with TrueList
+    name_parts = full_name.strip().lower().split()
+    if not name_parts or not TRUELIST_API_KEY:
+        return ""
+
+    firstname = re.sub(r'[^a-z]', '', name_parts[0])
+    lastname = re.sub(r'[^a-z]', '', name_parts[-1]) if len(name_parts) >= 2 else ""
+
+    candidates = []
+    if firstname and lastname:
+        candidates.append(f"{firstname}.{lastname}@{domain}")
+    if firstname:
+        candidates.append(f"{firstname}@{domain}")
+
+    for candidate in candidates:
+        is_valid, status = await _verify_email(candidate)
+        if is_valid:
+            logger.info(f"  Email pattern verified: {candidate} ({status})")
+            return candidate
 
     return ""
 
