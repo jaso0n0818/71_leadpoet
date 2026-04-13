@@ -336,8 +336,23 @@ _PERPLEXITY_SYSTEM = (
 )
 
 
+_PROMPT_VARIANTS = [
+    # Variant 0: Standard
+    "Find {num} real companies that match the profile below AND show public evidence of the listed intent signals from the last 6 months (since {since}).",
+    # Variant 1: Discovery angle
+    "Search the web thoroughly for {num} companies in the {industry} space that are actively showing the buying signals listed below. Look beyond the obvious market leaders — include mid-market and emerging companies (since {since}).",
+    # Variant 2: Evidence-focused
+    "Identify {num} {industry} companies where you can find concrete, recent public evidence (job postings, news articles, press releases, blog posts) of the intent signals below. Prioritize companies with strong, verifiable evidence (since {since}).",
+    # Variant 3: Breadth angle
+    "Cast a wide net and find {num} diverse companies across the {industry} sector that demonstrate any of the buying signals below. Include companies of all sizes and stages — startups, growth-stage, and established players (since {since}).",
+    # Variant 4: Regional diversity
+    "Find {num} {industry} companies showing the intent signals below. Look across different US cities and regions — not just Silicon Valley. Include companies headquartered in the Midwest, Southeast, Northeast, and other areas (since {since}).",
+]
+
+
 async def _discover_companies_with_intent(
     icp: dict, num_companies: int = 15, exclude_companies: set = None,
+    _variant_idx: int = 0,
 ) -> List[Dict]:
     """Single Perplexity sonar-pro call to find companies with intent signals.
 
@@ -362,8 +377,13 @@ async def _discover_companies_with_intent(
         exclude_list = sorted(exclude_companies)[:50]
         exclude_text = f"\n\nDO NOT include these companies (already processed):\n{', '.join(exclude_list)}\n"
 
-    prompt = f"""Find {num_companies} real companies that match the profile below AND show
-public evidence of the listed intent signals from the last 6 months (since {six_months_ago}).
+    variant = _PROMPT_VARIANTS[_variant_idx % len(_PROMPT_VARIANTS)]
+    opening = variant.format(
+        num=num_companies, since=six_months_ago,
+        industry=f"{industry}/{sub_industry}" if sub_industry else industry,
+    )
+
+    prompt = f"""{opening}
 
 COMPANY PROFILE:
 - Industry: {industry}{f' / {sub_industry}' if sub_industry else ''}
@@ -380,7 +400,6 @@ RULES:
 - Each company must have at least 1 signal with real, publicly verifiable evidence
 - Include a source URL for each signal when available
 - Don't force matches — skip signals that don't genuinely apply
-- Find DIFFERENT companies each time — diversify across the industry
 
 Return ONLY a JSON array:
 [{{
@@ -1463,10 +1482,13 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
               f"(have {len(all_leads)}/{num_leads}, need {remaining} more) ──")
 
         # Alternate between Perplexity-first (odd) and Google fallback (even)
+        # Rotate prompt variants on Perplexity attempts to get diverse results
         if attempt % 2 == 1:
+            variant_idx = (attempt // 2) % len(_PROMPT_VARIANTS)
             companies = await _discover_companies_with_intent(
                 icp, num_companies=remaining * 5,
                 exclude_companies=seen_companies if seen_companies else None,
+                _variant_idx=variant_idx,
             )
             use_precomputed = True
         else:
