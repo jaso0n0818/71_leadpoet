@@ -851,9 +851,8 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                 lead["company_hq_state"] = lead["state"]
                 print(f"    📍 Location CORRECTED: {old_city}, {old_state} → {lead['city']}, {lead['state']}")
             else:
-                print(f"    ⚠️ Could not determine location — clearing city/state")
-                lead["city"] = ""
-                lead["state"] = ""
+                print(f"    ❌ Could not determine location — skipping lead")
+                return None
 
         # Role mismatch → CORRECT using extracted role or fresh search
         elif "role" in failed:
@@ -872,10 +871,12 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                 lead["role"] = ext_role
                 print(f"    👤 Role CORRECTED: '{old_role}' → '{ext_role}'")
             else:
-                print(f"    ⚠️ Could not determine role — keeping original")
+                print(f"    ❌ Could not determine role — skipping lead")
+                return None
 
         else:
-            print(f"    ⚠️ Stage 4 failed on {failed} — proceeding with current data")
+            print(f"    ❌ Stage 4 failed on {failed} — skipping lead")
+            return None
 
     # ===================================================================
     # STAGE 5: Company verification (LinkedIn slug, employee count, HQ, industry)
