@@ -59,6 +59,7 @@ from validator_models.stage4_helpers import (
     get_linkedin_url_country,
 )
 from validator_models.stage5_verification import (
+    check_stage5_unified,
     _gse_search_sync,
     _extract_fields_from_results,
     _extract_company_size_from_snippet,
@@ -982,17 +983,28 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
         openrouter_api_key=OPENROUTER_API_KEY,
     )
 
-    if s4_result["passed"]:
-        print(f"    ✅ Stage 4 PASSED")
-        # Use extracted data to overwrite with verified values
-        if s4_result["data"].get("extracted_location"):
-            ext_loc = s4_result["data"]["extracted_location"]
+    def _apply_s4_extracted_data(s4_res, ld):
+        """Apply verified extracted data from a Stage 4 result to the lead."""
+        if s4_res["data"].get("extracted_location"):
+            ext_loc = s4_res["data"]["extracted_location"]
             parts = ext_loc.split(",")
             if len(parts) >= 2:
-                lead["city"] = parts[0].strip()
-                lead["state"] = parts[1].strip()
-        if s4_result["data"].get("extracted_role"):
-            lead["role"] = s4_result["data"]["extracted_role"]
+                ld["city"] = parts[0].strip()
+                ld["state"] = parts[1].strip()
+                ld["company_hq_state"] = ld["state"]
+                if len(parts) >= 3:
+                    ld["country"] = parts[2].strip()
+                    ld["company_hq_country"] = parts[2].strip()
+        ext_role = s4_res["data"].get("extracted_role", "")
+        if ext_role and len(ext_role) < 80:
+            # Validate it looks like a role (contains Latin chars, not Arabic/CJK)
+            latin_ratio = sum(1 for c in ext_role if c.isascii()) / max(len(ext_role), 1)
+            if latin_ratio > 0.5:
+                ld["role"] = ext_role
+
+    if s4_result["passed"]:
+        print(f"    ✅ Stage 4 PASSED")
+        _apply_s4_extracted_data(s4_result, lead)
     else:
         reason = s4_result.get("rejection_reason", {})
         failed = reason.get("failed_fields", [])
@@ -1020,6 +1032,7 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     print(f"    ❌ Stage 4 still failed with new URL: {s4_result.get('rejection_reason', {}).get('message', '')}")
                     return None
                 print(f"    ✅ Stage 4 PASSED with corrected LinkedIn URL")
+                _apply_s4_extracted_data(s4_result, lead)
             else:
                 print(f"    ❌ Cannot find LinkedIn profile — skipping lead")
                 return None
@@ -1140,86 +1153,105 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             return None
 
     # ===================================================================
-    # STAGE 5: Company verification (LinkedIn slug, employee count, HQ, industry)
+    # STAGE 5: Company verification using exact validator method
+    # check_stage5_unified finds the REAL values from LinkedIn.
+    # When it rejects, the extracted values are stored on the lead dict.
+    # We use those to correct the lead, then re-run.
     # ===================================================================
-    company_li = lead.get("company_linkedin", "")
-    cli_result = await _verify_company_on_linkedin(
-        company_name, company_li,
-        claimed_employee_count=lead.get("employee_count", ""),
-    )
+    # Set Stage 4 flags that Stage 5 requires
+    lead["role_verified"] = True
+    lead["role_method"] = s4_result["data"].get("role_method", "rule_based")
+    lead["location_verified"] = True
 
-    if cli_result["found"]:
-        # CORRECT company LinkedIn URL if we found a different slug
-        if cli_result["slug"] and cli_result["slug"] not in company_li:
-            old_li = company_li
-            lead["company_linkedin"] = f"https://linkedin.com/company/{cli_result['slug']}"
-            print(f"    🔗 Company LinkedIn CORRECTED: {old_li} → {lead['company_linkedin']}")
+    # Provide a description for classification (from Perplexity discovery)
+    if not lead.get("description") and lead.get("_description"):
+        lead["description"] = lead["_description"]
 
-        # CORRECT employee count to the real LinkedIn value
-        if cli_result["employee_count"]:
-            old_emp = lead.get("employee_count", "")
-            if old_emp != cli_result["employee_count"]:
-                lead["employee_count"] = cli_result["employee_count"]
-                print(f"    📊 Employee count CORRECTED: '{old_emp}' → '{cli_result['employee_count']}'")
+    MAX_S5_CORRECTIONS = 3
+    for s5_attempt in range(MAX_S5_CORRECTIONS):
+        s5_passed, s5_rejection = await check_stage5_unified(lead)
 
-        # CORRECT company website if LinkedIn has it
-        if cli_result["website"]:
-            li_domain = _normalize_domain(cli_result["website"])
-            lead_domain = _normalize_domain(lead.get("company_website", ""))
-            if li_domain and li_domain != lead_domain:
-                lead["company_website"] = f"https://{li_domain}"
-                print(f"    🌐 Website CORRECTED to LinkedIn value: {lead['company_website']}")
+        if s5_passed:
+            print(f"    ✅ Stage 5 PASSED")
+            # Stage 5 may have corrected industry to top-1 pair (line 4114-4116)
+            # and set extracted HQ values — apply them
+            if lead.get("extracted_hq_city"):
+                lead["company_hq_state"] = lead.get("extracted_hq_state", "")
+                lead["company_hq_country"] = lead.get("extracted_hq_country", "")
+            break
 
-        # CORRECT HQ info
-        if cli_result["hq_country"]:
-            lead["company_hq_country"] = cli_result["hq_country"]
-        if cli_result["hq_state"]:
-            lead["company_hq_state"] = cli_result["hq_state"]
-    else:
-        # Company not on LinkedIn — try to find the correct company LinkedIn
-        print(f"    Searching for correct company LinkedIn...")
-        q = f'site:linkedin.com/company/ "{company_name}"'
-        name_r = await asyncio.to_thread(_gse_search_sync, q, 5)
-        found_new = False
-        for r in name_r.get("results", []):
-            link = r.get("link", "")
-            m = re.search(r'linkedin\.com/company/([^/?#]+)', link.lower())
-            if m and company_name.lower() in f"{r.get('title', '')} {r.get('snippet', '')}".lower():
-                new_slug = m.group(1)
-                lead["company_linkedin"] = f"https://linkedin.com/company/{new_slug}"
-                combined = f"{r.get('title', '')} {r.get('snippet', '')}"
-                emp = _extract_company_size_from_snippet(combined)
-                if emp:
-                    lead["employee_count"] = emp
-                found_new = True
-                print(f"    🔗 Company LinkedIn FOUND: {lead['company_linkedin']}, size={emp}")
-                break
-        if not found_new:
-            print(f"    ❌ Company not found on LinkedIn — skipping lead")
+        if not s5_rejection:
+            print(f"    ❌ Stage 5 failed with no rejection info — skipping lead")
             return None
 
-    # ===================================================================
-    # INDUSTRY / SUB-INDUSTRY: Full Stage 5 classification pipeline
-    # ===================================================================
-    linkedin_industry = cli_result.get("industry", "") if cli_result["found"] else ""
-    company_desc = lead.get("_description", "") or ""
+        failed_fields = s5_rejection.get("failed_fields", [])
+        msg = s5_rejection.get("message", "")
+        print(f"    ⚠️ Stage 5 failed (attempt {s5_attempt+1}): {msg}")
 
-    verified_industry, verified_sub = await _classify_industry_full(
-        company_name=company_name,
-        company_description=company_desc,
-        linkedin_industry=linkedin_industry,
-        icp_industry=lead.get("industry", ""),
-        icp_sub_industry=lead.get("sub_industry", ""),
-    )
+        corrected_something = False
 
-    if verified_industry and verified_sub:
-        if verified_industry != lead.get("industry") or verified_sub != lead.get("sub_industry"):
-            old_ind = f"{lead.get('industry')}/{lead.get('sub_industry')}"
-            lead["industry"] = verified_industry
-            lead["sub_industry"] = verified_sub
-            print(f"    🏭 Industry CORRECTED: {old_ind} → {verified_industry}/{verified_sub}")
+        # Employee count mismatch → use the LinkedIn value
+        if "employee_count" in failed_fields:
+            # Parse "claimed 'X' vs LinkedIn 'Y'" or "LinkedIn shows 'Y'"
+            import re as _re
+            m = _re.search(r"LinkedIn (?:shows |')?'?([^'\"]+)'?", msg)
+            if m:
+                new_emp = m.group(1).strip()
+                old_emp = lead.get("employee_count", "")
+                lead["employee_count"] = new_emp
+                print(f"    📊 Employee count CORRECTED: '{old_emp}' → '{new_emp}'")
+                corrected_something = True
+
+        # Company LinkedIn slug not found → search by name
+        if "company_linkedin" in failed_fields:
+            print(f"    Searching for correct company LinkedIn...")
+            q = f'site:linkedin.com/company/ "{company_name}"'
+            name_r = await asyncio.to_thread(_gse_search_sync, q, 5)
+            for r in name_r.get("results", []):
+                link = r.get("link", "")
+                slug_m = re.search(r'linkedin\.com/company/([^/?#]+)', link.lower())
+                if slug_m and company_name.lower() in f"{r.get('title', '')} {r.get('snippet', '')}".lower():
+                    new_slug = slug_m.group(1)
+                    old_li = lead.get("company_linkedin", "")
+                    lead["company_linkedin"] = f"https://linkedin.com/company/{new_slug}"
+                    print(f"    🔗 Company LinkedIn CORRECTED: {old_li} → {lead['company_linkedin']}")
+                    corrected_something = True
+                    break
+
+        # HQ country mismatch → use extracted HQ
+        if "hq_country" in failed_fields:
+            if lead.get("extracted_hq_country"):
+                old_hq = lead.get("company_hq_country", "")
+                lead["company_hq_country"] = lead["extracted_hq_country"]
+                if lead.get("extracted_hq_state"):
+                    lead["company_hq_state"] = lead["extracted_hq_state"]
+                print(f"    🏢 HQ CORRECTED: '{old_hq}' → '{lead['company_hq_country']}'")
+                corrected_something = True
+
+        # Industry/sub-industry mismatch → Stage 5 already set top-1 on the lead
+        if "industry" in failed_fields or "sub_industry" in failed_fields:
+            # check_stage5_unified's classification already ran and failed
+            # There's no correction possible here — skip
+            print(f"    ❌ Industry classification failed — skipping lead")
+            return None
+
+        # Description mismatch
+        if "description" in failed_fields:
+            print(f"    ❌ Description validation failed — skipping lead")
+            return None
+
+        # Company name mismatch
+        if "company_name" in failed_fields:
+            print(f"    ❌ Company name mismatch on LinkedIn — skipping lead")
+            return None
+
+        if not corrected_something:
+            print(f"    ❌ Stage 5 failed and no correction possible — skipping lead")
+            return None
+
     else:
-        print(f"    ❌ Could not classify industry — skipping lead")
+        # Exhausted all correction attempts
+        print(f"    ❌ Stage 5 still failing after {MAX_S5_CORRECTIONS} corrections — skipping lead")
         return None
 
     # Clean up internal fields
