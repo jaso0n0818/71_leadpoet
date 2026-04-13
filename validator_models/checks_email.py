@@ -781,7 +781,7 @@ async def poll_truelist_batch(batch_id: str) -> Dict[str, dict]:
     start_time = time.time()
     poll_count = 0
     consecutive_404s = 0
-    MAX_CONSECUTIVE_404s = 3
+    MAX_CONSECUTIVE_404s = 5
 
     print(f"\n⏳ TrueList Batch: Polling for completion...")
     print(f"   🆔 Batch ID: {batch_id}")
