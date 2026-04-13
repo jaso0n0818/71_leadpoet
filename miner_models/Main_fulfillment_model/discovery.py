@@ -1243,7 +1243,13 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
 
         # Role mismatch → FIND actual role using exact validator methods
         elif "role" in failed:
-            ext_role = s4_result["data"].get("extracted_role", "")
+            # Don't use extracted_role when AI Mode REJECTED the role —
+            # extracted_role is the LinkedIn headline, not a real job title
+            role_method = s4_result["data"].get("role_method", "")
+            if role_method and "reject" in role_method:
+                ext_role = ""
+            else:
+                ext_role = s4_result["data"].get("extracted_role", "")
 
             if not ext_role:
                 ext_role = await _find_actual_role(
@@ -1331,15 +1337,22 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             lead["industry"] = icp_industry_original
             lead["sub_industry"] = icp_sub_industry_original
             # Sync all HQ fields to both naming conventions
-            if lead.get("extracted_hq_city"):
-                lead["hq_city"] = lead.get("extracted_hq_city", "")
-                lead["company_hq_city"] = lead.get("extracted_hq_city", "")
-            if lead.get("extracted_hq_state"):
-                lead["hq_state"] = lead.get("extracted_hq_state", "")
-                lead["company_hq_state"] = lead.get("extracted_hq_state", "")
-            if lead.get("extracted_hq_country"):
-                lead["hq_country"] = lead.get("extracted_hq_country", "")
-                lead["company_hq_country"] = lead.get("extracted_hq_country", "")
+            # Sync ALL HQ fields from extracted values (set by Stage 5 Q1/Q2/Q3)
+            for src, dst1, dst2 in [
+                ("extracted_hq_city", "hq_city", "company_hq_city"),
+                ("extracted_hq_state", "hq_state", "company_hq_state"),
+                ("extracted_hq_country", "hq_country", "company_hq_country"),
+            ]:
+                val = lead.get(src, "")
+                if val:
+                    lead[dst1] = val
+                    lead[dst2] = val
+            # Ensure hq_country is never empty if company_hq_country has a value
+            if not lead.get("hq_country") and lead.get("company_hq_country"):
+                lead["hq_country"] = lead["company_hq_country"]
+            if not lead.get("hq_state") and lead.get("company_hq_state"):
+                lead["hq_state"] = lead["company_hq_state"]
+            print(f"    HQ final: city={lead.get('hq_city','')}, state={lead.get('hq_state','')}, country={lead.get('hq_country','')}")
             break
 
         if not s5_rejection:
