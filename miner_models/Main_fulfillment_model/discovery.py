@@ -1244,6 +1244,29 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             return None
 
     # ===================================================================
+    # FIX COMPANY LINKEDIN SLUG: If Stage 4 couldn't scrape the company
+    # page (wrong slug from domain), search by company name to find it.
+    # Stage 5 needs the correct slug for Q1/Q2/Q3/S4 queries.
+    # ===================================================================
+    if not lead.get("company_linkedin_data"):
+        current_slug = lead.get("company_linkedin_slug", "")
+        print(f"    Company LinkedIn data missing (slug '{current_slug}' may be wrong) — searching by name...")
+        q = f'site:linkedin.com/company/ "{company_name}" "Company size"'
+        name_r = await asyncio.to_thread(_gse_search_sync, q, 5)
+        for r in name_r.get("results", []):
+            link = r.get("link", "")
+            slug_m = re.search(r'linkedin\.com/company/([^/?#]+)', link.lower())
+            if slug_m:
+                found_slug = slug_m.group(1)
+                combined = f"{r.get('title', '')} {r.get('snippet', '')}".lower()
+                if company_name.lower() in combined:
+                    old_li = lead.get("company_linkedin", "")
+                    lead["company_linkedin"] = f"https://linkedin.com/company/{found_slug}"
+                    lead["company_linkedin_slug"] = found_slug
+                    print(f"    🔗 Company LinkedIn slug FIXED: {current_slug} → {found_slug}")
+                    break
+
+    # ===================================================================
     # STAGE 5: Company verification using exact validator method
     # check_stage5_unified finds the REAL values from LinkedIn.
     # When it rejects, the extracted values are stored on the lead dict.
