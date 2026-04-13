@@ -245,8 +245,10 @@ async def search_email_google(
     for candidate in candidates:
         is_valid, status = await _verify_email(candidate)
         if is_valid:
-            logger.info(f"  Email pattern verified: {candidate} ({status})")
+            print(f"    Email pattern verified: {candidate} ({status})")
             return candidate
+        else:
+            print(f"    Email pattern {candidate} → {status}")
 
     return ""
 

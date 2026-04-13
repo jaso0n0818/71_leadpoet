@@ -326,7 +326,7 @@ _PERPLEXITY_SYSTEM = (
 
 
 async def _discover_companies_with_intent(
-    icp: dict, num_companies: int = 15
+    icp: dict, num_companies: int = 15, exclude_companies: set = None,
 ) -> List[Dict]:
     """Single Perplexity sonar-pro call to find companies with intent signals.
 
@@ -346,6 +346,11 @@ async def _discover_companies_with_intent(
 
     intent_list = "\n".join(f"- {s}" for s in intent_keywords) if intent_keywords else "- hiring\n- expansion\n- new product launch"
 
+    exclude_text = ""
+    if exclude_companies:
+        exclude_list = sorted(exclude_companies)[:50]
+        exclude_text = f"\n\nDO NOT include these companies (already processed):\n{', '.join(exclude_list)}\n"
+
     prompt = f"""Find {num_companies} real companies that match the profile below AND show
 public evidence of the listed intent signals from the last 6 months (since {six_months_ago}).
 
@@ -358,12 +363,13 @@ COMPANY PROFILE:
 
 INTENT SIGNALS (find evidence of ANY of these):
 {intent_list}
-
+{exclude_text}
 RULES:
 - Only include real, currently operating companies — no fictional or defunct ones
 - Each company must have at least 1 signal with real, publicly verifiable evidence
 - Include a source URL for each signal when available
 - Don't force matches — skip signals that don't genuinely apply
+- Find DIFFERENT companies each time — diversify across the industry
 
 Return ONLY a JSON array:
 [{{
@@ -390,7 +396,7 @@ Return at least {num_companies} companies. No explanation text."""
         prompt=prompt,
         model=PERPLEXITY_MODEL,
         system_prompt=_PERPLEXITY_SYSTEM,
-        temperature=0,
+        temperature=0.7,
         max_tokens=8000,
         timeout=PERPLEXITY_TIMEOUT,
     )
@@ -1222,6 +1228,7 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
         if attempt % 2 == 1:
             companies = await _discover_companies_with_intent(
                 icp, num_companies=remaining * 5,
+                exclude_companies=seen_companies if seen_companies else None,
             )
             use_precomputed = True
         else:
