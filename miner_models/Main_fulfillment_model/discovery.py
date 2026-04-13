@@ -34,9 +34,10 @@ from target_fit_model.web_discovery import (
     _extract_person_location,
     TRUELIST_API_KEY,
 )
-from target_fit_model.intent_enrichment import research_company_intent
+from target_fit_model.intent_enrichment import research_company_intent, compute_lead_score
 from target_fit_model.openrouter import chat_completion_json
 from target_fit_model.config import PERPLEXITY_MODEL, PERPLEXITY_TIMEOUT
+from target_fit_model.scoring import compute_fit_score
 
 # Validator imports — exact same functions the validator uses
 from validator_models.stage4_person_verification import (
@@ -1297,15 +1298,14 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             rescued = await _batch_intent_recheck(pool, icp, max_leads=remaining)
             all_leads.extend(rescued)
 
-    # Sort by matching signal count, then intent score
-    all_leads.sort(
-        key=lambda x: (x.get("_matching_signal_count", 0), x.get("_intent_score", 0)),
-        reverse=True,
-    )
+    # Sort by combined lead score (intent 60% + ICP fit 40%)
+    all_leads.sort(key=lambda x: x.get("_lead_score", 0), reverse=True)
 
     for lead in all_leads:
         lead.pop("_matching_signal_count", None)
         lead.pop("_intent_score", None)
+        lead.pop("_fit_score", None)
+        lead.pop("_lead_score", None)
 
     print(f"\n{'='*60}")
     print(f"  RESULT: Sourced {len(all_leads)}/{num_leads} leads "
@@ -1470,9 +1470,21 @@ async def _process_companies(
             continue
 
         matching_count = _count_matching_signals(adapted_signals, intent_keywords)
+
+        # ── Step 5: ICP fit scoring (original model's compute_fit_score) ──
+        fit_score, fit_breakdown = compute_fit_score(partial_lead, icp)
+        lead_score = compute_lead_score(intent_score, fit_score)
+
         print(
             f"    Intent: {len(adapted_signals)} signals, "
             f"{matching_count}/{len(intent_keywords)} ICP keywords matched"
+        )
+        print(
+            f"    Fit: {fit_score:.2f} (ind={fit_breakdown.get('industry_match', 0):.1f}, "
+            f"role={fit_breakdown.get('role_match', 0):.1f}, "
+            f"loc={fit_breakdown.get('location_match', 0):.1f}, "
+            f"size={fit_breakdown.get('size_match', 0):.1f}) "
+            f"| Lead score: {lead_score:.3f}"
         )
 
         lead = {
@@ -1480,13 +1492,15 @@ async def _process_companies(
             "intent_signals": adapted_signals,
             "_matching_signal_count": matching_count,
             "_intent_score": intent_score,
+            "_fit_score": fit_score,
+            "_lead_score": lead_score,
         }
         lead.pop("_domain", None)
 
         leads.append(lead)
         print(
             f"    ✅ Lead: {partial_lead['full_name']} @ {company_name} "
-            f"role='{partial_lead['role']}' ({len(adapted_signals)} signals)"
+            f"role='{partial_lead['role']}' ({len(adapted_signals)} signals, score={lead_score:.3f})"
         )
 
     return leads, email_verified_pool
