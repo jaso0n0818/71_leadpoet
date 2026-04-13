@@ -43,6 +43,10 @@ from validator_models.stage4_person_verification import (
     run_lead_validation_stage4,
     search_google_async,
 )
+from validator_models.stage4_helpers import (
+    extract_location_from_text as _s4_extract_location,
+    extract_role_from_result as _s4_extract_role,
+)
 from validator_models.stage5_verification import (
     _gse_search_sync,
     _extract_fields_from_results,
@@ -811,9 +815,34 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             print(f"    ❌ Company not found on LinkedIn — skipping lead")
             return None
 
-        # Location mismatch → CORRECT using extracted data
+        # Location mismatch → CORRECT using extracted data or fresh search
         elif "city" in failed or "state" in failed:
             ext_loc = s4_result["data"].get("extracted_location", "")
+
+            # If Stage 4 didn't extract a location, search the profile directly
+            if not ext_loc or "," not in ext_loc:
+                for r in s4_result["data"].get("search_results", []):
+                    text = f"{r.get('title', '')} {r.get('snippet', '')}"
+                    candidate = _s4_extract_location(text)
+                    if candidate and "," in candidate:
+                        ext_loc = candidate
+                        break
+
+            # If still nothing, do a dedicated location search
+            if not ext_loc or "," not in ext_loc:
+                lid = re.search(r'linkedin\.com/in/([^/?#]+)', lead.get("linkedin_url", ""))
+                if lid:
+                    slug = lid.group(1)
+                    print(f"    Searching for actual location on profile...")
+                    loc_q = f'site:linkedin.com/in/{slug} location'
+                    loc_results, _ = await search_google_async(loc_q, SCRAPINGDOG_API_KEY, max_results=3)
+                    for r in loc_results:
+                        text = f"{r.get('title', '')} {r.get('snippet', '')}"
+                        candidate = _s4_extract_location(text)
+                        if candidate and "," in candidate:
+                            ext_loc = candidate
+                            break
+
             if ext_loc and "," in ext_loc:
                 parts = ext_loc.split(",")
                 old_city, old_state = lead.get("city", ""), lead.get("state", "")
@@ -822,22 +851,31 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                 lead["company_hq_state"] = lead["state"]
                 print(f"    📍 Location CORRECTED: {old_city}, {old_state} → {lead['city']}, {lead['state']}")
             else:
-                print(f"    ❌ Location mismatch but no extracted location — skipping")
-                return None
+                print(f"    ⚠️ Could not determine location — clearing city/state")
+                lead["city"] = ""
+                lead["state"] = ""
 
-        # Role mismatch → CORRECT using extracted role
+        # Role mismatch → CORRECT using extracted role or fresh search
         elif "role" in failed:
             ext_role = s4_result["data"].get("extracted_role", "")
+
+            # If Stage 4 didn't extract a role, look in search results
+            if not ext_role:
+                for r in s4_result["data"].get("search_results", []):
+                    candidate = _s4_extract_role(r, lead["full_name"], company_name)
+                    if candidate:
+                        ext_role = candidate
+                        break
+
             if ext_role:
                 old_role = lead.get("role", "")
                 lead["role"] = ext_role
                 print(f"    👤 Role CORRECTED: '{old_role}' → '{ext_role}'")
             else:
-                print(f"    ❌ Role mismatch but no extracted role — skipping")
-                return None
+                print(f"    ⚠️ Could not determine role — keeping original")
+
         else:
-            print(f"    ❌ Stage 4 failed on unknown field — skipping")
-            return None
+            print(f"    ⚠️ Stage 4 failed on {failed} — proceeding with current data")
 
     # ===================================================================
     # STAGE 5: Company verification (LinkedIn slug, employee count, HQ, industry)
