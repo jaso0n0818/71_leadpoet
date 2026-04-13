@@ -1052,8 +1052,25 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             ext_loc = s4_result["data"].get("extracted_location", "")
             found_city, found_state, found_country = "", "", ""
 
+            # Method 0: Parse the rejection reason directly
+            # "City mismatch: extracted 'london' but claimed 'Tallinn'"
+            # "Area mismatch: found 'New York City Metropolitan Area' but city 'X' not in approved list"
+            rej_reason = s4_result.get("rejection_reason", {})
+            if rej_reason.get("extracted_location"):
+                ext_loc = rej_reason["extracted_location"]
+            if rej_reason.get("area_found"):
+                area = rej_reason["area_found"]
+                # "New York City Metropolitan Area" → "New York City"
+                area_city = re.sub(r'\s*(Metropolitan|Metro|Bay)?\s*Area$', '', area).strip()
+                area_city = re.sub(r'^Greater\s+', '', area_city).strip()
+                if area_city:
+                    found_city = area_city
+                    print(f"    Area found: {area} → city: {found_city}")
+            if rej_reason.get("extracted_city"):
+                found_city = rej_reason["extracted_city"]
+
             # Method 1: Use Stage 4's extracted location (from the matched result)
-            if ext_loc and "," in ext_loc:
+            if not found_city and ext_loc and "," in ext_loc:
                 parts = ext_loc.split(",")
                 found_city = parts[0].strip()
                 found_state = parts[1].strip() if len(parts) >= 2 else ""
@@ -1163,6 +1180,10 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     lead["role_method"] = s4_result["data"].get("role_method", "rule_based")
     lead["location_verified"] = True
 
+    # Stage 5 reads "hq_country" not "company_hq_country"
+    if lead.get("company_hq_country") and not lead.get("hq_country"):
+        lead["hq_country"] = lead["company_hq_country"]
+
     # Provide a description for classification (from Perplexity discovery)
     if not lead.get("description") and lead.get("_description"):
         lead["description"] = lead["_description"]
@@ -1173,11 +1194,10 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
 
         if s5_passed:
             print(f"    ✅ Stage 5 PASSED")
-            # Stage 5 may have corrected industry to top-1 pair (line 4114-4116)
-            # and set extracted HQ values — apply them
             if lead.get("extracted_hq_city"):
                 lead["company_hq_state"] = lead.get("extracted_hq_state", "")
                 lead["company_hq_country"] = lead.get("extracted_hq_country", "")
+                lead["hq_country"] = lead.get("extracted_hq_country", "")
             break
 
         if not s5_rejection:
@@ -1190,17 +1210,24 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
 
         corrected_something = False
 
-        # Employee count mismatch → use the LinkedIn value
+        # Employee count mismatch → use the LinkedIn value from rejection
         if "employee_count" in failed_fields:
-            # Parse "claimed 'X' vs LinkedIn 'Y'" or "LinkedIn shows 'Y'"
-            import re as _re
-            m = _re.search(r"LinkedIn (?:shows |')?'?([^'\"]+)'?", msg)
+            # Two message patterns:
+            #   "Size mismatch: claimed 'X' vs LinkedIn 'Y'" → extract Y
+            #   "Employee count 'X' not found in LinkedIn..." → no value, can't correct
+            m = re.search(r"vs LinkedIn '([^']+)'", msg)
+            if not m:
+                m = re.search(r"LinkedIn shows '([^']+)'", msg)
             if m:
                 new_emp = m.group(1).strip()
                 old_emp = lead.get("employee_count", "")
                 lead["employee_count"] = new_emp
                 print(f"    📊 Employee count CORRECTED: '{old_emp}' → '{new_emp}'")
                 corrected_something = True
+            else:
+                # Employee count not found at all on LinkedIn — unfixable
+                print(f"    ❌ Employee count not found on LinkedIn — skipping lead")
+                return None
 
         # Company LinkedIn slug not found → search by name
         if "company_linkedin" in failed_fields:
@@ -1218,20 +1245,28 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     corrected_something = True
                     break
 
-        # HQ country mismatch → use extracted HQ
+        # HQ country mismatch → use extracted HQ (set both field names)
         if "hq_country" in failed_fields:
-            if lead.get("extracted_hq_country"):
-                old_hq = lead.get("company_hq_country", "")
-                lead["company_hq_country"] = lead["extracted_hq_country"]
+            ext_country = lead.get("extracted_hq_country", "")
+            if not ext_country:
+                # Parse from rejection message
+                m = re.search(r"vs LinkedIn '([^']+)'", msg)
+                if m:
+                    ext_country = m.group(1).strip()
+            if ext_country:
+                old_hq = lead.get("hq_country", "") or lead.get("company_hq_country", "")
+                lead["hq_country"] = ext_country
+                lead["company_hq_country"] = ext_country
                 if lead.get("extracted_hq_state"):
                     lead["company_hq_state"] = lead["extracted_hq_state"]
-                print(f"    🏢 HQ CORRECTED: '{old_hq}' → '{lead['company_hq_country']}'")
+                print(f"    🏢 HQ CORRECTED: '{old_hq}' → '{ext_country}'")
                 corrected_something = True
+            else:
+                print(f"    ❌ HQ country not found — skipping lead")
+                return None
 
-        # Industry/sub-industry mismatch → Stage 5 already set top-1 on the lead
+        # Industry/sub-industry mismatch
         if "industry" in failed_fields or "sub_industry" in failed_fields:
-            # check_stage5_unified's classification already ran and failed
-            # There's no correction possible here — skip
             print(f"    ❌ Industry classification failed — skipping lead")
             return None
 
