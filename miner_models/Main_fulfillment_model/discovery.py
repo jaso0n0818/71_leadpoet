@@ -1289,7 +1289,7 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     if not lead.get("description") and lead.get("_description"):
         lead["description"] = lead["_description"]
 
-    MAX_S5_CORRECTIONS = 3
+    MAX_S5_CORRECTIONS = 6
     for s5_attempt in range(MAX_S5_CORRECTIONS):
         s5_passed, s5_rejection = await check_stage5_unified(lead)
 
@@ -1339,53 +1339,36 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                     corrected_something = True
                     break
 
-        # HQ mismatch (country, state, or city) → use extracted values
+        # HQ mismatch (country, state, or city) → correct ALL HQ fields at once
+        # Stage 5 checks country first, then state, then city — failing fast.
+        # By correcting all fields together, we avoid cascading single-field corrections.
         if any(f in failed_fields for f in ["hq_country", "hq_state", "hq_city"]):
-            extracted_val = s5_rejection.get("extracted", "")
             ext_country = lead.get("extracted_hq_country", "")
             ext_state = lead.get("extracted_hq_state", "")
             ext_city = lead.get("extracted_hq_city", "")
 
-            if "hq_country" in failed_fields:
-                if not ext_country:
-                    ext_country = extracted_val
+            # Also try to get from rejection's extracted field
+            extracted_val = s5_rejection.get("extracted", "")
+            if not ext_country and "hq_country" in failed_fields:
+                ext_country = extracted_val
+            if not ext_state and "hq_state" in failed_fields:
+                ext_state = extracted_val
+
+            if ext_country or ext_state or ext_city:
                 if ext_country:
                     lead["hq_country"] = ext_country
                     lead["company_hq_country"] = ext_country
-                    print(f"    🏢 HQ country CORRECTED → '{ext_country}'")
-                    corrected_something = True
-                else:
-                    print(f"    ❌ HQ country not found — skipping lead")
-                    return None
-
-            if "hq_state" in failed_fields:
-                if not ext_state:
-                    ext_state = extracted_val
                 if ext_state:
+                    lead["hq_state"] = ext_state
                     lead["company_hq_state"] = ext_state
-                    print(f"    🏢 HQ state CORRECTED → '{ext_state}'")
-                    corrected_something = True
-                else:
-                    print(f"    ❌ HQ state not found — skipping lead")
-                    return None
-
-            if "hq_city" in failed_fields:
-                if not ext_city:
-                    ext_city = extracted_val
                 if ext_city:
-                    print(f"    🏢 HQ city CORRECTED → '{ext_city}'")
-                    corrected_something = True
-
-            # Always sync all HQ fields from extracted values (both naming conventions)
-            if ext_country:
-                lead["hq_country"] = ext_country
-                lead["company_hq_country"] = ext_country
-            if ext_state:
-                lead["hq_state"] = ext_state
-                lead["company_hq_state"] = ext_state
-            if ext_city:
-                lead["hq_city"] = ext_city
-                lead["company_hq_city"] = ext_city
+                    lead["hq_city"] = ext_city
+                    lead["company_hq_city"] = ext_city
+                print(f"    🏢 HQ CORRECTED → {ext_city}, {ext_state}, {ext_country}")
+                corrected_something = True
+            else:
+                print(f"    ❌ HQ not found — skipping lead")
+                return None
 
         # Industry/sub-industry mismatch
         if "industry" in failed_fields or "sub_industry" in failed_fields:
