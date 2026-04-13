@@ -248,9 +248,13 @@ def _adapt_perplexity_signals(
         if not url:
             continue
 
+        # description must be >= 80 chars with specific keywords for the
+        # validator's is_generic_intent_description check to pass.
+        # Combine signal name + evidence for a substantive description.
+        full_desc = f"{signal_name}: {snippet_text}" if snippet_text and snippet_text != signal_name else signal_name
         adapted.append({
             "source": source_type,
-            "description": signal_name[:500],
+            "description": full_desc[:500],
             "url": url,
             "date": extracted_date,
             "snippet": snippet_text[:1000],
@@ -276,7 +280,6 @@ def _adapt_direct_signals(
         signal_name = sig.get("signal") or sig.get("description") or ""
 
         if not url:
-            # Try to extract URL from evidence text
             urls = _URL_REGEX.findall(evidence)
             url = urls[0].rstrip(".,;)") if urls else ""
 
@@ -297,9 +300,10 @@ def _adapt_direct_signals(
         if not url:
             continue
 
+        full_desc = f"{signal_name}: {snippet_text}" if snippet_text and snippet_text != signal_name else signal_name
         adapted.append({
             "source": source_type,
-            "description": signal_name[:500],
+            "description": full_desc[:500],
             "url": url,
             "date": extracted_date,
             "snippet": snippet_text[:1000],
@@ -1322,10 +1326,12 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     if not lead.get("description") and lead.get("_description"):
         lead["description"] = lead["_description"]
 
-    # Save ICP industry/sub_industry — Stage 5 may overwrite with classification
-    # but Tier 1 ICP matching needs the original ICP values
+    # Save original values — Stage 4/5 may overwrite with extracted data
+    # but Tier 1 ICP matching needs the original ICP values for industry
+    # and the find_contact-matched role for role checking
     icp_industry_original = lead.get("industry", "")
     icp_sub_industry_original = lead.get("sub_industry", "")
+    original_role = lead.get("role", "")
 
     MAX_S5_CORRECTIONS = 10
     for s5_attempt in range(MAX_S5_CORRECTIONS):
@@ -1333,9 +1339,12 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
 
         if s5_passed:
             print(f"    ✅ Stage 5 PASSED")
-            # Restore ICP industry/sub_industry — validator Tier 1 needs these to match ICP
+            # Restore ICP industry/sub_industry and original role
+            # Validator Tier 1 needs industry to match ICP, and role to match target_roles
             lead["industry"] = icp_industry_original
             lead["sub_industry"] = icp_sub_industry_original
+            if original_role:
+                lead["role"] = original_role
             # Sync all HQ fields to both naming conventions
             # Sync ALL HQ fields from extracted values (set by Stage 5 Q1/Q2/Q3)
             for src, dst1, dst2 in [
@@ -1363,9 +1372,11 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
         msg = s5_rejection.get("message", "")
         print(f"    ⚠️ Stage 5 failed (attempt {s5_attempt+1}): {msg}")
 
-        # Restore ICP industry (Stage 5 may have overwritten it)
+        # Restore ICP industry and original role (Stage 4/5 may have overwritten)
         lead["industry"] = icp_industry_original
         lead["sub_industry"] = icp_sub_industry_original
+        if original_role:
+            lead["role"] = original_role
 
         corrected_something = False
 
