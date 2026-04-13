@@ -42,10 +42,12 @@ from target_fit_model.config import PERPLEXITY_MODEL, PERPLEXITY_TIMEOUT
 from validator_models.stage4_person_verification import (
     run_lead_validation_stage4,
     search_google_async,
+    _check_role_via_aimode,
 )
 from validator_models.stage4_helpers import (
     extract_location_from_text as _s4_extract_location,
     extract_role_from_result as _s4_extract_role,
+    get_linkedin_id,
 )
 from validator_models.stage5_verification import (
     _gse_search_sync,
@@ -728,6 +730,207 @@ def _get_valid_industry_pair(
     return icp_industry, icp_sub_industry
 
 
+async def _find_actual_role(
+    linkedin_url: str,
+    company_name: str,
+    full_name: str,
+    search_results: list,
+) -> str:
+    """Find the person's actual role using the exact validator methods.
+
+    Pipeline (mirrors Stage 4):
+      1. extract_role_from_result on all search results
+      2. AI Mode: ask ScrapingDog about the LinkedIn profile
+      3. LLM fallback on AI Mode prose
+    """
+    # Step 1: Extract from search results (same as Stage 4 Step 7)
+    for r in search_results:
+        role = _s4_extract_role(r, full_name, company_name)
+        if role:
+            print(f"    Found role from search results: {role}")
+            return role
+
+    # Step 2: AI Mode — ask for the actual role (same API as Stage 4 Step 7.5)
+    if SCRAPINGDOG_API_KEY and linkedin_url:
+        print(f"    [AI Mode] Asking for actual role on profile...")
+        import time as _time
+        import requests as _requests
+        from concurrent.futures import ThreadPoolExecutor
+
+        _executor = ThreadPoolExecutor(max_workers=1)
+        query = (
+            f'For LinkedIn profile {linkedin_url}, what is the current job title '
+            f'at "{company_name}"? '
+            f'Return JSON only: {{"role":"the exact current job title"}}'
+        )
+
+        last_markdown = ""
+
+        def _call():
+            nonlocal last_markdown
+            for attempt in range(3):
+                try:
+                    resp = _requests.get(
+                        'https://api.scrapingdog.com/google/ai_mode',
+                        params={'api_key': SCRAPINGDOG_API_KEY, 'query': query},
+                        timeout=90,
+                    )
+                    if resp.status_code in (502, 503, 429):
+                        if attempt < 2:
+                            _time.sleep(2 + attempt * 2)
+                            continue
+                        return None
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        md = data.get('markdown', '') or ''
+                        last_markdown = md
+                        # Try parsing JSON
+                        m = re.search(r'\{[^{}]*"role"[^{}]*\}', md)
+                        if m:
+                            try:
+                                obj = json.loads(m.group())
+                                if obj.get("role"):
+                                    return obj["role"]
+                            except Exception:
+                                pass
+                        return None
+                except Exception:
+                    if attempt < 2:
+                        _time.sleep(2 + attempt * 2)
+                        continue
+                    return None
+            return None
+
+        loop = asyncio.get_running_loop()
+        aimode_role = await loop.run_in_executor(_executor, _call)
+
+        if aimode_role:
+            print(f"    [AI Mode] Found role: {aimode_role}")
+            return aimode_role
+
+        # Step 3: LLM fallback on AI Mode prose
+        if last_markdown and OPENROUTER_API_KEY:
+            from target_fit_model.web_discovery import _llm_call
+            prompt = (
+                f"Extract the current job title for {full_name} at {company_name} "
+                f"from this text. Return ONLY the job title, nothing else.\n\n"
+                f"Text:\n{last_markdown[:1500]}"
+            )
+            llm_resp = await _llm_call(prompt)
+            if llm_resp and len(llm_resp) < 100 and "sorry" not in llm_resp.lower():
+                role = llm_resp.strip().strip('"').strip("'")
+                print(f"    [LLM] Extracted role: {role}")
+                return role
+
+    return ""
+
+
+async def _classify_industry_full(
+    company_name: str,
+    company_description: str,
+    linkedin_industry: str,
+    icp_industry: str = "",
+    icp_sub_industry: str = "",
+) -> Tuple[str, str]:
+    """Classify industry using the full Stage 5 embedding pipeline.
+
+    Pipeline (exact same as Stage 5):
+      1. Validate + refine description (LLM)
+      2. Embed refined description (Qwen3-Embedding-8B)
+      3. Find top 30 candidates by cosine similarity
+      4. LLM ranks top 3
+
+    Falls back to simple taxonomy matching if the pipeline fails.
+    """
+    if company_description and linkedin_industry:
+        try:
+            classifications, refined, error = await asyncio.to_thread(
+                lambda: asyncio.get_event_loop().run_until_complete(
+                    classify_company_industry(
+                        miner_description=company_description,
+                        extracted_content=f"[Industry: {linkedin_industry}] {company_description}",
+                        extracted_industry=linkedin_industry,
+                        company_name=company_name,
+                        miner_industry=icp_industry,
+                        miner_sub_industry=icp_sub_industry,
+                    )
+                )
+            )
+        except Exception:
+            # classify_company_industry is already async-friendly internally
+            # but uses sync calls; just call it directly in a thread
+            try:
+                from validator_models.stage5_verification import (
+                    _load_taxonomy_embeddings,
+                    _get_embedding_sync,
+                    _find_top_candidates,
+                    _format_candidates_for_prompt,
+                    _call_llm_sync,
+                    _clean_refined_description,
+                    _parse_classification_response,
+                    VALIDATE_REFINE_PROMPT,
+                    CLASSIFY_PROMPT,
+                    TOP_K_CANDIDATES,
+                )
+
+                def _run_classification():
+                    taxonomy = _load_taxonomy_embeddings()
+                    if not taxonomy:
+                        return [], "", "no_taxonomy"
+
+                    content = f"[Industry: {linkedin_industry}] {company_description}"
+                    prompt1 = VALIDATE_REFINE_PROMPT.format(
+                        company_name=company_name,
+                        miner_description=company_description[:2000],
+                        extracted_content=content[:3000],
+                    )
+                    response1 = _call_llm_sync(prompt1)
+                    refined = _clean_refined_description(response1) if response1 else None
+                    if not refined:
+                        return [], "", "invalid_description"
+
+                    query_emb = _get_embedding_sync(refined)
+                    if query_emb is None:
+                        return [], refined, "embedding_failed"
+
+                    candidates = _find_top_candidates(query_emb, taxonomy, k=TOP_K_CANDIDATES)
+                    if not candidates:
+                        return [], refined, "no_candidates"
+
+                    candidates_str, candidates_list = _format_candidates_for_prompt(
+                        candidates,
+                        miner_industry=icp_industry,
+                        miner_sub_industry=icp_sub_industry,
+                        valid_pairs=taxonomy.get('valid_pairs'),
+                    )
+                    desc_for_prompt = f"{refined}. LinkedIn Industry: {linkedin_industry}" if linkedin_industry else refined
+                    prompt2 = CLASSIFY_PROMPT.format(
+                        refined_description=desc_for_prompt,
+                        candidates_list=candidates_str,
+                    )
+                    response2 = _call_llm_sync(prompt2)
+                    classifications = _parse_classification_response(response2, candidates_list) if response2 else []
+                    return classifications, refined, ""
+
+                classifications, refined, error = await asyncio.to_thread(_run_classification)
+            except Exception as e:
+                print(f"    [Industry] Classification pipeline failed: {e}")
+                classifications, error = [], str(e)
+
+        if classifications:
+            top = classifications[0]
+            print(f"    [Industry] Classified: {top['industry']}/{top['sub_industry']}")
+            return top["industry"], top["sub_industry"]
+
+    # Fall back to simple taxonomy matching
+    return _get_valid_industry_pair(
+        linkedin_industry=linkedin_industry,
+        company_description=company_description,
+        icp_industry=icp_industry,
+        icp_sub_industry=icp_sub_industry,
+    )
+
+
 async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
     """Run validator-equivalent checks and CORRECT the lead data.
 
@@ -854,17 +1057,17 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                 print(f"    ❌ Could not determine location — skipping lead")
                 return None
 
-        # Role mismatch → CORRECT using extracted role or fresh search
+        # Role mismatch → FIND actual role using exact validator methods
         elif "role" in failed:
             ext_role = s4_result["data"].get("extracted_role", "")
 
-            # If Stage 4 didn't extract a role, look in search results
             if not ext_role:
-                for r in s4_result["data"].get("search_results", []):
-                    candidate = _s4_extract_role(r, lead["full_name"], company_name)
-                    if candidate:
-                        ext_role = candidate
-                        break
+                ext_role = await _find_actual_role(
+                    linkedin_url=lead.get("linkedin_url", ""),
+                    company_name=company_name,
+                    full_name=lead["full_name"],
+                    search_results=s4_result["data"].get("search_results", []),
+                )
 
             if ext_role:
                 old_role = lead.get("role", "")
@@ -934,17 +1137,19 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
                 print(f"    🔗 Company LinkedIn FOUND: {lead['company_linkedin']}, size={emp}")
                 break
         if not found_new:
-            print(f"    ⚠️ Company not found on LinkedIn — proceeding with unverified data")
+            print(f"    ❌ Company not found on LinkedIn — skipping lead")
+            return None
 
     # ===================================================================
-    # INDUSTRY / SUB-INDUSTRY: Must be a valid taxonomy pair
+    # INDUSTRY / SUB-INDUSTRY: Full Stage 5 classification pipeline
     # ===================================================================
     linkedin_industry = cli_result.get("industry", "") if cli_result["found"] else ""
     company_desc = lead.get("_description", "") or ""
 
-    verified_industry, verified_sub = _get_valid_industry_pair(
-        linkedin_industry=linkedin_industry,
+    verified_industry, verified_sub = await _classify_industry_full(
+        company_name=company_name,
         company_description=company_desc,
+        linkedin_industry=linkedin_industry,
         icp_industry=lead.get("industry", ""),
         icp_sub_industry=lead.get("sub_industry", ""),
     )
@@ -955,6 +1160,9 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             lead["industry"] = verified_industry
             lead["sub_industry"] = verified_sub
             print(f"    🏭 Industry CORRECTED: {old_ind} → {verified_industry}/{verified_sub}")
+    else:
+        print(f"    ❌ Could not classify industry — skipping lead")
+        return None
 
     # Clean up internal fields
     lead.pop("_description", None)
