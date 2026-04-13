@@ -846,6 +846,7 @@ class Miner(BaseMinerNeuron):
                     employee_count=lead_dict.get("employee_count", ""),
                     company_hq_country=lead_dict.get("company_hq_country", ""),
                     company_hq_state=lead_dict.get("company_hq_state", ""),
+                    company_hq_city=lead_dict.get("company_hq_city", ""),
                     industry=lead_dict.get("industry", ""),
                     sub_industry=lead_dict.get("sub_industry", ""),
                     country=lead_dict.get("country", ""),

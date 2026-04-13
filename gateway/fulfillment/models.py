@@ -156,6 +156,7 @@ class FulfillmentLead(BaseModel):
     # Company HQ location (used for ICP country/state matching)
     company_hq_country: str
     company_hq_state: str
+    company_hq_city: str = ""
 
     # Industry
     industry: str
@@ -239,6 +240,7 @@ class FulfillmentLead(BaseModel):
         d["linkedin"] = self.linkedin_url
         d["hq_country"] = self.company_hq_country
         d["hq_state"] = self.company_hq_state
+        d["hq_city"] = self.company_hq_city
         parts = self.full_name.strip().split(None, 1)
         d["first"] = parts[0] if parts else ""
         d["last"] = parts[1] if len(parts) > 1 else ""
