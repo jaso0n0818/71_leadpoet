@@ -181,6 +181,53 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+_GENERIC_EMAIL_PREFIXES = frozenset({
+    "info", "admin", "sales", "support", "hello", "contact", "team",
+    "hr", "careers", "marketing", "press", "media", "office", "help",
+    "billing", "accounts", "noreply", "no-reply", "webmaster",
+})
+
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+
+
+async def search_email_google(
+    full_name: str, company_name: str, domain: str
+) -> str:
+    """Search Google for a person's publicly listed work email.
+
+    Tries two queries and extracts any ``@domain`` email from the results.
+    Returns the email string or "" if nothing usable is found.
+    Generic/catch-all prefixes (info@, sales@, etc.) are ignored.
+    """
+    if not full_name or not domain:
+        return ""
+
+    queries = [
+        f'"{full_name}" "@{domain}" email',
+        f'"{full_name}" "{company_name}" email',
+    ]
+
+    for query in queries:
+        results = await _google_search(query, num_results=5)
+        for r in results:
+            text = f"{r.get('title', '')} {r.get('snippet', '')}"
+            emails = _EMAIL_RE.findall(text)
+            for email in emails:
+                email_lower = email.lower()
+                prefix = email_lower.split("@")[0]
+                email_domain = email_lower.split("@")[1] if "@" in email_lower else ""
+                if prefix in _GENERIC_EMAIL_PREFIXES:
+                    continue
+                # Prefer exact domain match
+                if email_domain == domain.lower():
+                    return email_lower
+                # Accept subdomain match (e.g. mail.company.com)
+                if email_domain.endswith(f".{domain.lower()}"):
+                    return email_lower
+
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 1: Company Discovery
 # ═══════════════════════════════════════════════════════════════════════════
@@ -459,7 +506,6 @@ Return ONLY a JSON object:
 - full_name: their full name
 - actual_role: their actual job title from LinkedIn
 - matched_role: which target role best matches (MUST be one from the list above, or "" if none match)
-- email_guess: likely work email (firstname.lastname@{domain})
 
 Rules:
 - matched_role MUST be copied exactly from the target roles list if the person's actual role is close enough
@@ -471,11 +517,13 @@ Rules:
 
     if not resp:
         name_parts = title_text.split(" - ")[0].strip().split("–")[0].strip()
+        # Search for a publicly listed email
+        found_email = await search_email_google(name_parts, company_name, domain)
         return {
             "full_name": name_parts,
             "linkedin_url": linkedin_url,
             "role": target_roles[0] if target_roles else "VP of Sales",
-            "email": "",
+            "email": found_email,
             "city": person_loc.get("city", ""),
             "state": person_loc.get("state", ""),
         }
@@ -492,26 +540,25 @@ Rules:
             logger.info(f"  Contact at {company_name} role '{data.get('actual_role')}' doesn't match target roles — skipping")
             return None
 
-        email = data.get("email_guess", "")
-        if not email and data.get("full_name"):
-            parts = data["full_name"].lower().split()
-            if len(parts) >= 2:
-                email = f"{parts[0]}.{parts[-1]}@{domain}"
+        full_name = data.get("full_name", "")
+        found_email = await search_email_google(full_name, company_name, domain)
 
         return {
-            "full_name": data.get("full_name", ""),
+            "full_name": full_name,
             "linkedin_url": linkedin_url,
             "role": matched_role,
             "city": person_loc.get("city", ""),
             "state": person_loc.get("state", ""),
-            "email": email,
+            "email": found_email,
         }
     except json.JSONDecodeError:
+        name_parts = title_text.split(" - ")[0].strip()
+        found_email = await search_email_google(name_parts, company_name, domain)
         return {
-            "full_name": title_text.split(" - ")[0].strip(),
+            "full_name": name_parts,
             "linkedin_url": linkedin_url,
             "role": target_roles[0] if target_roles else "",
-            "email": "",
+            "email": found_email,
             "city": person_loc.get("city", ""),
             "state": person_loc.get("state", ""),
         }

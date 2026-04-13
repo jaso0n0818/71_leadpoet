@@ -171,10 +171,15 @@ async def get_active_requests(miner_hotkey: str = ""):
             raise HTTPException(403, detail=f"Hotkey banned: {reason}")
 
     now = datetime.now(timezone.utc)
+
+    # FIFO: only return the single oldest open request.
+    # Until it is fulfilled/recycled/closed, no other request is served.
     resp = supabase.table("fulfillment_requests") \
         .select("*") \
         .eq("status", "open") \
         .gt("window_end", now.isoformat()) \
+        .order("window_start", desc=False) \
+        .limit(1) \
         .execute()
 
     requests_out = []
