@@ -396,7 +396,7 @@ Return at least {num_companies} companies. No explanation text."""
         prompt=prompt,
         model=PERPLEXITY_MODEL,
         system_prompt=_PERPLEXITY_SYSTEM,
-        temperature=0.7,
+        temperature=0.3,
         max_tokens=8000,
         timeout=PERPLEXITY_TIMEOUT,
     )
@@ -1240,6 +1240,15 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             c for c in companies
             if c.get("name", "").lower() not in seen_companies
         ]
+
+        # When using precomputed signals from Perplexity, skip companies
+        # with 0 signals — don't waste API calls on contacts/emails/verification
+        if use_precomputed:
+            before = len(companies)
+            companies = [c for c in companies if c.get("signals")]
+            skipped = before - len(companies)
+            if skipped:
+                print(f"  Filtered out {skipped} companies with 0 intent signals")
 
         if not companies:
             print(f"  No new companies found this attempt")
