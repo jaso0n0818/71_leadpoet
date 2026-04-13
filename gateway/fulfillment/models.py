@@ -237,6 +237,8 @@ class FulfillmentLead(BaseModel):
         d = self.model_dump(exclude={"intent_signals"})
         d["website"] = self.company_website
         d["linkedin"] = self.linkedin_url
+        d["hq_country"] = self.company_hq_country
+        d["hq_state"] = self.company_hq_state
         parts = self.full_name.strip().split(None, 1)
         d["first"] = parts[0] if parts else ""
         d["last"] = parts[1] if len(parts) > 1 else ""
