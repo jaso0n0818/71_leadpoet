@@ -239,6 +239,7 @@ async def search_email_google(
     candidates = []
     if firstname and lastname:
         candidates.append(f"{firstname}.{lastname}@{domain}")
+        candidates.append(f"{firstname[0]}{lastname}@{domain}")
     if firstname:
         candidates.append(f"{firstname}@{domain}")
 
