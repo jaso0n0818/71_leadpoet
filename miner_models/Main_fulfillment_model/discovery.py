@@ -572,7 +572,7 @@ def _count_matching_signals(
 #         →  _apply_signal_time_decay  →  aggregate_intent_scores
 # ═══════════════════════════════════════════════════════════════════════════
 
-FULFILLMENT_MIN_INTENT_SCORE = 15.0  # must match gateway/fulfillment/config.py
+FULFILLMENT_MIN_INTENT_SCORE = 5.0  # Lowered for fulfillment — must match gateway/fulfillment/config.py
 
 
 async def _search_verified_intent_signals(
