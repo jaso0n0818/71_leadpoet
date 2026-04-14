@@ -624,14 +624,20 @@ async def _search_verified_intent_signals(
     expanded_str = " OR ".join(list(expanded_kws)[:3])
 
     search_templates = [
-        # ── Priority 1: Company blog/resources (company_website) ──
-        # No date cap, no date decay, 0.85x source mult.
+        # ── Priority 1: Company careers/culture pages (company_website) ──
+        # These are the highest-scoring: Datadog's careers blog scored 27.5.
+        # company_website = no date cap, no date decay (0.85x mult).
         # LLM 20/60 x 0.9 conf x 0.85 = 15.3 -> PASSES
+        (f'site:{company_domain} "sales team" OR "our team" OR "join our" OR "we\'re hiring"', "company_website"),
+        (f'site:{company_domain} "careers" OR "culture" OR "life at" OR "working at"', "company_website"),
         (f'site:{company_domain}/blog {expanded_str}', "company_website"),
         (f'site:{company_domain}/blog sales OR SDR OR hiring OR outbound OR team', "company_website"),
-        (f'site:{company_domain}/resources {expanded_str}', "company_website"),
         (f'site:{company_domain}/careers', "company_website"),
+        (f'site:{company_domain}/jobs', "company_website"),
         (f'site:{company_domain} {signal_words_plain}', "company_website"),
+        # ── Priority 1b: LinkedIn hiring posts (no date cap, 1.0x mult) ──
+        (f'site:linkedin.com/posts "{company_name}" hiring OR "join" OR "open role" OR "we\'re looking"', "linkedin"),
+        (f'site:linkedin.com/posts "{company_name}" SDR OR "sales development" OR sales team', "linkedin"),
         # ── Priority 2: Per-signal specific searches ──
     ]
 
