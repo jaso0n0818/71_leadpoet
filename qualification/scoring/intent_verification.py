@@ -63,9 +63,10 @@ logger = logging.getLogger(__name__)
 # If a malicious miner somehow extracts keys, they only get the
 # qualification keys (limited budget), not the main sourcing keys.
 #
-# TODO: After beta release, change back to "SCRAPINGDOG_API_KEY" (shared with sourcing)
+# SECURITY: Qualification uses SEPARATE API keys with limited funds.
+# If a malicious miner somehow extracts keys, they only get the
+# qualification keys (limited budget), not the main sourcing keys.
 SCRAPINGDOG_API_KEY = os.getenv("QUALIFICATION_SCRAPINGDOG_API_KEY", "")
-# TODO: After beta release, change back to "OPENROUTER_API_KEY" (shared with sourcing)
 OPENROUTER_API_KEY = os.getenv("QUALIFICATION_OPENROUTER_API_KEY", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 

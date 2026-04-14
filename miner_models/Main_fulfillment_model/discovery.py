@@ -118,6 +118,25 @@ _DOMAIN_TO_SOURCE = {
     "theverge.com": "news",
     "twitter.com": "social_media",
     "x.com": "social_media",
+    "youtube.com": "social_media",
+    "facebook.com": "social_media",
+    "instagram.com": "social_media",
+    "reddit.com": "social_media",
+    "tiktok.com": "social_media",
+    "threads.net": "social_media",
+    "g2.com": "review_site",
+    "capterra.com": "review_site",
+    "trustradius.com": "review_site",
+    "gartner.com": "review_site",
+    "github.com": "github",
+    "medium.com": "news",
+    "yahoo.com": "news",
+    "wsj.com": "news",
+    "nytimes.com": "news",
+    "axios.com": "news",
+    "seekingalpha.com": "news",
+    "benzinga.com": "news",
+    "marketwatch.com": "news",
     "facebook.com": "social_media",
     "reddit.com": "social_media",
     "github.com": "github",
@@ -1449,10 +1468,18 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
             print(f"    ❌ Description validation failed — skipping lead")
             return None
 
-        # Company name mismatch
+        # Company name mismatch → use the LinkedIn-verified name
         if "company_name" in failed_fields:
-            print(f"    ❌ Company name mismatch on LinkedIn — skipping lead")
-            return None
+            extracted_name = s5_rejection.get("extracted", "")
+            if extracted_name:
+                old_name = lead.get("business", "")
+                lead["business"] = extracted_name
+                company_name = extracted_name
+                print(f"    🏷️ Company name CORRECTED: '{old_name}' → '{extracted_name}'")
+                corrected_something = True
+            else:
+                print(f"    ❌ Company name mismatch on LinkedIn — skipping lead")
+                return None
 
         if not corrected_something:
             print(f"    ❌ Stage 5 failed and no correction possible — skipping lead")

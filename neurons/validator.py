@@ -5696,13 +5696,14 @@ class Validator(BaseValidatorNeuron):
             bt.logging.warning(f"Failed to request champion rebenchmark: {e}")
             return False
     
-    def _mark_rebenchmark_attempted_today(self, champion_data: Dict[str, Any]):
+    def _mark_rebenchmark_attempted_today(self, champion_data: Dict[str, Any], reason: str = "rebenchmark failed, will retry tomorrow"):
         """
         Update last_evaluated_utc_date in the champion JSON to today's date.
         
-        Prevents infinite rebenchmark retry loops when the gateway consistently
-        returns the wrong model_id (e.g. miner resubmitted same model name).
-        The rebenchmark will be retried tomorrow with the next ICP set.
+        Called in two cases:
+        1. On successful dispatch — prevents duplicate rebenchmarks across epochs
+           while the current one is still running.
+        2. On failure — prevents infinite retry loops when gateway returns wrong model.
         """
         try:
             from datetime import datetime, timezone
@@ -5725,7 +5726,7 @@ class Validator(BaseValidatorNeuron):
                     with open(champion_file, 'w') as f:
                         json.dump(data, f, indent=2)
                     
-                    print(f"   📅 Updated last_evaluated_utc_date: {old_date} → {today_str} (rebenchmark failed, will retry tomorrow)")
+                    print(f"   📅 Updated last_evaluated_utc_date: {old_date} → {today_str} ({reason})")
         except Exception as e:
             bt.logging.warning(f"Failed to update rebenchmark date: {e}")
     
@@ -6039,6 +6040,9 @@ class Validator(BaseValidatorNeuron):
                                             "is_rebenchmark": True
                                         }
                                         print(f"   ✅ Got rebenchmark work item: {rebenchmark_model['model_name']} (model_id verified)")
+                                        # Mark rebenchmark as dispatched TODAY so the next epoch
+                                        # doesn't trigger a duplicate rebenchmark while this one is still running.
+                                        self._mark_rebenchmark_attempted_today(champion_data, reason="rebenchmark dispatched, preventing duplicate")
                         else:
                             print(f"   ⚠️ Failed to queue rebenchmark: {rebench_resp.status_code}")
                 else:

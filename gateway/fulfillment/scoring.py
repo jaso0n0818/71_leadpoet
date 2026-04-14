@@ -341,9 +341,17 @@ async def score_fulfillment_lead(
     seen_domains: Set[str] = set()
     signal_results = []
 
-    for signal in lead.intent_signals:
+    lead_label = f"{lead.full_name} @ {lead_output.business}"
+    print(f"🔍 Tier 3 Intent Scoring: {lead_label} — {len(lead.intent_signals)} signal(s)")
+
+    for idx, signal in enumerate(lead.intent_signals):
+        source_str = signal.source.value if hasattr(signal.source, "value") else str(signal.source)
+        print(f"   Signal {idx+1}: source={source_str}, url={signal.url[:80]}, "
+              f"date={signal.date}, desc={signal.description[:100]}")
+
         domain = _extract_domain(signal.url)
         if domain in seen_domains:
+            print(f"   ⏭️  Duplicate domain '{domain}' — skipping")
             signal_results.append({"after_decay": 0.0, "decay_mult": 1.0, "confidence": 0})
             continue
         seen_domains.add(domain)
@@ -354,14 +362,16 @@ async def score_fulfillment_lead(
                 lead_output.business, lead_output.company_website,
                 api_key=api_key,
             )
+            print(f"   📊 Raw score={score:.1f}, confidence={confidence}, "
+                  f"date_status={date_status}, content_date={content_found_date}")
         except Exception as e:
-            logger.warning(f"Signal scoring error: {e}")
+            print(f"   ❌ Signal scoring error: {e}")
             score, confidence, date_status, content_found_date = 0.0, 0, "fabricated", None
 
-        source_str = signal.source.value if hasattr(signal.source, "value") else str(signal.source)
         after_decay, decay_mult = _apply_signal_time_decay(
             score, signal.date, date_status, source_str, content_found_date
         )
+        print(f"   📉 After decay={after_decay:.1f}, decay_mult={decay_mult:.2f}")
 
         signal_results.append({
             "after_decay": after_decay,
@@ -373,7 +383,12 @@ async def score_fulfillment_lead(
     intent_signal_final = aggregate_intent_scores(after_decay_scores)
     intent_signal_final = min(intent_signal_final, 60.0)
 
+    print(f"   🎯 Intent final={intent_signal_final:.1f} (threshold={FULFILLMENT_MIN_INTENT_SCORE}), "
+          f"decay_scores={[f'{s:.1f}' for s in after_decay_scores]}")
+
     all_fabricated = bool(signal_results) and all(r["confidence"] == 0 for r in signal_results)
+    if all_fabricated:
+        print(f"   ⚠️  All signals have confidence=0 (all_fabricated=True)")
 
     shared_fields = dict(
         tier1_passed=True,

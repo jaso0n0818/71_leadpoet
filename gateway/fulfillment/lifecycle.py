@@ -127,6 +127,18 @@ async def _lifecycle_tick_inner(supabase) -> None:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
+    # Debug: show all non-terminal request statuses
+    all_req = supabase.table("fulfillment_requests") \
+        .select("request_id, status, window_end, reveal_window_end") \
+        .in_("status", ["open", "commit_closed", "scoring"]) \
+        .execute()
+    if all_req.data:
+        print(f"🔄 Lifecycle tick @ {now_iso[:19]}Z — {len(all_req.data)} active request(s):")
+        for ar in (all_req.data or []):
+            print(f"   {ar['request_id'][:8]}... status={ar['status']} "
+                  f"window_end={ar.get('window_end', '?')[:19]} "
+                  f"reveal_end={ar.get('reveal_window_end', '?')[:19]}")
+
     # Step 1: open -> commit_closed (past window_end)
     open_past_window = supabase.table("fulfillment_requests") \
         .select("request_id") \
@@ -141,24 +153,44 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 "p_request_id": r["request_id"],
                 "p_new_status": "commit_closed",
             }).execute()
-            print(f"   {r['request_id'][:8]}... -> commit_closed")
+            # Verify the transition actually happened
+            verify = supabase.table("fulfillment_requests") \
+                .select("status") \
+                .eq("request_id", r["request_id"]) \
+                .execute()
+            actual_status = verify.data[0]["status"] if verify.data else "?"
+            print(f"   {r['request_id'][:8]}... -> commit_closed (verified: {actual_status})")
         except Exception as e:
             print(f"   Error closing {r['request_id'][:8]}...: {e}")
 
     # Step 2: commit_closed -> scoring or recycled (past reveal_window_end)
     closed_past_reveal = supabase.table("fulfillment_requests") \
-        .select("request_id, icp_details, num_leads") \
+        .select("request_id, icp_details, num_leads, reveal_window_end") \
         .eq("status", "commit_closed") \
         .lt("reveal_window_end", now_iso) \
         .execute()
 
+    if closed_past_reveal.data:
+        print(f"Lifecycle Step 2: {len(closed_past_reveal.data)} commit_closed request(s) past reveal_window_end")
+
     for r in (closed_past_reveal.data or []):
         rid = r["request_id"]
+        print(f"   Checking {rid[:8]}... (reveal_window_end={r.get('reveal_window_end', '?')})")
+
+        all_subs = supabase.table("fulfillment_submissions") \
+            .select("submission_id, revealed, miner_hotkey") \
+            .eq("request_id", rid) \
+            .execute()
+        print(f"   Total submissions for {rid[:8]}: {len(all_subs.data or [])}")
+        for s in (all_subs.data or []):
+            print(f"     sub={s['submission_id'][:8]}... miner={s['miner_hotkey'][:8]}... revealed={s['revealed']}")
+
         reveals = supabase.table("fulfillment_submissions") \
             .select("submission_id") \
             .eq("request_id", rid) \
             .eq("revealed", True) \
             .execute()
+        print(f"   Revealed submissions: {len(reveals.data or [])}")
 
         if reveals.data:
             try:
@@ -166,10 +198,11 @@ async def _lifecycle_tick_inner(supabase) -> None:
                     "p_request_id": rid,
                     "p_new_status": "scoring",
                 }).execute()
-                logger.info(f"Request {rid[:8]}... -> scoring ({len(reveals.data)} reveals)")
+                print(f"   ✅ {rid[:8]}... -> scoring ({len(reveals.data)} reveal(s))")
             except Exception as e:
-                logger.error(f"Error transitioning {rid[:8]}... to scoring: {e}")
+                print(f"   ❌ Error transitioning {rid[:8]}... to scoring: {e}")
         else:
+            print(f"   ⚠️  No reveals for {rid[:8]}... — recycling")
             new_id = str(uuid4())
             from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, epochs_to_seconds
             tempo = _get_tempo(supabase)
@@ -199,15 +232,18 @@ async def _lifecycle_tick_inner(supabase) -> None:
                     "new_request_id": new_id,
                     "reason": "no_reveals",
                 })
-                logger.info(f"Request {rid[:8]}... recycled -> {new_id[:8]}...")
+                print(f"   ♻️  {rid[:8]}... recycled -> {new_id[:8]}...")
             except Exception as e:
-                logger.error(f"Error recycling {rid[:8]}...: {e}")
+                print(f"   ❌ Error recycling {rid[:8]}...: {e}")
 
     # Step 3: consensus aggregation for scoring requests
     scoring_requests = supabase.table("fulfillment_requests") \
         .select("request_id, reveal_window_end") \
         .eq("status", "scoring") \
         .execute()
+
+    if scoring_requests.data:
+        print(f"Lifecycle Step 3: {len(scoring_requests.data)} request(s) in scoring status")
 
     for r in (scoring_requests.data or []):
         rid = r["request_id"]
@@ -222,11 +258,13 @@ async def _lifecycle_tick_inner(supabase) -> None:
             timeout = reveal_end + timedelta(minutes=FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES)
 
             if len(unique_validators) < FULFILLMENT_MIN_VALIDATORS and now < timeout:
+                mins_left = (timeout - now).total_seconds() / 60
+                print(f"   {rid[:8]}... waiting for validators: {len(unique_validators)}/{FULFILLMENT_MIN_VALIDATORS} ({mins_left:.1f}min until timeout)")
                 continue
 
             if len(unique_validators) == 0 and now >= timeout:
-                logger.warning(
-                    f"Request {rid[:8]}... has 0 validators after timeout — "
+                print(
+                    f"   ⚠️  {rid[:8]}... has 0 validators after timeout — "
                     f"moving to fulfilled (no winners)"
                 )
                 supabase.table("fulfillment_requests").update({
@@ -235,15 +273,15 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 continue
 
             if len(unique_validators) < FULFILLMENT_MIN_VALIDATORS:
-                logger.warning(
-                    f"Request {rid[:8]}... consensus timeout: "
-                    f"{len(unique_validators)}/{FULFILLMENT_MIN_VALIDATORS} validators"
+                print(
+                    f"   ⚠️  {rid[:8]}... consensus timeout: "
+                    f"{len(unique_validators)}/{FULFILLMENT_MIN_VALIDATORS} validators — proceeding"
                 )
 
             consensus_results = await compute_fulfillment_consensus(rid)
             if not consensus_results:
-                logger.warning(
-                    f"Request {rid[:8]}... produced empty consensus — "
+                print(
+                    f"   ⚠️  {rid[:8]}... produced empty consensus — "
                     f"moving to fulfilled (no winners)"
                 )
                 supabase.table("fulfillment_requests").update({
@@ -260,7 +298,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
             supabase.table("fulfillment_requests").update({
                 "status": "fulfilled",
             }).eq("request_id", rid).execute()
-            logger.info(f"Request {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
+            print(f"   ✅ {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
 
             # Print final ranked results
             ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
@@ -281,13 +319,15 @@ async def _lifecycle_tick_inner(supabase) -> None:
             print(f"{'='*60}\n")
 
         except Exception as e:
-            logger.error(f"Error in consensus for {rid[:8]}...: {e}")
+            print(f"   ❌ Error in consensus for {rid[:8]}...: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Step 4: reward expiry
     try:
         _expire_rewards(supabase)
     except Exception as e:
-        logger.error(f"Reward expiry error: {e}")
+        print(f"❌ Reward expiry error: {e}")
 
 
 async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> None:

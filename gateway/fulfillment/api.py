@@ -405,6 +405,10 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
         "lead_data": lead_data_list,
     }).eq("submission_id", reveal.submission_id).execute()
 
+    print(f"✅ REVEAL stored: request={reveal.request_id[:8]}... "
+          f"sub={reveal.submission_id[:8]}... miner={reveal.miner_hotkey[:8]}... "
+          f"leads={len(lead_data_list)} revealed=True")
+
     _log_event(EventType.FULFILLMENT_REVEAL, {
         "request_id": reveal.request_id,
         "miner_hotkey": reveal.miner_hotkey,
@@ -429,8 +433,10 @@ async def get_scoring_requests(validator_hotkey: str = ""):
         .eq("status", "scoring") \
         .execute()
 
-    # If validator_hotkey is provided, check which requests this validator
-    # has already scored — exclude them so the validator doesn't re-score.
+    scoring_count = len(resp.data or [])
+    if scoring_count > 0:
+        print(f"📋 /fulfillment/scoring: {scoring_count} request(s) in scoring status")
+
     already_scored_requests = set()
     if validator_hotkey:
         scored_resp = supabase.table("fulfillment_scores") \
@@ -438,10 +444,13 @@ async def get_scoring_requests(validator_hotkey: str = ""):
             .eq("validator_hotkey", validator_hotkey) \
             .execute()
         already_scored_requests = {r["request_id"] for r in (scored_resp.data or [])}
+        if already_scored_requests:
+            print(f"   Validator {validator_hotkey[:8]}... already scored: {len(already_scored_requests)} request(s)")
 
     out = []
     for r in (resp.data or []):
         if r["request_id"] in already_scored_requests:
+            print(f"   Skipping {r['request_id'][:8]}... (already scored by this validator)")
             continue
 
         subs_resp = supabase.table("fulfillment_submissions") \
@@ -460,6 +469,9 @@ async def get_scoring_requests(validator_hotkey: str = ""):
                 "leads": [entry.get("data", {}) for entry in lead_data],
                 "lead_ids": [entry.get("lead_id", "") for entry in lead_hashes],
             })
+
+        print(f"   Returning {r['request_id'][:8]}... with {len(submissions)} submission(s), "
+              f"{sum(len(s['leads']) for s in submissions)} total leads")
 
         out.append({
             "request_id": r["request_id"],
