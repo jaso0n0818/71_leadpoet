@@ -161,12 +161,15 @@ else
 fi
 echo ""
 
-# Stop and remove existing containers (sourcing + qualification)
+# Stop and remove existing containers (sourcing + qualification + fulfillment)
 echo "🛑 Stopping existing containers (if any)..."
 docker ps -a --filter "name=leadpoet-validator" --format "{{.Names}}" | while read container; do
     docker rm -f "$container" 2>/dev/null || true
 done
 docker ps -a --filter "name=leadpoet-qual-worker" --format "{{.Names}}" | while read container; do
+    docker rm -f "$container" 2>/dev/null || true
+done
+docker ps -a --filter "name=leadpoet-ff-worker" --format "{{.Names}}" | while read container; do
     docker rm -f "$container" 2>/dev/null || true
 done
 echo "✅ Old containers removed"
@@ -358,6 +361,95 @@ if [ $QUAL_PROXY_COUNT -gt 0 ]; then
     echo ""
 fi
 
+# ════════════════════════════════════════════════════════════════════════════════
+# SPAWN FULFILLMENT WORKERS (Docker containers with --restart unless-stopped)
+# ════════════════════════════════════════════════════════════════════════════════
+# Fulfillment workers score revealed leads through Tier 1-3 pipeline.
+# They use their own proxies (FULFILLMENT_WEBSHARE_PROXY_*) for ScrapingDog/LLM.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Auto-detect FULFILLMENT proxies from .env
+FF_PROXIES=()
+FF_PROXY_COUNT=0
+
+for i in {1..10}; do
+    PROXY_VAR="FULFILLMENT_WEBSHARE_PROXY_$i"
+    PROXY_VALUE="${!PROXY_VAR}"
+    
+    if [ -n "$PROXY_VALUE" ]; then
+        FF_PROXIES+=("$PROXY_VALUE")
+        FF_PROXY_COUNT=$((FF_PROXY_COUNT + 1))
+    else
+        break
+    fi
+done
+
+echo "🔍 Auto-detected FULFILLMENT proxies: $FF_PROXY_COUNT"
+
+if [ $FF_PROXY_COUNT -gt 0 ]; then
+    echo ""
+    echo "============================================================"
+    echo "🎯 DEPLOYING FULFILLMENT WORKER CONTAINERS"
+    echo "============================================================"
+    echo ""
+    
+    for i in $(seq 1 $FF_PROXY_COUNT); do
+        docker rm -f "leadpoet-ff-worker-$i" 2>/dev/null || true
+    done
+    sleep 1
+    
+    for i in $(seq 1 $FF_PROXY_COUNT); do
+        FF_PROXY_VAR="FULFILLMENT_WEBSHARE_PROXY_$i"
+        FF_PROXY_VALUE="${!FF_PROXY_VAR}"
+        
+        echo "🚀 Starting Fulfillment Worker $i (Docker container)..."
+        if [ -n "$FF_PROXY_VALUE" ]; then
+            echo "   Proxy: ${FF_PROXY_VALUE:0:30}..."
+        fi
+        
+        FF_PROXY_ARGS=""
+        if [ -n "$FF_PROXY_VALUE" ]; then
+            FF_PROXY_ARGS="-e HTTP_PROXY=$FF_PROXY_VALUE -e HTTPS_PROXY=$FF_PROXY_VALUE"
+        fi
+        
+        docker run -d \
+          --name "leadpoet-ff-worker-$i" \
+          --network host \
+          --restart unless-stopped \
+          --log-driver=awslogs \
+          --log-opt awslogs-region=us-east-1 \
+          --log-opt awslogs-group=/leadpoet/validator/fulfillment \
+          --log-opt awslogs-stream=ff-worker-$i \
+          --log-opt awslogs-create-group=true \
+          -v "$REPO_ROOT/validator_weights:/app/validator_weights" \
+          -e PYTHONUNBUFFERED=1 \
+          -e LEADPOET_CONTAINER_MODE=1 \
+          -e LEADPOET_WRAPPER_ACTIVE=1 \
+          -e ENABLE_FULFILLMENT=true \
+          -e GATEWAY_URL="${GATEWAY_URL:-http://52.91.135.79:8000}" \
+          -e FULFILLMENT_WEBSHARE_PROXY_1="${FULFILLMENT_WEBSHARE_PROXY_1:-}" \
+          -e FULFILLMENT_WEBSHARE_PROXY_2="${FULFILLMENT_WEBSHARE_PROXY_2:-}" \
+          -e FULFILLMENT_WEBSHARE_PROXY_3="${FULFILLMENT_WEBSHARE_PROXY_3:-}" \
+          -e FULFILLMENT_WEBSHARE_PROXY_4="${FULFILLMENT_WEBSHARE_PROXY_4:-}" \
+          -e FULFILLMENT_WEBSHARE_PROXY_5="${FULFILLMENT_WEBSHARE_PROXY_5:-}" \
+          -e FULFILLMENT_OPENROUTER_API_KEY="${FULFILLMENT_OPENROUTER_API_KEY:-}" \
+          -e QUALIFICATION_SCRAPINGDOG_API_KEY="${QUALIFICATION_SCRAPINGDOG_API_KEY:-}" \
+          -e QUALIFICATION_OPENROUTER_API_KEY="${QUALIFICATION_OPENROUTER_API_KEY:-}" \
+          -e SCRAPINGDOG_API_KEY="${SCRAPINGDOG_API_KEY:-}" \
+          -e TRUELIST_API_KEY="${TRUELIST_API_KEY:-}" \
+          $FF_PROXY_ARGS \
+          leadpoet-validator:latest \
+          --mode fulfillment_worker \
+          --container-id "$i" > /dev/null
+        
+        echo "   ✅ Started: leadpoet-ff-worker-$i"
+        echo ""
+    done
+    
+    echo "✅ All $FF_PROXY_COUNT fulfillment worker containers deployed"
+    echo ""
+fi
+
 # Wait for containers to start
 echo "⏳ Waiting 10 seconds for containers to initialize..."
 sleep 10
@@ -367,7 +459,7 @@ echo ""
 echo "============================================================"
 echo "📊 CONTAINER STATUS"
 echo "============================================================"
-docker ps --filter "name=leadpoet-validator" --filter "name=leadpoet-qual-worker" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker ps --filter "name=leadpoet-validator" --filter "name=leadpoet-qual-worker" --filter "name=leadpoet-ff-worker" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo ""
 
 # Verify proxies
