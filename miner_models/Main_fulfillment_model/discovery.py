@@ -2414,34 +2414,19 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
         # stop asking it for new companies and focus on Google fallback +
         # pool recheck via verified search.
         if perplexity_exhausted:
-            # Only use Google Search fallback — Perplexity has run out
             companies = await discover_companies(icp, num_companies=remaining * 5)
             use_precomputed = False
+        elif attempt % 2 == 1:
+            variant_idx = (attempt // 2) % len(_PROMPT_VARIANTS)
+            companies = await _discover_companies_with_intent(
+                icp, num_companies=remaining * 5,
+                exclude_companies=seen_companies if seen_companies else None,
+                _variant_idx=variant_idx,
+            )
+            use_precomputed = True
         else:
-            # Normal rotation:
-            #   Odd attempts: Perplexity sonar-pro
-            #   Even attempts: Google Search fallback
-            #   Every 6th OR after 3+ consecutive empties: deep research
-            use_deep = (attempt % 6 == 5) or (consecutive_empty >= 3 and attempt % 2 == 1)
-
-            if use_deep:
-                companies = await _discover_companies_deep_research(
-                    icp, num_companies=remaining * 3,
-                    exclude_companies=seen_companies if seen_companies else None,
-                )
-                use_precomputed = True
-                consecutive_empty = 0
-            elif attempt % 2 == 1:
-                variant_idx = (attempt // 2) % len(_PROMPT_VARIANTS)
-                companies = await _discover_companies_with_intent(
-                    icp, num_companies=remaining * 5,
-                    exclude_companies=seen_companies if seen_companies else None,
-                    _variant_idx=variant_idx,
-                )
-                use_precomputed = True
-            else:
-                companies = await discover_companies(icp, num_companies=remaining * 5)
-                use_precomputed = False
+            companies = await discover_companies(icp, num_companies=remaining * 5)
+            use_precomputed = False
 
         # Filter out companies we've already processed
         companies = [
