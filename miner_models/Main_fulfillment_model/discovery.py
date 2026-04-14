@@ -673,6 +673,13 @@ async def _search_verified_intent_signals(
         (f'site:greenhouse.io "{company_name}"', "job_board"),
     ])
 
+    # Track the best company_website candidate separately so we can try
+    # multiple pages from the company's domain and pick the most relevant.
+    _best_company_signal: Optional[Dict] = None
+    _best_company_kw_score: int = -1
+    _company_domain_tried: bool = False
+    _seen_company_urls: set = set()
+
     for template, default_source in search_templates:
         if len(signals) >= max_signals:
             break
@@ -700,7 +707,15 @@ async def _search_verified_intent_signals(
                 continue
 
             link_domain = _extract_signal_domain(link)
-            if link_domain in seen_domains:
+
+            # For the company's own domain: don't skip duplicates yet —
+            # collect candidates and pick the best one later.
+            is_company_domain = (company_domain and company_domain in link.lower())
+            if is_company_domain:
+                if link in _seen_company_urls:
+                    continue
+                _seen_company_urls.add(link)
+            elif link_domain in seen_domains:
                 continue
 
             # FIX 1: Source type — only use recognized source types.
@@ -781,34 +796,56 @@ async def _search_verified_intent_signals(
                     if kw_words and all(w in text_lower for w in kw_words):
                         matched_kw = kw
                         break
-            # Last resort: use a generic description from the snippet itself
-            # (no intent keyword prefix — avoids grounding failure)
+            # Build the signal dict
             if not matched_kw:
-                signals.append({
+                sig_dict = {
                     "source": source_type,
                     "description": best_snippet[:400],
                     "url": link,
                     "date": signal_date,
                     "snippet": best_snippet[:500],
-                })
-                seen_domains.add(link_domain)
-                print(
-                    f"    📌 Verified signal ({source_type}, no kw match): "
-                    f"{link_domain} — {best_snippet[:60]}..."
-                )
+                }
+                kw_score = 0
+            else:
+                sig_dict = {
+                    "source": source_type,
+                    "description": f"{matched_kw}: {best_snippet[:300]}",
+                    "url": link,
+                    "date": signal_date,
+                    "snippet": best_snippet[:500],
+                }
+                kw_score = len([w for w in matched_kw.lower().split()
+                                if len(w) > 3 and w in snippet_lower])
+
+            # For company's own domain: collect candidates, pick best later
+            if is_company_domain:
+                if kw_score > _best_company_kw_score:
+                    _best_company_kw_score = kw_score
+                    _best_company_signal = sig_dict
+                    print(
+                        f"    📌 Company candidate ({source_type}, kw={kw_score}): "
+                        f"{link_domain} — {best_snippet[:60]}..."
+                    )
                 continue
 
-            signals.append({
-                "source": source_type,
-                "description": f"{matched_kw}: {best_snippet[:300]}",
-                "url": link,
-                "date": signal_date,
-                "snippet": best_snippet[:500],
-            })
+            # For other domains: add immediately
+            signals.append(sig_dict)
             seen_domains.add(link_domain)
+            kw_label = f", kw={matched_kw}" if matched_kw else ", no kw match"
             print(
-                f"    📌 Verified signal ({source_type}): "
+                f"    📌 Verified signal ({source_type}{kw_label}): "
                 f"{link_domain} — {best_snippet[:60]}..."
+            )
+
+    # Add the best company_website signal (if any) as the first signal
+    if _best_company_signal and len(signals) < max_signals:
+        cd = _extract_signal_domain(_best_company_signal["url"])
+        if cd not in seen_domains:
+            signals.insert(0, _best_company_signal)
+            seen_domains.add(cd)
+            print(
+                f"    📌 Best company signal selected: "
+                f"{_best_company_signal['url'][:60]}..."
             )
 
     return signals
