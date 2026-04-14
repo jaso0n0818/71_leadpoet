@@ -600,27 +600,72 @@ async def _search_verified_intent_signals(
     signals: List[Dict] = []
     seen_domains: set = set()
 
-    signal_words = " OR ".join(f'"{kw}"' for kw in intent_keywords[:3])
     signal_words_plain = " OR ".join(intent_keywords[:3])
+
+    # Build signal-specific keyword expansions for better search relevance
+    _signal_expansions = {
+        "hiring": '"sales development" OR "SDR" OR "hiring" OR "job opening" OR "careers"',
+        "sdr": '"sales development representative" OR "SDR" OR "outbound sales"',
+        "sales tools": '"sales tools" OR "sales technology" OR "sales stack" OR "evaluating"',
+        "competitors": '"competitor" OR "alternative" OR "vs" OR "comparison"',
+        "evaluating": '"evaluating" OR "comparing" OR "reviewing" OR "considering"',
+        "funding": '"funding" OR "raised" OR "series" OR "investment"',
+        "expansion": '"expansion" OR "growth" OR "scaling" OR "new office"',
+    }
+    expanded_kws = set()
+    for kw in intent_keywords:
+        kw_lower = kw.lower()
+        for trigger, expansion in _signal_expansions.items():
+            if trigger in kw_lower:
+                expanded_kws.add(expansion)
+                break
+        else:
+            expanded_kws.add(f'"{kw}"')
+    expanded_str = " OR ".join(list(expanded_kws)[:3])
 
     search_templates = [
         # ── Priority 1: Company blog/resources (company_website) ──
         # No date cap, no date decay, 0.85x source mult.
-        # LLM 20/60 × 0.9 conf × 0.85 = 15.3 → PASSES
-        (f'site:{company_domain}/blog {signal_words_plain}', "company_website"),
-        (f'site:{company_domain}/blog sales OR SDR OR hiring OR outbound', "company_website"),
-        (f'site:{company_domain}/resources {signal_words_plain}', "company_website"),
+        # LLM 20/60 x 0.9 conf x 0.85 = 15.3 -> PASSES
+        (f'site:{company_domain}/blog {expanded_str}', "company_website"),
+        (f'site:{company_domain}/blog sales OR SDR OR hiring OR outbound OR team', "company_website"),
+        (f'site:{company_domain}/resources {expanded_str}', "company_website"),
+        (f'site:{company_domain}/careers', "company_website"),
         (f'site:{company_domain} {signal_words_plain}', "company_website"),
-        # ── Priority 2: Recent news with dates ──
-        (f'"{company_name}" {signal_words_plain} 2026 -site:{company_domain}', "news"),
+        # ── Priority 2: Per-signal specific searches ──
+    ]
+
+    # Add per-keyword targeted searches
+    for kw in intent_keywords[:3]:
+        kw_lower = kw.lower()
+        if "hiring" in kw_lower or "sdr" in kw_lower:
+            search_templates.extend([
+                (f'"{company_name}" "sales development representative" OR "SDR" site:indeed.com OR site:lever.co OR site:greenhouse.io', "job_board"),
+                (f'"{company_name}" hiring sales 2026 -site:{company_domain}', "news"),
+            ])
+        elif "tool" in kw_lower or "evaluat" in kw_lower:
+            search_templates.extend([
+                (f'"{company_name}" "sales tools" OR "sales technology" review 2025 OR 2026', "news"),
+            ])
+        elif "competitor" in kw_lower or "research" in kw_lower:
+            search_templates.extend([
+                (f'"{company_name}" alternative OR competitor OR comparison 2025 OR 2026', "news"),
+            ])
+        elif "funding" in kw_lower or "raised" in kw_lower:
+            search_templates.extend([
+                (f'site:techcrunch.com OR site:crunchbase.com "{company_name}" funding OR raised 2025 OR 2026', "news"),
+            ])
+
+    search_templates.extend([
+        # ── Priority 3: Recent news with dates ──
         (f'site:prnewswire.com OR site:businesswire.com "{company_name}" 2026', "news"),
         (f'site:techcrunch.com "{company_name}" 2025 OR 2026', "news"),
         (f'"{company_name}" expansion OR growth OR hiring 2026 news -site:{company_domain}', "news"),
-        # ── Priority 3: Job boards (supporting signals) ──
+        # ── Priority 4: Job boards (supporting signals) ──
         (f'site:builtin.com/company "{company_name}"', "job_board"),
         (f'site:lever.co "{company_name}"', "job_board"),
         (f'site:greenhouse.io "{company_name}"', "job_board"),
-    ]
+    ])
 
     for template, default_source in search_templates:
         if len(signals) >= max_signals:
@@ -1094,6 +1139,137 @@ Return at least {num_companies} companies. No explanation text."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Deep Research Company Discovery (sonar-deep-research)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _discover_companies_deep_research(
+    icp: dict, num_companies: int = 10, exclude_companies: set = None,
+) -> List[Dict]:
+    """Find companies using sonar-deep-research when sonar-pro is exhausted.
+
+    Deep research does thorough multi-step web searching and often returns
+    companies that sonar-pro's single-step search misses.  However it
+    returns markdown, so we use a two-step approach:
+      1. Deep research returns raw text (companies + evidence)
+      2. sonar-pro structures the text into JSON
+    """
+    from target_fit_model.config import PERPLEXITY_DEEP_MODEL, PERPLEXITY_DEEP_TIMEOUT
+    from target_fit_model.openrouter import chat_completion, parse_json_response
+
+    industry = icp.get("industry", "")
+    sub_industry = icp.get("sub_industry", "")
+    employee_count = icp.get("employee_count", "")
+    country = icp.get("country", "United States")
+    intent_keywords = icp.get("intent_signals", [])
+    signals_str = ", ".join(intent_keywords) if intent_keywords else "hiring, expansion"
+
+    six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%B %Y")
+
+    exclude_text = ""
+    if exclude_companies:
+        exclude_list = sorted(exclude_companies)[:30]
+        exclude_text = f"\n\nDO NOT include: {', '.join(exclude_list)}\n"
+
+    prompt = (
+        f"Find {num_companies} real {industry}"
+        f"{f'/{sub_industry}' if sub_industry else ''} companies "
+        f"({employee_count or 'any size'}, {country}) that show public evidence "
+        f"of these buying signals since {six_months_ago}: {signals_str}."
+        f"{exclude_text}\n"
+        f"For each company provide: name, website URL, and what evidence you found."
+    )
+
+    print(f"  [Deep Research] Searching for {num_companies} companies...")
+
+    raw = await asyncio.to_thread(
+        chat_completion,
+        prompt=prompt,
+        model=PERPLEXITY_DEEP_MODEL,
+        system_prompt="Find real companies with buying signals. Be thorough.",
+        temperature=0,
+        max_tokens=8000,
+        timeout=PERPLEXITY_DEEP_TIMEOUT,
+    )
+
+    if not raw or len(raw) < 50:
+        print(f"  [Deep Research] No response")
+        return []
+
+    # Try JSON parse first
+    result = parse_json_response(raw)
+    if result and isinstance(result, list):
+        companies = []
+        for item in result:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            website = item.get("website", "").strip()
+            companies.append({
+                "name": item["name"].strip(),
+                "website": website,
+                "domain": _extract_domain(website) if website else "",
+                "description": item.get("description", ""),
+                "employee_estimate": item.get("employee_estimate", ""),
+                "hq_city": item.get("hq_city", ""),
+                "hq_state": item.get("hq_state", ""),
+                "signals": item.get("signals", []),
+            })
+        if companies:
+            print(f"  [Deep Research] Parsed {len(companies)} companies from JSON")
+            return companies
+
+    # Markdown response — extract company names + URLs, then ask sonar-pro to structure
+    urls_found = _URL_REGEX.findall(raw)
+    extract_prompt = f"""Extract company information from this research text.
+
+TEXT:
+{raw[:6000]}
+
+Return ONLY a JSON array:
+[{{"name": "Company Name", "website": "https://...", "description": "one sentence", "employee_estimate": "50-200", "hq_city": "", "hq_state": "", "signals": [{{"signal": "what signal", "evidence": "what was found", "url": "source url", "date": "YYYY-MM"}}]}}]
+
+Only include real companies with real evidence. No explanation text."""
+
+    structured = await asyncio.to_thread(
+        chat_completion_json,
+        prompt=extract_prompt,
+        model=PERPLEXITY_MODEL,
+        system_prompt="Extract structured data. Return ONLY valid JSON array.",
+        temperature=0,
+        max_tokens=4000,
+        timeout=PERPLEXITY_TIMEOUT,
+    )
+
+    if not structured:
+        print(f"  [Deep Research] Could not structure markdown response")
+        return []
+
+    if isinstance(structured, dict):
+        structured = structured.get("companies", structured.get("results", [structured]))
+
+    companies = []
+    for item in (structured if isinstance(structured, list) else []):
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        website = item.get("website", "").strip()
+        companies.append({
+            "name": item["name"].strip(),
+            "website": website,
+            "domain": _extract_domain(website) if website else "",
+            "description": item.get("description", ""),
+            "employee_estimate": item.get("employee_estimate", ""),
+            "hq_city": item.get("hq_city", ""),
+            "hq_state": item.get("hq_state", ""),
+            "signals": item.get("signals", []) if isinstance(item.get("signals"), list) else [],
+        })
+
+    print(f"  [Deep Research] Extracted {len(companies)} companies from markdown")
+    for c in companies[:5]:
+        print(f"    - {c['name']} ({c.get('domain', '?')})")
+
+    return companies
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Batch Intent Re-check — rescue email-verified leads with no signals
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1109,54 +1285,44 @@ async def _batch_intent_recheck(
     product_service = icp.get("product_service", "")
     prompt_text = icp.get("prompt", "")
 
+    # Limit to 10 leads to keep prompt short (reduces timeout/parsing failures)
+    batch_pool = pool[:10]
     leads_text = "\n".join(
-        f"{i+1}. {p['full_name']}, {p.get('role', '?')} at {p['business']} ({p.get('company_website', '?')})"
-        for i, p in enumerate(pool[:20])
+        f"{i+1}. {p['full_name']} at {p['business']} ({p.get('company_website', '?')})"
+        for i, p in enumerate(batch_pool)
     )
-    signals_text = "\n".join(f"- {s}" for s in intent_keywords)
+    signals_text = ", ".join(intent_keywords)
 
-    prompt = f"""I have verified leads (person + company). For each one, determine whether
-there is REAL, PUBLIC evidence from the last 6 months that connects to any
-of the intent signals below.
+    prompt = (
+        f"For each company below, search the web for public evidence (last 6 months) "
+        f"of these buying signals: {signals_text}\n\n"
+        f"COMPANIES:\n{leads_text}\n\n"
+        f"{f'The buyer sells: {product_service}' if product_service else ''}\n"
+        f"Return ONLY JSON: "
+        f'[{{"company": "Name", "signals": [{{"signal": "...", "evidence": "...", "url": "https://...", "date": "YYYY-MM"}}]}}]\n'
+        f"Omit companies with no evidence."
+    )
 
-LEADS:
-{leads_text}
+    print(f"  [Batch Intent] Asking Perplexity about {len(batch_pool)} companies...")
 
-INTENT SIGNALS:
-{signals_text}
-
-{f'CONTEXT: The buyer sells "{product_service}"' if product_service else ''}
-{f'{prompt_text}' if prompt_text else ''}
-
-RULES:
-- Evidence must be publicly verifiable (has a URL someone can visit)
-- Evidence must be from the last 6 months
-- Evidence can be about the COMPANY or the PERSON specifically
-- Match each piece of evidence to the most relevant intent signal from the list
-- If a signal doesn't apply to a lead, skip it — don't force a match
-
-Return ONLY a JSON array:
-[{{"person": "Full Name", "company": "Company Name", "signals": [
-  {{"signal": "exact signal text from list", "evidence": "what you found",
-   "url": "https://...", "date": "YYYY-MM"}}
-]}}]
-
-Omit leads where you found no evidence. No explanation text."""
-
-    print(f"  [Batch Intent] Asking Perplexity about {len(pool)} companies...")
-
-    result = await asyncio.to_thread(
-        chat_completion_json,
+    from target_fit_model.openrouter import chat_completion, parse_json_response
+    raw = await asyncio.to_thread(
+        chat_completion,
         prompt=prompt,
         model=PERPLEXITY_MODEL,
-        system_prompt=_PERPLEXITY_SYSTEM,
+        system_prompt="Search for buying signals. Return ONLY valid JSON.",
         temperature=0,
-        max_tokens=6000,
+        max_tokens=4000,
         timeout=PERPLEXITY_TIMEOUT,
     )
 
-    if not result:
+    if not raw or len(raw) < 5:
         print(f"  [Batch Intent] No response from Perplexity")
+        return []
+
+    result = parse_json_response(raw)
+    if not result:
+        print(f"  [Batch Intent] Could not parse response ({len(raw)} chars): {raw[:150]}...")
         return []
 
     if isinstance(result, dict):
@@ -2135,6 +2301,8 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
     seen_companies: set = set()
 
     consecutive_empty = 0
+    perplexity_empty_streak = 0  # tracks only Perplexity empty responses
+    perplexity_exhausted = False
 
     for attempt in range(1, MAX_SOURCING_ATTEMPTS + 1):
         if len(all_leads) >= num_leads:
@@ -2142,28 +2310,49 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
 
         remaining = num_leads - len(all_leads)
 
-        # Back off when we keep finding nothing new
+        # Back off when we keep finding nothing new (shorter when exhausted)
         if consecutive_empty >= 2:
-            pause = min(10 * consecutive_empty, 60)
-            print(f"\n  ⏸  Backing off {pause}s ({consecutive_empty} empty attempts)")
+            pause = min(10 * consecutive_empty, 30 if perplexity_exhausted else 60)
+            print(f"\n  ⏸  Backing off {pause}s ({consecutive_empty} empty attempts"
+                  f"{', Perplexity exhausted' if perplexity_exhausted else ''})")
             await asyncio.sleep(pause)
 
         print(f"\n  ── Attempt {attempt}/{MAX_SOURCING_ATTEMPTS} "
               f"(have {len(all_leads)}/{num_leads}, need {remaining} more) ──")
 
-        # Alternate between Perplexity-first (odd) and Google fallback (even)
-        # Rotate prompt variants on Perplexity attempts to get diverse results
-        if attempt % 2 == 1:
-            variant_idx = (attempt // 2) % len(_PROMPT_VARIANTS)
-            companies = await _discover_companies_with_intent(
-                icp, num_companies=remaining * 5,
-                exclude_companies=seen_companies if seen_companies else None,
-                _variant_idx=variant_idx,
-            )
-            use_precomputed = True
-        else:
+        # ── Discovery strategy ──
+        # Once Perplexity is exhausted (5+ consecutive empty responses),
+        # stop asking it for new companies and focus on Google fallback +
+        # pool recheck via verified search.
+        if perplexity_exhausted:
+            # Only use Google Search fallback — Perplexity has run out
             companies = await discover_companies(icp, num_companies=remaining * 5)
             use_precomputed = False
+        else:
+            # Normal rotation:
+            #   Odd attempts: Perplexity sonar-pro
+            #   Even attempts: Google Search fallback
+            #   Every 6th OR after 3+ consecutive empties: deep research
+            use_deep = (attempt % 6 == 5) or (consecutive_empty >= 3 and attempt % 2 == 1)
+
+            if use_deep:
+                companies = await _discover_companies_deep_research(
+                    icp, num_companies=remaining * 3,
+                    exclude_companies=seen_companies if seen_companies else None,
+                )
+                use_precomputed = True
+                consecutive_empty = 0
+            elif attempt % 2 == 1:
+                variant_idx = (attempt // 2) % len(_PROMPT_VARIANTS)
+                companies = await _discover_companies_with_intent(
+                    icp, num_companies=remaining * 5,
+                    exclude_companies=seen_companies if seen_companies else None,
+                    _variant_idx=variant_idx,
+                )
+                use_precomputed = True
+            else:
+                companies = await discover_companies(icp, num_companies=remaining * 5)
+                use_precomputed = False
 
         # Filter out companies we've already processed
         companies = [
@@ -2183,8 +2372,16 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
         if not companies:
             print(f"  No new companies found this attempt")
             consecutive_empty += 1
+            if use_precomputed and not perplexity_exhausted:
+                perplexity_empty_streak += 1
+                if perplexity_empty_streak >= 5:
+                    perplexity_exhausted = True
+                    print(f"  ⚠️  Perplexity exhausted ({perplexity_empty_streak} consecutive empties)")
+                    print(f"  Switching to Google fallback + pool recheck only")
         else:
             consecutive_empty = 0
+            if use_precomputed:
+                perplexity_empty_streak = 0
             print(f"  Found {len(companies)} new companies to process")
             new_leads, new_pool = await _process_companies(
                 companies, icp, remaining,
@@ -2202,8 +2399,9 @@ async def source_fulfillment_leads(icp: dict, num_leads: int = 5) -> List[Dict]:
             all_leads.extend(new_leads)
             email_verified_pool.extend(new_pool)
 
-        # Every BATCH_RECHECK_EVERY attempts, batch re-check pooled leads
-        if attempt % BATCH_RECHECK_EVERY == 0 and email_verified_pool and len(all_leads) < num_leads:
+        # Batch re-check pooled leads (more frequent when Perplexity is exhausted)
+        recheck_interval = 1 if perplexity_exhausted else BATCH_RECHECK_EVERY
+        if attempt % recheck_interval == 0 and email_verified_pool and len(all_leads) < num_leads:
             remaining = num_leads - len(all_leads)
             lead_companies = {l["business"].lower() for l in all_leads}
             pool = [p for p in email_verified_pool if p["business"].lower() not in lead_companies]

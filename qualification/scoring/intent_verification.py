@@ -767,6 +767,20 @@ _SOURCE_DOMAIN_ALLOWLIST: Dict[str, frozenset] = {
 }
 
 
+def _domain_matches_allowlist(domain: str, allowed: frozenset) -> bool:
+    """Check if ``domain`` matches any entry in ``allowed``.
+
+    Supports country-prefix subdomains like ``ca.indeed.com`` matching
+    ``indeed.com``, or ``sg.finance.yahoo.com`` matching ``finance.yahoo.com``.
+    """
+    if domain in allowed:
+        return True
+    for entry in allowed:
+        if domain.endswith("." + entry):
+            return True
+    return False
+
+
 def _is_known_third_party_domain(domain: str) -> Optional[str]:
     """Check if a domain belongs to a known third-party platform.
     Returns the actual source type if it's a known platform, None otherwise."""
@@ -774,7 +788,7 @@ def _is_known_third_party_domain(domain: str) -> Optional[str]:
     if domain.startswith("www."):
         domain = domain[4:]
     for source_type, domains in _SOURCE_DOMAIN_ALLOWLIST.items():
-        if domain in domains:
+        if _domain_matches_allowlist(domain, domains):
             return source_type
     return None
 
@@ -827,7 +841,7 @@ def check_source_url_mismatch(source_str: str, url: str) -> Optional[str]:
     domain = domain.lower()
     if domain.startswith("www."):
         domain = domain[4:]
-    if domain in allowed:
+    if _domain_matches_allowlist(domain, allowed):
         return None
 
     return (
