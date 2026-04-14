@@ -46,6 +46,14 @@ from Leadpoet.utils.utils_lead_extraction import (
 )
 from validator_models.industry_taxonomy import INDUSTRY_TAXONOMY
 
+# Load gateway geo normalization for city alias matching (St/Saint, NYC, etc.)
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+try:
+    from gateway.utils.geo_normalize import normalize_city as _normalize_city_geo
+except Exception:
+    _normalize_city_geo = None
+
 # Load environment variables (explicit path to ensure .env is found regardless of working directory)
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
@@ -1096,10 +1104,11 @@ def _extract_company_name_from_title(title: str) -> str:
 
 
 def _normalize_company_name(name: str) -> str:
-    """Normalize company name for comparison - only clean punctuation and whitespace."""
+    """Normalize company name for comparison - clean Unicode control chars, punctuation and whitespace."""
     if not name:
         return ''
     n = name.lower().strip()
+    n = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+', '', n)
     n = re.sub(r'[.,\-&\'\"()]+', ' ', n)
     return ' '.join(n.split()).strip()
 
@@ -1394,20 +1403,42 @@ def _check_location_match(
 
         # Both have city - must match
         city_match = claimed_city_clean == extracted_city_clean
+
+        # Try gateway geo normalization (handles known aliases: St/Saint, NYC, etc.)
+        if not city_match and _normalize_city_geo:
+            try:
+                country = "United States" if region == "USA" else ""
+                claimed_norm = _normalize_city_geo(claimed_city, country).lower()
+                extracted_norm = _normalize_city_geo(extracted_city, country).lower()
+                if claimed_norm == extracted_norm:
+                    city_match = True
+            except Exception:
+                pass
+
         if not city_match:
             # Try normalized comparison (punctuation, spacing differences)
             city_match = _normalize_company_name(claimed_city) == _normalize_company_name(extracted_city)
         if not city_match:
-            # Try typo tolerance: St. Louis vs Saint Louis, Ft. Worth vs Fort Worth
+            # Try prefix normalization: St/Saint, Ft/Fort, Mt/Mount, Ste/Saint
             variations_claimed = [
                 claimed_city_clean, claimed_city_clean.replace('.', ''),
                 claimed_city_clean.replace('st ', 'saint ').replace('st.', 'saint'),
                 claimed_city_clean.replace('ft ', 'fort ').replace('ft.', 'fort'),
+                claimed_city_clean.replace('mt ', 'mount ').replace('mt.', 'mount'),
+                claimed_city_clean.replace('ste ', 'saint ').replace('ste.', 'saint'),
+                claimed_city_clean.replace('saint ', 'st. '),
+                claimed_city_clean.replace('mount ', 'mt. '),
+                claimed_city_clean.replace('fort ', 'ft. '),
             ]
             variations_extracted = [
                 extracted_city_clean, extracted_city_clean.replace('.', ''),
                 extracted_city_clean.replace('st ', 'saint ').replace('st.', 'saint'),
                 extracted_city_clean.replace('ft ', 'fort ').replace('ft.', 'fort'),
+                extracted_city_clean.replace('mt ', 'mount ').replace('mt.', 'mount'),
+                extracted_city_clean.replace('ste ', 'saint ').replace('ste.', 'saint'),
+                extracted_city_clean.replace('saint ', 'st. '),
+                extracted_city_clean.replace('mount ', 'mt. '),
+                extracted_city_clean.replace('fort ', 'ft. '),
             ]
             for vc in variations_claimed:
                 for ve in variations_extracted:
@@ -1423,7 +1454,18 @@ def _check_location_match(
     if region == 'UAE':
         if not extracted_city:
             return False
-        return claimed_city.lower().strip() == extracted_city.lower().strip()
+        claimed_clean = claimed_city.lower().strip()
+        extracted_clean = extracted_city.lower().strip()
+        if claimed_clean == extracted_clean:
+            return True
+        if _normalize_city_geo:
+            try:
+                if _normalize_city_geo(claimed_city, "United Arab Emirates").lower() == \
+                   _normalize_city_geo(extracted_city, "United Arab Emirates").lower():
+                    return True
+            except Exception:
+                pass
+        return False
 
     return False
 

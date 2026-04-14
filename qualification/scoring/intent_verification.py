@@ -1004,7 +1004,7 @@ async def verify_intent_signal(
                 f"Source is 'company_website' but signal URL domain ({signal_domain}) "
                 f"doesn't match lead's company website ({lead_domain}). "
                 f"Use the correct source type (news, job_board, etc.) for third-party URLs."
-            ), "fabricated"
+            ), "fabricated", None
 
     # Check cache first (include ICP in cache key if provided)
     icp_cache_suffix = f"|{icp_industry}|{icp_criteria}" if icp_industry else ""
@@ -1045,7 +1045,7 @@ async def verify_intent_signal(
             return False, 0, (
                 f"Company '{company_name}' not mentioned in source content — "
                 f"signal may be misattributed to the wrong company"
-            ), "fabricated"
+            ), "fabricated", None
         else:
             logger.info(f"✓ Company '{company_name}' found in page content")
 
@@ -1064,7 +1064,7 @@ async def verify_intent_signal(
             return False, 0, (
                 f"Snippet not found in source content (overlap: {snippet_overlap:.0%}). "
                 f"The snippet text does not appear on the page — likely fabricated or manipulated."
-            ), "fabricated"
+            ), "fabricated", None
         else:
             logger.info(f"✓ Snippet verbatim check passed: overlap={snippet_overlap:.0%}")
 
@@ -1082,7 +1082,7 @@ async def verify_intent_signal(
             return False, 0, (
                 f"Description not grounded in source content (overlap: {desc_grounding:.0%}). "
                 f"The description contains claims not found on the page — likely LLM-fabricated."
-            ), "fabricated"
+            ), "fabricated", None
         else:
             logger.info(f"✓ Description grounding check passed: overlap={desc_grounding:.0%}")
 

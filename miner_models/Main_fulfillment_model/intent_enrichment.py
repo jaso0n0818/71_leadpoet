@@ -20,7 +20,9 @@ from typing import Dict, List, Optional, Tuple
 
 from target_fit_model.config import (
     PERPLEXITY_MODEL,
+    PERPLEXITY_DEEP_MODEL,
     PERPLEXITY_TIMEOUT,
+    PERPLEXITY_DEEP_TIMEOUT,
     MAX_CONCURRENT_PERPLEXITY,
 )
 from target_fit_model.openrouter import chat_completion, chat_completion_json, parse_json_response
@@ -197,16 +199,95 @@ fit_score: how well this company matches the target profile and would benefit fr
 
         return None
 
-    # Attempt 1: Full prompt with expanded signals + ScrapingDog data
+    # Attempt 1: Deep research to gather real evidence, then extract JSON
     print(f"    [Intent] Attempt 1 for {company_name} (jobs={bool(jobs_data)}, news={bool(news_data)})")
-    result = chat_completion_json(
-        prompt=prompt,
-        model=PERPLEXITY_MODEL,
-        system_prompt=_SYSTEM_PROMPT,
+
+    deep_research_prompt = f"""Find VERIFIABLE evidence that "{company_name}" is showing these buying signals: {intent_signals}
+
+Context: A sales team selling "{product_description}" wants proof these signals are real.
+
+CRITICAL URL RULES:
+1. Each signal MUST link to a DIFFERENT domain — the validator rejects multiple signals from the same domain
+2. STRONGLY PREFER third-party sources: news (TechCrunch, Forbes, Bloomberg, CRN, VentureBeat), job boards (Indeed, Greenhouse, Lever, LinkedIn Jobs), press releases (PRNewsWire, BusinessWire), Crunchbase, G2, TrustRadius
+3. The company's own website ({website}) is allowed ONLY for specific deep pages (e.g. /careers/sdr-role, /blog/2026-expansion) — NEVER use the homepage or generic pages like /about, /press, /careers
+4. Each URL must be a specific page that mentions "{company_name}" by name with verifiable facts
+5. Only include evidence from the last 6 months (since {_six_months_ago})
+
+Source strategy per signal type:
+- Hiring signals → Indeed.com, Greenhouse.io, Lever.co, or LinkedIn Jobs (actual job postings)
+- Funding signals → Crunchbase.com, TechCrunch.com, PRNewsWire.com (announcements)
+- Competitor/tool evaluation → G2.com, TrustRadius.com, news articles
+- General business signals → News articles, LinkedIn company posts, press releases
+
+Return ONLY this JSON:
+{{"signals": [{{"signal": "signal name", "match": true, "relevance_score": 0.7, "evidence": "what you found, with the date (month/year) and full source URL"}}], "intent_paragraph": "one paragraph summary", "intent_score": 0.5, "fit_score": 0.5}}
+
+If no verifiable evidence found, return: {{"signals": [], "intent_paragraph": "", "intent_score": 0.0, "fit_score": 0.0}}"""
+
+    # Try deep research first
+    from target_fit_model.openrouter import chat_completion
+    deep_raw = chat_completion(
+        prompt=deep_research_prompt,
+        model=PERPLEXITY_DEEP_MODEL,
+        system_prompt="You are a sales research assistant. Return ONLY valid JSON.",
         temperature=0,
-        max_tokens=6000,
-        timeout=PERPLEXITY_TIMEOUT,
+        max_tokens=8000,
+        timeout=PERPLEXITY_DEEP_TIMEOUT,
     )
+
+    result = None
+    if deep_raw and len(deep_raw) > 20:
+        from target_fit_model.openrouter import parse_json_response
+        result = parse_json_response(deep_raw)
+
+        if result is None and len(deep_raw) > 200:
+            # Deep research returned markdown — extract URLs and evidence,
+            # then ask a fast model to structure it as JSON.
+            import re as _re
+            urls_found = _re.findall(r'https?://[^\s)<>\]"]+', deep_raw)
+            urls_snippet = "\n".join(f"- {u}" for u in urls_found[:15])
+            company_domain = (website.replace("https://", "").replace("http://", "")
+                              .split("/")[0].lower() if website else "")
+
+            # Separate third-party URLs from company URLs
+            third_party_urls = [u for u in urls_found if company_domain not in u.lower()]
+            company_urls = [u for u in urls_found if company_domain in u.lower()
+                           and u.lower().rstrip("/") != f"https://{company_domain}"
+                           and u.lower().rstrip("/") != f"http://{company_domain}"]
+            urls_snippet = "\n".join(f"- {u}" for u in (third_party_urls + company_urls)[:15])
+
+            extract_prompt = f"""Extract intent signals from this research about "{company_name}".
+
+RESEARCH TEXT:
+{deep_raw[:6000]}
+
+URLs found in the research:
+{urls_snippet}
+
+Signals to look for: {intent_signals}
+
+RULES:
+- Each signal MUST use a URL from a DIFFERENT domain (validator skips duplicate domains)
+- PREFER third-party URLs (news, job boards, Crunchbase, etc.) over company website URLs
+- Company website URLs ({company_domain}) are OK only for specific deep pages (e.g. /careers/specific-job, /blog/specific-post) — NOT homepages or generic pages
+- The evidence field must include the full source URL
+- Only include signals with real, specific evidence
+
+Return ONLY this JSON:
+{{"signals": [{{"signal": "signal name", "match": true, "relevance_score": 0.7, "evidence": "specific evidence with date and source URL"}}], "intent_paragraph": "brief summary of findings", "intent_score": 0.5, "fit_score": 0.5}}
+
+If no verifiable evidence found, return: {{"signals": [], "intent_paragraph": "", "intent_score": 0.0, "fit_score": 0.0}}"""
+
+            result = chat_completion_json(
+                prompt=extract_prompt,
+                model=PERPLEXITY_MODEL,
+                system_prompt="Extract structured data from research text. Return ONLY valid JSON.",
+                temperature=0,
+                max_tokens=4000,
+                timeout=PERPLEXITY_TIMEOUT,
+            )
+            if result:
+                print(f"    [Intent] Extracted JSON from deep research markdown")
 
     parsed = _parse_result(result, data_gaps)
     if parsed:

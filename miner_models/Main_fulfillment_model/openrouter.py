@@ -33,6 +33,7 @@ _MODEL_COSTS = {
     "google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
     "perplexity/sonar-pro": {"input": 3.00, "output": 15.00},
     "perplexity/sonar-deep-research": {"input": 2.00, "output": 8.00},
+    "perplexity/sonar-deep-research:online": {"input": 2.00, "output": 8.00},
     "openai/gpt-5.4-nano": {"input": 0.20, "output": 1.25},
     "openai/gpt-5.4-mini": {"input": 0.75, "output": 4.50},
     "openai/gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -99,7 +100,9 @@ def chat_completion(
     messages.append({"role": "user", "content": prompt})
 
     effective_timeout = timeout or LLM_TIMEOUT
-    if "perplexity" in model.lower():
+    if "deep-research" in model.lower():
+        effective_timeout = max(effective_timeout, PERPLEXITY_TIMEOUT, 120)
+    elif "perplexity" in model.lower():
         effective_timeout = max(effective_timeout, PERPLEXITY_TIMEOUT)
 
     start = time.time()
