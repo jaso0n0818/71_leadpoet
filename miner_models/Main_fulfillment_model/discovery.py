@@ -1219,13 +1219,21 @@ async def _discover_companies_deep_research(
 
     # Markdown response — extract company names + URLs, then ask sonar-pro to structure
     urls_found = _URL_REGEX.findall(raw)
+    urls_text = "\n".join(f"  - {u}" for u in urls_found[:20])
     extract_prompt = f"""Extract company information from this research text.
 
 TEXT:
-{raw[:6000]}
+{raw[:5000]}
+
+URLs found in the text:
+{urls_text}
+
+CRITICAL: For each company, include their WEBSITE URL (e.g. https://retool.com).
+If you can't find the exact URL in the text, construct it from the company name
+(e.g. "Retool" -> "https://retool.com", "Datadog" -> "https://datadoghq.com").
 
 Return ONLY a JSON array:
-[{{"name": "Company Name", "website": "https://...", "description": "one sentence", "employee_estimate": "50-200", "hq_city": "", "hq_state": "", "signals": [{{"signal": "what signal", "evidence": "what was found", "url": "source url", "date": "YYYY-MM"}}]}}]
+[{{"name": "Company Name", "website": "https://company.com", "description": "one sentence", "employee_estimate": "50-200", "hq_city": "", "hq_state": "", "signals": [{{"signal": "what signal", "evidence": "what was found", "url": "source url", "date": "YYYY-MM"}}]}}]
 
 Only include real companies with real evidence. No explanation text."""
 
@@ -1246,13 +1254,51 @@ Only include real companies with real evidence. No explanation text."""
     if isinstance(structured, dict):
         structured = structured.get("companies", structured.get("results", [structured]))
 
+    # Well-known company domain map for common SaaS companies
+    _KNOWN_DOMAINS = {
+        "retool": "retool.com", "datadog": "datadoghq.com",
+        "cloudflare": "cloudflare.com", "okta": "okta.com",
+        "loom": "loom.com", "notion": "notion.so",
+        "figma": "figma.com", "stripe": "stripe.com",
+        "plaid": "plaid.com", "twilio": "twilio.com",
+        "hubspot": "hubspot.com", "salesforce": "salesforce.com",
+        "slack": "slack.com", "zoom": "zoom.us",
+        "airtable": "airtable.com", "monday.com": "monday.com",
+        "asana": "asana.com", "clickup": "clickup.com",
+        "intercom": "intercom.com", "drift": "drift.com",
+        "gong": "gong.io", "outreach": "outreach.io",
+        "pipedrive": "pipedrive.com", "pendo": "pendo.io",
+        "amplitude": "amplitude.com", "mixpanel": "mixpanel.com",
+        "segment": "segment.com", "braze": "braze.com",
+        "snyk": "snyk.io", "miro": "miro.com",
+        "calendly": "calendly.com", "webflow": "webflow.com",
+        "vercel": "vercel.com", "supabase": "supabase.com",
+        "rippling": "rippling.com", "deel": "deel.com",
+        "lattice": "lattice.com", "gusto": "gusto.com",
+    }
+
     companies = []
     for item in (structured if isinstance(structured, list) else []):
         if not isinstance(item, dict) or not item.get("name"):
             continue
         website = item.get("website", "").strip()
+        name = item["name"].strip()
+
+        # If website is missing, try to infer from known domains
+        if not website or not _extract_domain(website):
+            name_lower = name.lower().replace(" ", "").replace(".", "").replace(",", "")
+            for known_name, known_domain in _KNOWN_DOMAINS.items():
+                if known_name in name_lower or name_lower in known_name:
+                    website = f"https://{known_domain}"
+                    break
+            if not website:
+                # Last resort: guess domain from name
+                clean_name = re.sub(r'[^a-z0-9]', '', name.lower())
+                if clean_name:
+                    website = f"https://{clean_name}.com"
+
         companies.append({
-            "name": item["name"].strip(),
+            "name": name,
             "website": website,
             "domain": _extract_domain(website) if website else "",
             "description": item.get("description", ""),
