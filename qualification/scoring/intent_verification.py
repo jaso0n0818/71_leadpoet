@@ -750,6 +750,10 @@ _SOURCE_DOMAIN_ALLOWLIST: Dict[str, frozenset] = {
         "intellectia.ai", "fiercepharma.com", "fiercebiotech.com",
         "statnews.com", "biopharmadive.com", "supplychaindive.com",
         "retaildive.com", "ciodive.com", "hrdive.com",
+        "crn.com", "channele2e.com", "sdxcentral.com",
+        "theregister.com", "infoworld.com", "computerworld.com",
+        "geekwire.com", "fastcompany.com", "inc.com",
+        "hbr.org", "getlatka.com", "owler.com",
     }),
     "social_media": frozenset({
         "twitter.com", "x.com",
