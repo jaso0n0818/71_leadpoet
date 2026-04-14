@@ -1463,14 +1463,6 @@ async def _verify_and_correct_lead(lead: dict, icp: dict) -> Optional[Dict]:
         print(f"    ❌ Stage 5 still failing after {MAX_S5_CORRECTIONS} corrections — skipping lead")
         return None
 
-    # Post-verification ICP role check: if the verified role doesn't match
-    # any of the ICP's target roles, skip the lead — the validator's Tier 1
-    # will reject it anyway.
-    target_roles = icp.get("target_roles", [])
-    if target_roles and lead.get("role") not in target_roles:
-        print(f"    ❌ Verified role '{lead.get('role')}' not in ICP target_roles {target_roles} — skipping")
-        return None
-
     # Clean up internal fields
     lead.pop("_description", None)
 

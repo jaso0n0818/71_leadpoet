@@ -93,6 +93,121 @@ def _normalize_country(c: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fuzzy role matching for ICP Tier 1
+# ---------------------------------------------------------------------------
+
+_ROLE_TITLE_EQUIVALENTS = {
+    "vp": ["vp", "vice president", "v.p."],
+    "svp": ["svp", "senior vice president", "senior vp"],
+    "evp": ["evp", "executive vice president"],
+    "director": ["director", "dir"],
+    "head": ["head", "head of"],
+    "cro": ["cro", "chief revenue officer"],
+    "coo": ["coo", "chief operating officer"],
+    "cmo": ["cmo", "chief marketing officer"],
+    "cto": ["cto", "chief technology officer"],
+    "cfo": ["cfo", "chief financial officer"],
+    "ceo": ["ceo", "chief executive officer"],
+    "cio": ["cio", "chief information officer"],
+    "manager": ["manager", "mgr"],
+    "gm": ["gm", "general manager"],
+    "md": ["md", "managing director"],
+}
+
+_ROLE_FUNCTION_EQUIVALENTS = {
+    "sales": ["sales", "revenue", "commercial", "business development", "gtm", "go-to-market", "go to market"],
+    "marketing": ["marketing", "growth", "demand generation", "brand"],
+    "engineering": ["engineering", "software engineering", "development", "r&d"],
+    "product": ["product", "product management"],
+    "operations": ["operations", "ops"],
+    "hr": ["hr", "human resources", "people", "talent"],
+    "finance": ["finance", "financial"],
+    "it": ["it", "information technology"],
+    "customer success": ["customer success", "client success", "cx"],
+    "partnerships": ["partnerships", "alliances", "channel"],
+}
+
+
+def _normalize_role_tokens(role: str) -> set:
+    """Break a role into normalized tokens, expanding equivalents."""
+    role_lower = role.lower().strip()
+
+    # Handle slash/comma separated roles: "CRO / VP Sales" → ["cro", "vp", "sales"]
+    role_lower = re.sub(r'[/,&]+', ' ', role_lower)
+    role_lower = re.sub(r'\s+of\s+', ' ', role_lower)
+    role_lower = re.sub(r'\s+', ' ', role_lower).strip()
+
+    tokens = set(role_lower.split())
+
+    # Expand title equivalents
+    expanded = set()
+    for token in tokens:
+        for canonical, equivalents in _ROLE_TITLE_EQUIVALENTS.items():
+            if token in equivalents:
+                expanded.update(equivalents)
+                break
+        for canonical, equivalents in _ROLE_FUNCTION_EQUIVALENTS.items():
+            if token in equivalents:
+                expanded.update(equivalents)
+                break
+
+    return tokens | expanded
+
+
+def _fuzzy_role_match(lead_role: str, target_roles: list) -> bool:
+    """Check if lead_role is a fuzzy match for any target role.
+
+    Handles: "CRO / VP Sales" matching "VP of Sales",
+    "Director, Revenue" matching "Director of Sales",
+    "Head of GTM" matching "Head of Revenue", etc.
+    """
+    if not lead_role or not target_roles:
+        return False
+
+    lead_tokens = _normalize_role_tokens(lead_role)
+
+    for target in target_roles:
+        target_tokens = _normalize_role_tokens(target)
+
+        # Check overlap: if both roles share a title token AND a function token, it's a match
+        lead_titles = set()
+        lead_functions = set()
+        target_titles = set()
+        target_functions = set()
+
+        for token in lead_tokens:
+            for _, equivs in _ROLE_TITLE_EQUIVALENTS.items():
+                if token in equivs:
+                    lead_titles.add(token)
+            for _, equivs in _ROLE_FUNCTION_EQUIVALENTS.items():
+                if token in equivs:
+                    lead_functions.add(token)
+
+        for token in target_tokens:
+            for _, equivs in _ROLE_TITLE_EQUIVALENTS.items():
+                if token in equivs:
+                    target_titles.add(token)
+            for _, equivs in _ROLE_FUNCTION_EQUIVALENTS.items():
+                if token in equivs:
+                    target_functions.add(token)
+
+        # Match if: shared title level AND shared function area
+        title_overlap = bool(lead_titles & target_titles)
+        function_overlap = bool(lead_functions & target_functions)
+
+        if title_overlap and function_overlap:
+            return True
+
+        # Fallback: high token overlap (>= 50% of smaller set)
+        overlap = lead_tokens & target_tokens
+        min_size = min(len(lead_tokens), len(target_tokens))
+        if min_size > 0 and len(overlap) / min_size >= 0.5:
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Tier 1: ICP Fit Gate (free, deterministic)
 # ---------------------------------------------------------------------------
 
@@ -115,7 +230,8 @@ def _tier1_check(
         return "role_type_mismatch"
 
     if icp.target_roles and lead.role not in icp.target_roles:
-        return "role_mismatch"
+        if not _fuzzy_role_match(lead.role, icp.target_roles):
+            return "role_mismatch"
 
     if icp.target_seniority:
         try:
