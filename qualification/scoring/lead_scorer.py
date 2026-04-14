@@ -440,6 +440,11 @@ def _apply_signal_time_decay(
         # Model submitted date=null but our re-scrape found a date in the content.
         # Apply time decay based on the date we found — the model shouldn't get to
         # hide a real date to avoid decay.
+        # EXCEPTION: sources that don't require dates (company_website, review_site,
+        # etc.) are exempt — their pages often contain old dates in footers,
+        # copyright notices, or unrelated content that shouldn't penalize the signal.
+        if source_lower in SOURCES_DATE_NOT_REQUIRED:
+            return raw_score, 1.0
         try:
             parsed_date = date.fromisoformat(content_found_date)
         except (ValueError, AttributeError):
