@@ -1698,26 +1698,6 @@ class Validator(BaseValidatorNeuron):
             # Block file is now updated inline in process_gateway_validation_workflow()
             # (No separate background thread needed - eliminates websocket concurrency)
 
-            # ════════════════════════════════════════════════════════════
-            # LEAD FULFILLMENT SCORING (separate task, polls every 30s)
-            # Enable with: export ENABLE_FULFILLMENT=true
-            # ════════════════════════════════════════════════════════════
-            fulfillment_scoring_task = None
-            if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
-                async def _fulfillment_scoring_loop():
-                    while not self.should_exit:
-                        try:
-                            await self.process_fulfillment_scoring()
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            bt.logging.warning(f"Fulfillment scoring error: {e}")
-                        await asyncio.sleep(30)
-
-                fulfillment_scoring_task = asyncio.create_task(
-                    _fulfillment_scoring_loop(), name="fulfillment_scoring")
-                bt.logging.info("✅ Fulfillment scoring task started (30s poll)")
-
             try:
                 # Keep the validator running and continuously process leads
                 while not self.should_exit:
@@ -1741,13 +1721,14 @@ class Validator(BaseValidatorNeuron):
                         await asyncio.sleep(5)  # Wait before retrying
                     
                     # ════════════════════════════════════════════════════════════
-                    # FULFILLMENT: Collect worker results and submit to gateway
-                    # Runs after sourcing, before qualification
+                    # FULFILLMENT SCORING WORKFLOW
+                    # Distributes work at epoch start, collects after sourcing
+                    # Enable with: export ENABLE_FULFILLMENT=true
                     # ════════════════════════════════════════════════════════════
                     try:
-                        await self.collect_fulfillment_worker_results()
+                        await self.process_fulfillment_workflow()
                     except Exception as e:
-                        bt.logging.warning(f"Error in collect_fulfillment_worker_results: {e}")
+                        bt.logging.warning(f"Error in process_fulfillment_workflow: {e}")
 
                     # ════════════════════════════════════════════════════════════
                     # QUALIFICATION MODEL EVALUATION (polls gateway for miner models)
@@ -4003,182 +3984,172 @@ class Validator(BaseValidatorNeuron):
     # LEAD FULFILLMENT SCORING WORKFLOW
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def process_fulfillment_scoring(self):
-        """Distribute fulfillment scoring work to dedicated worker containers.
+    async def process_fulfillment_workflow(self):
+        """Unified fulfillment workflow — distribute work AND collect results.
 
-        Coordinator mode: fetch revealed leads from gateway, split across
-        FULFILLMENT_CONTAINERS_COUNT workers by writing work files.
-        Each worker scores its batch and writes a results file.
+        Called every main-loop iteration (like qualification workflow).
+        Two phases per call:
 
-        Falls back to inline scoring if no fulfillment proxies are configured
-        (single-container / development mode).
+        Phase 1 — DISTRIBUTE (any time, no sourcing gate):
+            If there are scoring-ready requests on the gateway AND no work
+            is currently pending for this epoch, fetch reveals and write
+            work files for the 5 fulfillment worker containers.
+
+        Phase 2 — COLLECT + SUBMIT (gated on sourcing completion):
+            After sourcing results have been submitted for this epoch
+            (``_last_processed_epoch >= current_epoch``), check if all
+            fulfillment workers have finished.  If so, aggregate results
+            and submit scores to the gateway.  If workers are still
+            running, return silently — collection will happen next
+            iteration or next epoch (same pattern as qualification).
+
+        Falls back to inline scoring if no fulfillment proxies are
+        configured (development / single-container mode).
         """
         if os.environ.get("ENABLE_FULFILLMENT", "false").lower() != "true":
             return
 
-        if getattr(self, "_fulfillment_scoring_in_progress", False):
-            return
-        self._fulfillment_scoring_in_progress = True
-
         try:
-            from Leadpoet.utils.cloud_db import (
-                gateway_get_fulfillment_reveals,
-                gateway_submit_fulfillment_scores,
-            )
-            from qualification.scoring.fulfillment_scorer import (
-                score_miner_submission,
-                deduplicate_across_miners,
-                format_scores_for_gateway,
-            )
-
-            data = gateway_get_fulfillment_reveals(self.wallet)
-            active_requests = data.get("requests", []) if isinstance(data, dict) else []
-
-            for req in active_requests:
-                request_id = req.get("request_id", "")
-                status = req.get("status", "")
-                if status != "scoring":
-                    continue
-
-                icp_details = req.get("icp", {})
-                submissions = req.get("submissions", [])
-                if not submissions:
-                    continue
-
-                print(f"\n🔍 Fulfillment: distributing {len(submissions)} submission(s) for {request_id[:8]}...")
-
-                fulfillment_proxies = detect_fulfillment_proxies()
-                num_workers = len(fulfillment_proxies) if fulfillment_proxies else 0
-
-                if num_workers > 0:
-                    # ── Container mode: distribute across workers ──
-                    current_block = await self.get_current_block_async()
-                    current_epoch = current_block // 360
-                    weights_dir = Path("validator_weights")
-                    weights_dir.mkdir(exist_ok=True)
-
-                    # Round-robin distribute submissions across workers
-                    worker_assignments = {i: [] for i in range(1, num_workers + 1)}
-                    for idx, sub in enumerate(submissions):
-                        worker_id = (idx % num_workers) + 1
-                        worker_assignments[worker_id].append(sub)
-
-                    for worker_id, assigned_subs in worker_assignments.items():
-                        if not assigned_subs:
-                            continue
-                        work_file = weights_dir / f"fulfillment_worker_{worker_id}_work_{current_epoch}.json"
-                        with open(work_file, 'w') as f:
-                            json.dump({
-                                "epoch": current_epoch,
-                                "request_id": request_id,
-                                "icp": icp_details,
-                                "submissions": assigned_subs,
-                                "timestamp": time.time(),
-                            }, f, indent=2)
-                        print(f"   📝 Assigned {len(assigned_subs)} submission(s) to fulfillment worker {worker_id}")
-
-                    print(f"   ⏳ Work distributed — workers will score and write results")
-                else:
-                    # ── Inline mode: score directly (no dedicated containers) ──
-                    print(f"   (No fulfillment containers — scoring inline)")
-                    scored_all: dict = {}
-                    for sub in submissions:
-                        miner_hk = sub.get("miner_hotkey", "")
-                        sub_id = sub.get("submission_id", "")
-                        leads_raw = sub.get("leads", [])
-                        lead_ids = sub.get("lead_ids", [])
-                        if not leads_raw:
-                            continue
-
-                        try:
-                            results = await score_miner_submission(leads_raw, icp_details)
-                            scored_all[miner_hk] = list(zip(leads_raw, results))
-
-                            print(f"\n{'='*60}")
-                            print(f"📊 FULFILLMENT SCORES — Request {request_id[:8]}...")
-                            print(f"   Miner: {miner_hk[:16]}...")
-                            print(f"{'='*60}")
-                            for idx, sr in enumerate(results):
-                                lead_name = leads_raw[idx].get("full_name", "?") if idx < len(leads_raw) else "?"
-                                lead_biz = leads_raw[idx].get("business", "?") if idx < len(leads_raw) else "?"
-                                t1 = "✅" if sr.tier1_passed else "❌"
-                                t2 = "✅" if sr.tier2_passed else "❌"
-                                reason = sr.failure_reason or "passed"
-                                print(f"   Lead {idx+1}: {lead_name} @ {lead_biz}")
-                                print(f"     Tier1(ICP): {t1}  Tier2(Data): {t2}  Score: {sr.final_score:.1f}  [{reason}]")
-                            print(f"{'='*60}\n")
-
-                            scores_payload = format_scores_for_gateway(
-                                miner_hk, lead_ids, results,
-                                request_id=request_id,
-                                submission_id=sub_id,
-                            )
-                            gateway_submit_fulfillment_scores(
-                                self.wallet, request_id, scores_payload,
-                            )
-                            print(f"   ✅ Submitted {len(scores_payload)} scores for miner {miner_hk[:8]}...")
-                        except Exception as e:
-                            print(f"   ❌ Scoring failed for miner {miner_hk[:8]}: {e}")
-
-        except ImportError as e:
-            if not getattr(self, "_fulfillment_import_warned", False):
-                bt.logging.warning(f"Fulfillment scoring imports unavailable: {e}")
-                self._fulfillment_import_warned = True
-        except Exception as e:
-            bt.logging.warning(f"Fulfillment scoring error: {e}")
-        finally:
-            self._fulfillment_scoring_in_progress = False
-
-    async def collect_fulfillment_worker_results(self):
-        """Collect scored results from fulfillment worker containers and submit to gateway.
-
-        Polls for fulfillment_worker_{id}_results_{epoch}.json files, aggregates
-        all scored leads, runs cross-miner deduplication, and submits final
-        scores to the gateway.
-        """
-        if os.environ.get("ENABLE_FULFILLMENT", "false").lower() != "true":
-            return
-
-        fulfillment_proxies = detect_fulfillment_proxies()
-        if not fulfillment_proxies:
-            return
-
-        try:
-            from Leadpoet.utils.cloud_db import gateway_submit_fulfillment_scores
-            from qualification.scoring.fulfillment_scorer import (
-                format_scores_for_gateway,
-            )
-            from gateway.fulfillment.models import FulfillmentScoreResult
-
             current_block = await self.get_current_block_async()
             current_epoch = current_block // 360
             weights_dir = Path("validator_weights")
-            num_workers = len(fulfillment_proxies)
+            weights_dir.mkdir(exist_ok=True)
+        except Exception:
+            return
 
-            # Check if any work was distributed this epoch
-            any_work = False
-            for wid in range(1, num_workers + 1):
-                if (weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json").exists():
-                    any_work = True
-                    break
-            if not any_work:
-                return
+        fulfillment_proxies = detect_fulfillment_proxies()
+        num_workers = len(fulfillment_proxies) if fulfillment_proxies else 0
 
-            # Check if all workers that have work also have results
-            all_done = True
-            for wid in range(1, num_workers + 1):
-                work_file = weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json"
-                results_file = weights_dir / f"fulfillment_worker_{wid}_results_{current_epoch}.json"
-                if work_file.exists() and not results_file.exists():
-                    all_done = False
-                    break
+        # Track epochs where we already distributed and collected
+        if not hasattr(self, '_ff_distributed_epochs'):
+            self._ff_distributed_epochs = set()
+        if not hasattr(self, '_ff_collected_epochs'):
+            self._ff_collected_epochs = set()
 
-            if not all_done:
-                return
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 1: DISTRIBUTE — fetch scoring-ready reveals, write work files
+        # No sourcing gate — distribute as early as possible so workers
+        # can score in parallel with sourcing validation.
+        # ═══════════════════════════════════════════════════════════════════
+        if current_epoch not in self._ff_distributed_epochs:
+            try:
+                from Leadpoet.utils.cloud_db import gateway_get_fulfillment_reveals
 
-            # All workers done — aggregate and submit
+                data = gateway_get_fulfillment_reveals(self.wallet)
+                active_requests = data.get("requests", []) if isinstance(data, dict) else []
+
+                scoring_requests = [r for r in active_requests
+                                    if r.get("status") == "scoring" and r.get("submissions")]
+
+                if scoring_requests:
+                    req = scoring_requests[0]  # one request at a time
+                    request_id = req.get("request_id", "")
+                    icp_details = req.get("icp", {})
+                    submissions = req.get("submissions", [])
+
+                    print(f"\n🔍 Fulfillment: {len(submissions)} submission(s) for {request_id[:8]}...")
+
+                    if num_workers > 0:
+                        # ── Container mode: distribute across workers ──
+                        worker_assignments = {i: [] for i in range(1, num_workers + 1)}
+                        for idx, sub in enumerate(submissions):
+                            worker_id = (idx % num_workers) + 1
+                            worker_assignments[worker_id].append(sub)
+
+                        for worker_id, assigned_subs in worker_assignments.items():
+                            if not assigned_subs:
+                                continue
+                            work_file = weights_dir / f"fulfillment_worker_{worker_id}_work_{current_epoch}.json"
+                            with open(work_file, 'w') as f:
+                                json.dump({
+                                    "epoch": current_epoch,
+                                    "request_id": request_id,
+                                    "icp": icp_details,
+                                    "submissions": assigned_subs,
+                                    "timestamp": time.time(),
+                                }, f, indent=2)
+                            print(f"   📝 Assigned {len(assigned_subs)} submission(s) to fulfillment worker {worker_id}")
+
+                        self._ff_distributed_epochs.add(current_epoch)
+                        print(f"   ⏳ Work distributed to {num_workers} workers")
+                    else:
+                        # ── Inline mode (no containers) ──
+                        from qualification.scoring.fulfillment_scorer import (
+                            score_miner_submission, format_scores_for_gateway,
+                        )
+                        from Leadpoet.utils.cloud_db import gateway_submit_fulfillment_scores
+
+                        for sub in submissions:
+                            miner_hk = sub.get("miner_hotkey", "")
+                            sub_id = sub.get("submission_id", "")
+                            leads_raw = sub.get("leads", [])
+                            lead_ids = sub.get("lead_ids", [])
+                            if not leads_raw:
+                                continue
+                            try:
+                                results = await score_miner_submission(leads_raw, icp_details)
+                                scores_payload = format_scores_for_gateway(
+                                    miner_hk, lead_ids, results,
+                                    request_id=request_id, submission_id=sub_id,
+                                )
+                                gateway_submit_fulfillment_scores(
+                                    self.wallet, request_id, scores_payload,
+                                )
+                                print(f"   ✅ Inline: submitted {len(scores_payload)} scores for {miner_hk[:8]}...")
+                            except Exception as e:
+                                print(f"   ❌ Inline scoring failed for {miner_hk[:8]}: {e}")
+
+                        self._ff_distributed_epochs.add(current_epoch)
+                        self._ff_collected_epochs.add(current_epoch)
+
+            except ImportError as e:
+                if not getattr(self, "_fulfillment_import_warned", False):
+                    bt.logging.warning(f"Fulfillment imports unavailable: {e}")
+                    self._fulfillment_import_warned = True
+            except Exception as e:
+                bt.logging.warning(f"Fulfillment distribution error: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE 2: COLLECT + SUBMIT — only after sourcing is done
+        # Same gate as qualification: _last_processed_epoch >= current_epoch
+        # If workers aren't done yet, return silently (try again next iteration).
+        # ═══════════════════════════════════════════════════════════════════
+        if num_workers == 0 or current_epoch in self._ff_collected_epochs:
+            return
+
+        last_processed = getattr(self, '_last_processed_epoch', -1)
+        if last_processed < current_epoch:
+            return  # sourcing not done yet
+
+        # Check if any work was distributed
+        any_work = False
+        for wid in range(1, num_workers + 1):
+            if (weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json").exists():
+                any_work = True
+                break
+        if not any_work:
+            return
+
+        # Check if ALL workers that have work also have results
+        all_done = True
+        for wid in range(1, num_workers + 1):
+            work_file = weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json"
+            results_file = weights_dir / f"fulfillment_worker_{wid}_results_{current_epoch}.json"
+            if work_file.exists() and not results_file.exists():
+                all_done = False
+                break
+
+        if not all_done:
+            return  # workers still scoring — try again next iteration
+
+        # ── All workers done — aggregate and submit to gateway ──
+        try:
+            from Leadpoet.utils.cloud_db import gateway_submit_fulfillment_scores
+            from qualification.scoring.fulfillment_scorer import format_scores_for_gateway
+            from gateway.fulfillment.models import FulfillmentScoreResult
+
             print(f"\n{'='*60}")
-            print(f"📊 FULFILLMENT: Collecting worker results for epoch {current_epoch}")
+            print(f"📊 FULFILLMENT: Collecting worker results (epoch {current_epoch})")
             print(f"{'='*60}")
 
             for wid in range(1, num_workers + 1):
@@ -4193,7 +4164,7 @@ class Validator(BaseValidatorNeuron):
                 submission_results = worker_data.get("submission_results", [])
 
                 if worker_data.get("error"):
-                    print(f"   ⚠️ Worker {wid} had error: {worker_data['error']}")
+                    print(f"   ⚠️ Worker {wid} error: {worker_data['error']}")
                     continue
 
                 print(f"   Worker {wid}: {len(submission_results)} submission(s)")
@@ -4203,28 +4174,26 @@ class Validator(BaseValidatorNeuron):
                     sub_id = sub_result.get("submission_id", "")
                     lead_ids = sub_result.get("lead_ids", [])
                     raw_results = sub_result.get("results", [])
-
                     results = [FulfillmentScoreResult(**r) for r in raw_results]
 
                     for idx, sr in enumerate(results):
-                        status = "✅" if sr.final_score > 0 else "❌"
+                        icon = "✅" if sr.final_score > 0 else "❌"
                         reason = sr.failure_reason or "passed"
-                        print(f"     {status} Lead {idx+1}: score={sr.final_score:.1f} [{reason}]")
+                        print(f"     {icon} Lead {idx+1}: score={sr.final_score:.1f} [{reason}]")
 
                     try:
                         scores_payload = format_scores_for_gateway(
                             miner_hk, lead_ids, results,
-                            request_id=request_id,
-                            submission_id=sub_id,
+                            request_id=request_id, submission_id=sub_id,
                         )
                         gateway_submit_fulfillment_scores(
                             self.wallet, request_id, scores_payload,
                         )
                         print(f"   ✅ Submitted {len(scores_payload)} scores for miner {miner_hk[:8]}...")
                     except Exception as e:
-                        print(f"   ❌ Gateway submission failed for miner {miner_hk[:8]}: {e}")
+                        print(f"   ❌ Gateway submit failed for {miner_hk[:8]}: {e}")
 
-                # Clean up work and results files
+                # Clean up files
                 try:
                     work_file = weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json"
                     if work_file.exists():
@@ -4233,6 +4202,7 @@ class Validator(BaseValidatorNeuron):
                 except Exception:
                     pass
 
+            self._ff_collected_epochs.add(current_epoch)
             print(f"{'='*60}\n")
 
         except ImportError as e:
@@ -4240,7 +4210,7 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.warning(f"Fulfillment collection imports unavailable: {e}")
                 self._fulfillment_collect_warned = True
         except Exception as e:
-            bt.logging.warning(f"Fulfillment result collection error: {e}")
+            bt.logging.warning(f"Fulfillment collection error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # QUALIFICATION MODEL EVALUATION WORKFLOW
