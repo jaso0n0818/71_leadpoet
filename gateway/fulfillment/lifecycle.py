@@ -238,7 +238,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
 
     # Step 3: consensus aggregation for scoring requests
     scoring_requests = supabase.table("fulfillment_requests") \
-        .select("request_id, reveal_window_end") \
+        .select("request_id, reveal_window_end, icp_details, num_leads") \
         .eq("status", "scoring") \
         .execute()
 
@@ -293,16 +293,15 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 "p_consensus": consensus_results,
             }).execute()
 
-            await _run_dedup_and_rewards(rid, consensus_results)
+            winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results)
 
             supabase.table("fulfillment_requests").update({
                 "status": "fulfilled",
             }).eq("request_id", rid).execute()
             print(f"   ✅ {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
 
-            # Print final ranked results
             ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
-            num_requested = r.get("icp_details", {}).get("num_leads", len(ranked)) if isinstance(r.get("icp_details"), dict) else len(ranked)
+            num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or len(ranked)
             print(f"\n{'='*60}")
             print(f"🏆 FULFILLMENT RESULTS — Request {rid[:8]}...")
             print(f"   {len(ranked)} leads scored, client requested {num_requested}")
@@ -311,11 +310,11 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 miner = cr.get("miner_hotkey", "?")[:16]
                 score = cr.get("consensus_final_score", 0)
                 t2 = "✅" if cr.get("consensus_tier2_passed") else "❌"
-                winner = "👑" if cr.get("is_winner") else "  "
+                is_winner = cr.get("lead_id") in winner_lead_ids
+                winner = "👑" if is_winner else "  "
                 lid = cr.get("lead_id", "?")[:8]
                 print(f"   {winner} #{i}: score={score:.1f} tier2={t2} miner={miner}... lead={lid}...")
-            winners = [c for c in ranked if c.get("is_winner")]
-            print(f"\n   Winners: {len(winners)}/{len(ranked)} leads")
+            print(f"\n   Winners: {len(winner_lead_ids)}/{len(ranked)} leads")
             print(f"{'='*60}\n")
 
         except Exception as e:
@@ -330,8 +329,8 @@ async def _lifecycle_tick_inner(supabase) -> None:
         print(f"❌ Reward expiry error: {e}")
 
 
-async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> None:
-    """Deduplicate across miners and assign rewards."""
+async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> set:
+    """Deduplicate across miners and assign rewards. Returns set of winner lead_ids."""
     from gateway.fulfillment.rewards import calculate_lead_rewards
     supabase = _get_supabase()
 
@@ -384,6 +383,8 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> No
 
     current_epoch = _get_current_epoch()
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
+
+    return {w["lead_id"] for w in winners}
 
 
 def _normalize_company(name: str) -> str:
