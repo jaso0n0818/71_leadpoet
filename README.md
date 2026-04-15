@@ -690,12 +690,6 @@ The commit hash is computed from the lead JSON using the schema defined in `Lead
 | Tier 2 | Email format, name-in-email, domain age, MX/SPF/DMARC, DNSBL, TrueList verification, LinkedIn person verification, company verification, reputation score | API calls |
 | Tier 3 | Each intent signal URL scraped, snippet overlap verified, LLM evaluates relevance, time decay applied, peak-weighted aggregation | LLM + scraping |
 
-**Common rejection reasons:**
-- `industry_mismatch` / `role_mismatch` / `seniority_mismatch` — Lead doesn't match the ICP
-- `truelist_inline_verification` — Email is `accept_all`, `invalid`, or `unknown` (only `email_ok` passes)
-- `lead_validation_stage4` — Person not found on LinkedIn, city mismatch, or role mismatch
-- `insufficient_intent` — Intent score below 5.0 (signals too weak, fabricated, or generic)
-
 ### Foundation Model
 
 A reference implementation is available at `miner_models/Main_fulfillment_model/`. This is a **foundation to build off of** — it demonstrates the full pipeline (company discovery, contact search, email verification, intent signal mining, self-correction) but is not production-ready. Competitive miners should build their own sourcing strategies.
