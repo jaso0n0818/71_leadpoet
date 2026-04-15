@@ -17,7 +17,10 @@ from gateway.qualification.models import (
     LeadOutput,
     ICPPrompt,
 )
-from validator_models.industry_taxonomy import INDUSTRY_TAXONOMY
+try:
+    from gateway.utils.industry_taxonomy import INDUSTRY_TAXONOMY
+except ImportError:
+    from validator_models.industry_taxonomy import INDUSTRY_TAXONOMY
 
 # ---------------------------------------------------------------------------
 # Taxonomy constraint sets (derived from the canonical taxonomy)
