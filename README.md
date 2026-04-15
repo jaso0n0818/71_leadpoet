@@ -598,6 +598,110 @@ python neurons/miner.py submit-model \
 
 ---
 
+## Fulfillment (Direct Client Requests)
+
+Fulfillment is a new incentive mechanism where miners compete directly on real client requests. Instead of sourcing leads into a general pool, miners respond to specific ICPs published as global tasks.
+
+### How It Works
+
+1. **Request Published** — A client submits a fulfillment request with a specific ICP (industry, roles, seniority, geography, intent signals). The request is published globally for all miners.
+
+2. **Commit Window (2 epochs, ~2.5 hours)** — Miners source leads matching the ICP, then submit **hashed lead data** (commit). This prevents other miners from copying your leads.
+
+3. **Reveal Window (2 minutes after commit closes)** — Miners reveal the actual lead data corresponding to their committed hashes. Hashes must match or the submission is rejected.
+
+4. **Validator Scoring** — Validators score every revealed lead through a three-tier pipeline:
+   - **Tier 1 (ICP Fit)** — Industry, sub-industry, role, seniority, employee count, country must match the request
+   - **Tier 2 (Data Accuracy)** — Email verification (TrueList), LinkedIn/person verification (ScrapingDog), company verification, reputation score
+   - **Tier 3 (Intent Scoring)** — Each intent signal URL is fetched and verified. An LLM evaluates relevance. Signals are scored and aggregated with time decay. Minimum threshold: 5.0
+
+5. **Winner Selection & Rewards** — Leads are ranked by score, deduplicated by company. The top `num_leads` (as requested by the client) are selected as winners. Each winning lead earns **0.1% of emission for 30 epochs**. Ties on the same company split the reward.
+
+### Fulfillment Lead Schema
+
+Miners must submit leads with this exact structure via the commit-reveal endpoints:
+
+```json
+{
+  "full_name": "Jane Smith",
+  "email": "jsmith@company.com",
+  "linkedin_url": "https://linkedin.com/in/janesmith",
+  "phone": "",
+
+  "business": "Company Inc",
+  "company_linkedin": "https://linkedin.com/company/company-inc",
+  "company_website": "https://company.com",
+  "employee_count": "501-1,000",
+
+  "company_hq_country": "United States",
+  "company_hq_state": "California",
+  "company_hq_city": "San Francisco",
+
+  "industry": "Software",
+  "sub_industry": "SaaS",
+
+  "country": "United States",
+  "city": "Austin",
+  "state": "Texas",
+
+  "role": "VP of Sales",
+  "role_type": "Sales",
+  "seniority": "VP",
+
+  "intent_signals": [
+    {
+      "source": "job_board",
+      "description": "Company Inc hiring Sales Development Representatives",
+      "url": "https://jobs.lever.co/company/abc123",
+      "date": null,
+      "snippet": "Sales Development Representative - Full Time. We are looking for driven SDRs to join our growing sales team."
+    }
+  ]
+}
+```
+
+**Key fields:**
+- `city`/`state`/`country` — The **contact's** location (from their LinkedIn profile), not the company HQ
+- `company_hq_city`/`company_hq_state`/`company_hq_country` — The **company's** headquarters location
+- `industry`/`sub_industry` — Must match values from `validator_models/industry_taxonomy.py`
+- `role_type` — One of: `Sales`, `Business Development`, `Marketing`, `Engineer/Technical`, `Operations`, `Finance`, `HR`, `Legal`, `Customer Success`, `Other`
+- `seniority` — One of: `C-Suite`, `VP`, `Director`, `Manager`, `Individual Contributor`
+- `intent_signals` — At least one signal required. Each signal needs `source`, `description`, `url`, `date` (ISO format or null), and `snippet` (verbatim text from the URL)
+
+**Intent signal sources:** `linkedin`, `job_board`, `company_website`, `news`, `social_media`, `github`, `review_site`, `wikipedia`, `other`
+
+### Commit-Reveal Flow
+
+```
+POST /fulfillment/commit
+  request_id, miner_hotkey, lead_hashes[], signature, nonce, timestamp
+
+POST /fulfillment/reveal
+  request_id, submission_id, miner_hotkey, leads[], signature, nonce, timestamp
+```
+
+The commit hash is computed from the lead JSON using the schema defined in `Leadpoet/utils/hashing.py`. Leads must be revealed within the reveal window or they are discarded.
+
+### Scoring Details
+
+| Stage | What's Checked | Cost |
+|-------|---------------|------|
+| Tier 1 | Industry, sub-industry, role, seniority, country, employee count, duplicate company | Free |
+| Tier 2 | Email format, name-in-email, domain age, MX/SPF/DMARC, DNSBL, TrueList verification, LinkedIn person verification, company verification, reputation score | API calls |
+| Tier 3 | Each intent signal URL scraped, snippet overlap verified, LLM evaluates relevance, time decay applied, peak-weighted aggregation | LLM + scraping |
+
+**Common rejection reasons:**
+- `industry_mismatch` / `role_mismatch` / `seniority_mismatch` — Lead doesn't match the ICP
+- `truelist_inline_verification` — Email is `accept_all`, `invalid`, or `unknown` (only `email_ok` passes)
+- `lead_validation_stage4` — Person not found on LinkedIn, city mismatch, or role mismatch
+- `insufficient_intent` — Intent score below 5.0 (signals too weak, fabricated, or generic)
+
+### Foundation Model
+
+A reference implementation is available at `miner_models/Main_fulfillment_model/`. This is a **foundation to build off of** — it demonstrates the full pipeline (company discovery, contact search, email verification, intent signal mining, self-correction) but is not production-ready. Competitive miners should build their own sourcing strategies.
+
+---
+
 ## For Validators
 
 ### Getting Started
