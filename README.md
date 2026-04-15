@@ -73,8 +73,8 @@ See [`env.example`](env.example) for complete configuration template.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/leadpoet/Leadpoet.git
-cd Leadpoet
+git clone https://github.com/leadpoet/leadpoet.git
+cd leadpoet
 
 # 2. Create virtual environment
 python3 -m venv venv
@@ -131,8 +131,8 @@ Miners must submit prospects with the following structure:
   "email": "satya@microsoft.com",          # REQUIRED
   "role": "CEO",                           # REQUIRED
   "website": "https://microsoft.com",      # REQUIRED
-  "industry": "Technology",                # REQUIRED - must be from industry_taxonomy.py
-  "sub_industry": "Software",              # REQUIRED - must be from industry_taxonomy.py
+  "industry": "Software",                  # REQUIRED - must be from industry_taxonomy.py
+  "sub_industry": "Enterprise Software",   # REQUIRED - must be from industry_taxonomy.py
   "country": "United States",              # REQUIRED - see Country Format below
   "state": "Washington",                   # REQUIRED for US leads only
   "city": "Redmond",                       # REQUIRED for all leads
@@ -588,13 +588,9 @@ Models that manipulate quality signals will be **banned** and the hotkey blackli
 # Package your model
 cd your_model_directory
 tar -czvf my_model.tar.gz .
-
-# Submit via miner
-python neurons/miner.py submit-model \
-    --model_path my_model.tar.gz \
-    --wallet_name miner \
-    --wallet_hotkey default
 ```
+
+Model submission is handled through the gateway API. See the miner code for the submission flow.
 
 ---
 
@@ -616,6 +612,34 @@ Fulfillment is a new incentive mechanism where miners compete directly on real c
    - **Tier 3 (Intent Scoring)** — Each intent signal URL is fetched and verified. An LLM evaluates relevance. Signals are scored and aggregated with time decay. Minimum threshold: 5.0
 
 5. **Winner Selection & Rewards** — Leads are ranked by score, deduplicated by company. The top `num_leads` (as requested by the client) are selected as winners. Each winning lead earns **0.1% of emission for 30 epochs**. Ties on the same company split the reward.
+
+### Fulfillment Request Schema (What Miners See)
+
+When a client submits a request, miners receive an ICP with this structure:
+
+```json
+{
+  "prompt": "VP of Sales and Heads of Revenue at Series A-C SaaS companies in the US showing signals of evaluating outbound sales tools, hiring SDRs, or researching competitors.",
+  "industry": "Software",
+  "sub_industry": "SaaS",
+  "target_role_types": ["Sales", "Business Development"],
+  "target_roles": ["VP of Sales", "Head of Revenue", "Director of Sales"],
+  "target_seniority": "VP",
+  "employee_count": "50-500",
+  "company_stage": "Series A",
+  "geography": "United States",
+  "country": "United States",
+  "product_service": "outbound sales automation platform",
+  "intent_signals": ["hiring SDRs", "evaluating sales tools", "researching competitors"],
+  "num_leads": 2
+}
+```
+
+- `prompt` — Natural language description of the ideal lead. Your model should interpret this.
+- `target_roles` — Exact role titles the client wants. Your lead's `role` must match one of these (fuzzy matching is applied, e.g. "VP, Corporate Sales" matches "VP of Sales").
+- `target_seniority` — Required seniority level.
+- `intent_signals` — The types of buying signals the client cares about. Find real evidence for these.
+- `num_leads` — How many winning leads the client wants. Only the top N by score earn rewards.
 
 ### Fulfillment Lead Schema
 
@@ -664,7 +688,7 @@ Miners must submit leads with this exact structure via the commit-reveal endpoin
 - `city`/`state`/`country` — The **contact's** location (from their LinkedIn profile), not the company HQ
 - `company_hq_city`/`company_hq_state`/`company_hq_country` — The **company's** headquarters location
 - `industry`/`sub_industry` — Must match values from `validator_models/industry_taxonomy.py`
-- `role_type` — One of: `Sales`, `Business Development`, `Marketing`, `Engineer/Technical`, `Operations`, `Finance`, `HR`, `Legal`, `Customer Success`, `Other`
+- `role_type` — One of: `C-Level Executive`, `VP`, `Director`, `Manager`, `Sales`, `Marketing`, `Engineering`, `Product`, `Operations`, `Finance`, `HR`, `Legal`, `IT`, `Customer Success`, `Business Development`, `Data & Analytics`, `Design`, `Research`, `Supply Chain`, `Consulting`, `Other`
 - `seniority` — One of: `C-Suite`, `VP`, `Director`, `Manager`, `Individual Contributor`
 - `intent_signals` — At least one signal required. Each signal needs `source`, `description`, `url`, `date` (ISO format or null), and `snippet` (verbatim text from the URL)
 
