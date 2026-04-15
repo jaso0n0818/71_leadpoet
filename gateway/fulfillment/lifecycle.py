@@ -293,7 +293,8 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 "p_consensus": consensus_results,
             }).execute()
 
-            winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results)
+            num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or len(consensus_results)
+            winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results, num_requested)
 
             supabase.table("fulfillment_requests").update({
                 "status": "fulfilled",
@@ -301,7 +302,6 @@ async def _lifecycle_tick_inner(supabase) -> None:
             print(f"   ✅ {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
 
             ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
-            num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or len(ranked)
             print(f"\n{'='*60}")
             print(f"🏆 FULFILLMENT RESULTS — Request {rid[:8]}...")
             print(f"   {len(ranked)} leads scored, client requested {num_requested}")
@@ -329,8 +329,12 @@ async def _lifecycle_tick_inner(supabase) -> None:
         print(f"❌ Reward expiry error: {e}")
 
 
-async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> set:
-    """Deduplicate across miners and assign rewards. Returns set of winner lead_ids."""
+async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_leads: int = 0) -> set:
+    """Deduplicate across miners and assign rewards. Returns set of winner lead_ids.
+
+    Only the top ``num_leads`` deduped leads earn rewards.  If num_leads
+    is 0 or not provided, all deduped leads are rewarded (backwards compat).
+    """
     from gateway.fulfillment.rewards import calculate_lead_rewards
     supabase = _get_supabase()
 
@@ -365,7 +369,7 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> se
             groups[dedup_key] = []
         groups[dedup_key].append(r)
 
-    winners = []
+    deduped = []
     for dedup_key, candidates in groups.items():
         candidates.sort(key=lambda x: (
             -x["consensus_final_score"],
@@ -379,7 +383,14 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list) -> se
                 and c.get("consensus_intent_signal_final", 0) == best_raw]
 
         for c in tied:
-            winners.append({**c, "tie_count": len(tied)})
+            deduped.append({**c, "tie_count": len(tied)})
+
+    deduped.sort(key=lambda x: (
+        -x["consensus_final_score"],
+        -x.get("consensus_intent_signal_final", 0),
+    ))
+
+    winners = deduped[:num_leads] if num_leads > 0 else deduped
 
     current_epoch = _get_current_epoch()
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
