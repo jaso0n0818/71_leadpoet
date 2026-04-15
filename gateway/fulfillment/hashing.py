@@ -1,10 +1,58 @@
-"""Re-exports from Leadpoet.utils.hashing for gateway-internal convenience."""
+"""
+Hashing utilities for the lead fulfillment commit-reveal scheme.
 
-from Leadpoet.utils.hashing import (  # noqa: F401
-    HASH_SCHEMA_VERSION,
-    canonical_json,
-    hash_data,
-    hash_lead,
-    hash_request,
-    verify_commit,
-)
+Inlined from Leadpoet/utils/hashing.py so the gateway doesn't depend
+on the Leadpoet package (which isn't installed on the gateway server).
+"""
+
+import json
+import hashlib
+
+HASH_SCHEMA_VERSION = 1
+
+_JSON_NATIVE_TYPES = (str, int, float, bool, type(None), list, dict)
+
+
+def canonical_json(obj: dict) -> str:
+    """Deterministic JSON serialization with sorted keys and no whitespace."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _check_json_native(obj, path: str = "root") -> None:
+    """Raise TypeError if any value in the nested structure is not JSON-native."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _check_json_native(v, path=f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _check_json_native(v, path=f"{path}[{i}]")
+    elif not isinstance(obj, _JSON_NATIVE_TYPES):
+        raise TypeError(
+            f"Non-JSON-native type at {path}: {type(obj).__name__} = {obj!r}. "
+            "Call model_dump(mode='json') before hashing."
+        )
+
+
+def hash_data(data: str) -> str:
+    """SHA-256 hex digest of a string."""
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def hash_lead(lead_data: dict, schema_version: int = HASH_SCHEMA_VERSION) -> str:
+    """Hash a complete lead dict (including PII) for commit-reveal binding."""
+    _check_json_native(lead_data)
+    return hash_data(f"v{schema_version}:" + canonical_json(lead_data))
+
+
+def hash_request(icp_details: dict) -> str:
+    """Hash ICP request details for transparency logging."""
+    return hash_data(canonical_json(icp_details))
+
+
+def verify_commit(
+    committed_hash: str,
+    lead_data: dict,
+    schema_version: int = HASH_SCHEMA_VERSION,
+) -> bool:
+    """Check whether ``lead_data`` matches the previously committed hash."""
+    return hash_lead(lead_data, schema_version) == committed_hash
