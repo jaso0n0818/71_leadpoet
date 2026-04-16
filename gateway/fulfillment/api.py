@@ -387,18 +387,26 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
         ))
 
     lead_data_list = []
+    mismatched = []
     for i, lead in enumerate(reveal.leads):
         lead_dict = lead.model_dump(mode="json")
         committed_hash = committed_hashes[i]["hash"]
         if not verify_commit(committed_hash, lead_dict):
-            raise HTTPException(
-                400,
-                detail=f"Hash mismatch for lead index {i} (lead_id={committed_hashes[i]['lead_id']})"
-            )
+            mismatched.append({
+                "index": i,
+                "lead_id": committed_hashes[i]["lead_id"],
+            })
+            continue
         lead_data_list.append({
             "lead_id": committed_hashes[i]["lead_id"],
             "data": lead_dict,
         })
+
+    if not lead_data_list:
+        raise HTTPException(
+            400,
+            detail=f"All {len(reveal.leads)} lead(s) failed hash verification",
+        )
 
     supabase.table("fulfillment_submissions").update({
         "revealed": True,
@@ -408,15 +416,21 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
 
     print(f"✅ REVEAL stored: request={reveal.request_id[:8]}... "
           f"sub={reveal.submission_id[:8]}... miner={reveal.miner_hotkey[:8]}... "
-          f"leads={len(lead_data_list)} revealed=True")
+          f"leads={len(lead_data_list)}/{len(reveal.leads)} revealed=True"
+          + (f" (dropped {len(mismatched)} mismatched)" if mismatched else ""))
 
     _log_event(EventType.FULFILLMENT_REVEAL, {
         "request_id": reveal.request_id,
         "miner_hotkey": reveal.miner_hotkey,
         "reveal_timestamp": now.isoformat(),
+        "mismatched_indices": [m["index"] for m in mismatched],
     })
 
-    return {"status": "revealed", "num_leads": len(lead_data_list)}
+    return {
+        "status": "revealed",
+        "num_leads": len(lead_data_list),
+        "mismatched": mismatched,
+    }
 
 
 # ---------------------------------------------------------------
