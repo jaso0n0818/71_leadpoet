@@ -370,7 +370,8 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
             groups[dedup_key] = []
         groups[dedup_key].append(r)
 
-    deduped = []
+    # Pick the best candidate(s) per dedup group (tied miners on same lead)
+    group_results = []  # list of (best_score, best_raw, tied_candidates)
     for dedup_key, candidates in groups.items():
         candidates.sort(key=lambda x: (
             -x["consensus_final_score"],
@@ -382,16 +383,17 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
         tied = [c for c in candidates
                 if c["consensus_final_score"] == best_score
                 and c.get("consensus_intent_signal_final", 0) == best_raw]
+        group_results.append((best_score, best_raw, tied))
 
+    # Rank unique leads by score, take top num_leads (respect uniqueness, not row count)
+    group_results.sort(key=lambda g: (-g[0], -g[1]))
+    top_groups = group_results[:num_leads] if num_leads > 0 else group_results
+
+    # Flatten to winners; tie_count reflects only tied miners SELECTED (not dropped)
+    winners = []
+    for _, _, tied in top_groups:
         for c in tied:
-            deduped.append({**c, "tie_count": len(tied)})
-
-    deduped.sort(key=lambda x: (
-        -x["consensus_final_score"],
-        -x.get("consensus_intent_signal_final", 0),
-    ))
-
-    winners = deduped[:num_leads] if num_leads > 0 else deduped
+            winners.append({**c, "tie_count": len(tied)})
 
     current_epoch = _get_current_epoch()
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
