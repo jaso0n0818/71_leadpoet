@@ -12,6 +12,7 @@ from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 from typing import List
 
+from dateutil.parser import isoparse as _isoparse
 from fastapi import APIRouter, HTTPException
 
 from gateway.fulfillment.config import T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES, FULFILLMENT_BANS_ENABLED, epochs_to_seconds
@@ -248,7 +249,7 @@ async def commit_leads(commit: FulfillmentCommitRequest):
         raise HTTPException(400, detail=f"Window not open (status={req['status']})")
 
     now = datetime.now(timezone.utc)
-    if now > datetime.fromisoformat(req["window_end"]):
+    if now > _isoparse(req["window_end"]):
         raise HTTPException(400, detail="Commit window expired")
 
     num_leads_max = req["num_leads"]
@@ -371,8 +372,8 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
 
     req = req_resp.data[0]
     now = datetime.now(timezone.utc)
-    window_end_dt = datetime.fromisoformat(req["window_end"])
-    reveal_end_dt = datetime.fromisoformat(req["reveal_window_end"])
+    window_end_dt = _isoparse(req["window_end"])
+    reveal_end_dt = _isoparse(req["reveal_window_end"])
 
     if now < window_end_dt:
         raise HTTPException(400, detail="Commit window still open — cannot reveal yet")

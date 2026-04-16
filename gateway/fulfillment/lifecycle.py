@@ -9,6 +9,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
+from dateutil.parser import isoparse as _isoparse
 
 from gateway.fulfillment.config import (
     FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS,
@@ -254,7 +255,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 .execute()
             unique_validators = {s["validator_hotkey"] for s in (validator_count_resp.data or [])}
 
-            reveal_end = datetime.fromisoformat(r["reveal_window_end"])
+            reveal_end = _isoparse(r["reveal_window_end"])
             timeout = reveal_end + timedelta(minutes=FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES)
 
             if len(unique_validators) < FULFILLMENT_MIN_VALIDATORS and now < timeout:
