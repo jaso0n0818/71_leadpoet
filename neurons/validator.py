@@ -2901,27 +2901,22 @@ class Validator(BaseValidatorNeuron):
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _get_fulfillment_emission_share(
-        self, current_epoch: int, max_sourcing_share: float,
+        self, current_epoch: int, fulfillment_pool: float,
     ) -> tuple:
-        """Compute the fulfillment emission carve-out from the sourcing allocation.
+        """Compute fulfillment emission from active rewards, capped to the pool.
 
         Queries the gateway for active (unexpired) fulfillment rewards, sums them
-        per miner, and applies the FULFILLMENT_MAX_EMISSION_SHARE cap.  If the raw
-        total exceeds the cap, each miner's share is reduced pro-rata so the total
-        stays at the cap.
+        per miner, and caps the total to ``fulfillment_pool``.  If the raw total
+        exceeds the pool, each miner's share is reduced pro-rata.
 
         Args:
             current_epoch: the current Bittensor epoch number
-            max_sourcing_share: the sourcing pool size (0.9 with champion, 1.0 without)
+            fulfillment_pool: the fulfillment pool size (e.g. 0.50 for 50%)
 
         Returns:
             (effective_fulfillment_share, {hotkey: effective_pct})
             On any error returns (0.0, {}).
         """
-        FULFILLMENT_MAX_EMISSION_SHARE = float(
-            os.getenv("FULFILLMENT_MAX_EMISSION_SHARE", "0.50")
-        )
-
         try:
             from Leadpoet.utils.cloud_db import gateway_get_all_fulfillment_rewards
             per_miner = gateway_get_all_fulfillment_rewards(self.wallet, current_epoch)
@@ -2933,14 +2928,12 @@ class Validator(BaseValidatorNeuron):
             if raw_total <= 0:
                 return 0.0, {}
 
-            max_allowed = FULFILLMENT_MAX_EMISSION_SHARE * max_sourcing_share
-
-            if raw_total <= max_allowed:
+            if raw_total <= fulfillment_pool:
                 return raw_total, dict(per_miner)
 
-            scale_factor = max_allowed / raw_total
+            scale_factor = fulfillment_pool / raw_total
             scaled = {hk: pct * scale_factor for hk, pct in per_miner.items()}
-            return max_allowed, scaled
+            return fulfillment_pool, scaled
 
         except Exception as e:
             bt.logging.warning(f"Fulfillment emission share error (safe fallback): {e}")
@@ -3009,10 +3002,11 @@ class Validator(BaseValidatorNeuron):
             # ═══════════════════════════════════════════════════════════════════
             # Allocation shares (dynamic based on champion status)
             BASE_BURN_SHARE = 0.0          # 0% base burn to UID 0
-            CHAMPION_SHARE = 0.10          # 10% to qualification model champion (when active)
+            CHAMPION_SHARE = 0.05          # 5% to qualification model champion (when active)
+            FULFILLMENT_POOL_SHARE = 0.50  # 50% reserved for fulfillment (when enabled)
             # MAX_SOURCING_SHARE is computed dynamically:
-            #   No champion → 100% to sourcing miners
-            #   Active champion → 90% to sourcing, 10% to champion
+            #   No champion, no fulfillment → 100% to sourcing miners
+            #   Both active → 45% sourcing, 5% champion, 50% fulfillment pool
             
             # CONFIGURABLE THRESHOLD: Approved leads needed in 30 epochs for full sourcing share
             # If network produces >= this many leads, full share is distributed
@@ -3147,9 +3141,10 @@ class Validator(BaseValidatorNeuron):
             except Exception as e:
                 print(f"   ⚠️  Error reading champion: {e} - 100% to sourcing miners")
             
-            # Dynamic sourcing share: 100% if no champion, 90% if champion active
-            MAX_SOURCING_SHARE = 1.0 - CHAMPION_SHARE if champion_active else 1.0
-            print(f"\n   📊 SPLIT: Sourcing={MAX_SOURCING_SHARE*100:.0f}%, Champion={effective_champion_share*100:.0f}%")
+            ff_enabled = os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true"
+            MAX_SOURCING_SHARE = 1.0 - (CHAMPION_SHARE if champion_active else 0.0) - (FULFILLMENT_POOL_SHARE if ff_enabled else 0.0)
+            effective_fulfillment_pool = FULFILLMENT_POOL_SHARE if ff_enabled else 0.0
+            print(f"\n   📊 SPLIT: Sourcing={MAX_SOURCING_SHARE*100:.0f}%, Champion={effective_champion_share*100:.0f}%, Fulfillment={effective_fulfillment_pool*100:.0f}%")
             print()
             
             # ═══════════════════════════════════════════════════════════════════
@@ -3234,38 +3229,39 @@ class Validator(BaseValidatorNeuron):
             effective_sourcing_to_miners = effective_sourcing_share - dereg_burn
             
             # ════════════════════════════════════════════════════════════════
-            # FULFILLMENT EMISSION CARVE-OUT (Phase 2)
-            # Carved from the sourcing allocation, NOT additive.
-            # Champion's 10% is never touched.
-            # On any error, fulfillment_share stays 0 — sourcing keeps full allocation.
+            # FULFILLMENT POOL (first-class allocation, not carved from sourcing)
+            # Has its own 50% pool. Unused portion goes to burn.
+            # On any error, fulfillment_share stays 0 — full pool goes to burn.
             # ════════════════════════════════════════════════════════════════
             fulfillment_share = 0.0
             fulfillment_per_miner = {}
+            unused_fulfillment = 0.0
             try:
-                if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+                if ff_enabled:
                     fulfillment_share, fulfillment_per_miner = self._get_fulfillment_emission_share(
-                        current_epoch, MAX_SOURCING_SHARE,
+                        current_epoch, effective_fulfillment_pool,
                     )
+                    unused_fulfillment = effective_fulfillment_pool - fulfillment_share
                     if fulfillment_share > 0:
-                        effective_sourcing_to_miners -= fulfillment_share
-                        ff_cap = float(os.getenv("FULFILLMENT_MAX_EMISSION_SHARE", "0.50"))
-                        ff_max = ff_cap * MAX_SOURCING_SHARE
-                        print(f"      Fulfillment carve-out: {fulfillment_share*100:.4f}% "
-                              f"(cap {ff_max*100:.1f}%, {len(fulfillment_per_miner)} miners)")
+                        print(f"      Fulfillment active: {fulfillment_share*100:.4f}% used of {effective_fulfillment_pool*100:.0f}% pool "
+                              f"({len(fulfillment_per_miner)} miners)")
+                    if unused_fulfillment > 0:
+                        print(f"      Fulfillment unused: {unused_fulfillment*100:.2f}% → burn")
             except Exception as e:
                 fulfillment_share = 0.0
                 fulfillment_per_miner = {}
-                print(f"      Fulfillment emission error (safe fallback — 0% carved): {e}")
+                unused_fulfillment = effective_fulfillment_pool
+                print(f"      Fulfillment emission error (safe fallback — full pool to burn): {e}")
             
             # Calculate total burn share
-            # When no champion: MAX_SOURCING_SHARE=100%, so burn = only threshold shortfall + dereg
-            # When champion active: MAX_SOURCING_SHARE=90%, champion gets 10%, burn = shortfall + dereg
+            # Includes: threshold shortfall + deregistered miners + unused fulfillment pool
             unused_sourcing_share = MAX_SOURCING_SHARE - effective_sourcing_share
-            total_burn_share = BASE_BURN_SHARE + unused_sourcing_share + dereg_burn
+            total_burn_share = BASE_BURN_SHARE + unused_sourcing_share + dereg_burn + unused_fulfillment
             
             print()
             print(f"   📊 WEIGHT DISTRIBUTION:")
             print(f"      Unused sourcing:      {unused_sourcing_share*100:.2f}% (threshold shortfall)")
+            print(f"      Unused fulfillment:   {unused_fulfillment*100:.2f}%")
             print(f"      Deregistered miners:  {dereg_burn*100:.2f}%")
             print(f"      ─────────────────────────────")
             print(f"      Total burn → UID 0:   {total_burn_share*100:.2f}%")
