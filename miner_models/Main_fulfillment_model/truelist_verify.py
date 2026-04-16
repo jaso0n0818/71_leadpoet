@@ -141,7 +141,7 @@ def verify_emails_batch(emails: List[str]) -> Dict[str, dict]:
 
     payload = {
         "data": [[e] for e in valid_emails],
-        "validation_strategy": "fast",
+        "validation_strategy": "accurate",
         "name": unique_name,
     }
 
