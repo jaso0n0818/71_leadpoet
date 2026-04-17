@@ -361,10 +361,13 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
         if not lead_info:
             continue
 
+        # Cross-miner dedup: one lead per company in the final ranking.
+        # Different contacts at the same company from different miners collapse
+        # into one group; the highest-scoring contact wins and the rest drop.
         company = _normalize_company(lead_info.get("business", ""))
-        email = (lead_info.get("email", "") or "").lower().strip()
-        name = (lead_info.get("full_name", "") or "").lower().strip()
-        dedup_key = (company, email) if email else (company, name)
+        if not company:
+            continue
+        dedup_key = company
 
         if dedup_key not in groups:
             groups[dedup_key] = []
