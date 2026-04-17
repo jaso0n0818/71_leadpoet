@@ -450,20 +450,26 @@ def _normalize_company(name: str) -> str:
 
 
 def _get_current_epoch() -> int:
-    """Best-effort epoch computation from metagraph data."""
+    """Return the current Bittensor epoch ID.
+
+    Uses the gateway's canonical epoch helper, which derives the epoch from
+    the live chain block. The previous implementation queried a
+    ``subnet_state`` table that does not exist in the Supabase schema, so
+    it always silently returned 0 — which made every freshly-awarded
+    ``reward_expires_epoch`` equal to ``L_EPOCHS`` (e.g. 30) instead of
+    ``current_epoch + L_EPOCHS`` (e.g. 22227). That caused every winning
+    fulfillment lead to be treated as already-expired and never earn
+    emission.
+    """
     try:
-        supabase = _get_supabase()
-        resp = supabase.table("subnet_state") \
-            .select("current_block, tempo") \
-            .limit(1) \
-            .execute()
-        if resp.data:
-            block = int(resp.data[0].get("current_block", 0))
-            tempo = int(resp.data[0].get("tempo", 360))
-            return block // (tempo + 1)
-    except Exception:
-        pass
-    return 0
+        from gateway.utils.epoch import get_current_epoch_id
+        return int(get_current_epoch_id())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"_get_current_epoch() fell back to 0: {e}"
+        )
+        return 0
 
 
 def _expire_rewards(supabase) -> None:
