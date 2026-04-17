@@ -3141,9 +3141,12 @@ class Validator(BaseValidatorNeuron):
             except Exception as e:
                 print(f"   ⚠️  Error reading champion: {e} - 100% to sourcing miners")
             
+            # Fulfillment pool is ALWAYS reserved (50%). If fulfillment is disabled
+            # on this validator, or no miners earned rewards this epoch, the unused
+            # portion flows to burn — it does NOT redistribute back to sourcing.
             ff_enabled = os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true"
-            MAX_SOURCING_SHARE = 1.0 - (CHAMPION_SHARE if champion_active else 0.0) - (FULFILLMENT_POOL_SHARE if ff_enabled else 0.0)
-            effective_fulfillment_pool = FULFILLMENT_POOL_SHARE if ff_enabled else 0.0
+            MAX_SOURCING_SHARE = 1.0 - (CHAMPION_SHARE if champion_active else 0.0) - FULFILLMENT_POOL_SHARE
+            effective_fulfillment_pool = FULFILLMENT_POOL_SHARE
             print(f"\n   📊 SPLIT: Sourcing={MAX_SOURCING_SHARE*100:.0f}%, Champion={effective_champion_share*100:.0f}%, Fulfillment={effective_fulfillment_pool*100:.0f}%")
             print()
             
