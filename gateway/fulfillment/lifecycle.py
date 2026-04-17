@@ -407,6 +407,28 @@ def _recycle_request(
     new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
 
     try:
+        # Claim the predecessor FIRST with a guarded UPDATE: only proceed if the
+        # predecessor doesn't already have a successor. This is idempotent and
+        # race-free — if two lifecycle ticks try to recycle the same request,
+        # only one succeeds in claiming it; the other sees zero affected rows
+        # and exits without creating an orphan successor.
+        #
+        # The previous implementation did INSERT-then-UPDATE without a guard,
+        # which under concurrent ticks produced orphan successor rows (both
+        # ticks would INSERT, only the last UPDATE would win, leaving the
+        # first successor with no predecessor pointing to it).
+        claim = supabase.table("fulfillment_requests").update({
+            "status": terminal_status,
+            "successor_request_id": new_id,
+        }).eq("request_id", rid) \
+          .is_("successor_request_id", "null") \
+          .execute()
+
+        if not claim.data:
+            # Another tick already recycled this request — do nothing.
+            return
+
+        # We own the backlink; safe to insert the successor.
         supabase.table("fulfillment_requests").insert({
             "request_id": new_id,
             "request_hash": "",
@@ -418,11 +440,6 @@ def _recycle_request(
             "status": "open",
             "created_by": "recycled",
         }).execute()
-
-        supabase.table("fulfillment_requests").update({
-            "status": terminal_status,
-            "successor_request_id": new_id,
-        }).eq("request_id", rid).execute()
 
         _log_event(EventType.FULFILLMENT_RECYCLED, {
             "old_request_id": rid,
