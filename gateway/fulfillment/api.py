@@ -27,6 +27,7 @@ from gateway.fulfillment.models import (
 )
 from gateway.models.events import EventType
 from gateway.utils.bans import is_hotkey_banned, ban_hotkey
+from gateway.utils.registry import is_registered_hotkey_async
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,38 @@ def _log_event(event_type: EventType, payload: dict) -> None:
         }).execute()
     except Exception as e:
         logger.warning(f"Failed to log {event_type.value}: {e}")
+
+
+async def _verify_validator_request(
+    event_type: str, validator_hotkey: str,
+    signature: str, nonce: str, timestamp: int,
+    request_id: str = "",
+) -> None:
+    """Verify a validator's signature + confirm they are a registered validator.
+
+    Raises HTTPException(403) on signature failure, unregistered hotkey, or
+    non-validator role.  For request-scoped events, ``request_id`` binds the
+    signature to a specific request; for global events (e.g. /scoring polling
+    all requests), pass an empty string.
+    """
+    _verify_fulfillment_signature(
+        event_type, validator_hotkey, request_id,
+        signature, nonce, timestamp,
+    )
+
+    import asyncio
+    try:
+        is_registered, role = await asyncio.wait_for(
+            is_registered_hotkey_async(validator_hotkey),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Metagraph query timeout — retry")
+
+    if not is_registered:
+        raise HTTPException(403, detail="Hotkey not registered on subnet")
+    if role != "validator":
+        raise HTTPException(403, detail="Only validators can call this endpoint")
 
 
 def _verify_fulfillment_signature(
@@ -437,9 +470,20 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
 # GET /fulfillment/scoring  — validators fetch revealed leads for scoring
 # ---------------------------------------------------------------
 @fulfillment_router.get("/scoring")
-async def get_scoring_requests(validator_hotkey: str = ""):
+async def get_scoring_requests(
+    validator_hotkey: str,
+    signature: str,
+    nonce: str,
+    timestamp: int,
+):
     if not _enable_fulfillment():
         raise HTTPException(503, detail="Fulfillment system is not enabled")
+
+    await _verify_validator_request(
+        "FULFILLMENT_SCORING", validator_hotkey,
+        signature, nonce, timestamp,
+        request_id="",
+    )
 
     supabase = _get_supabase()
 
@@ -505,10 +549,19 @@ async def get_scoring_requests(validator_hotkey: str = ""):
 async def submit_scores(
     request_id: str,
     validator_hotkey: str,
+    signature: str,
+    nonce: str,
+    timestamp: int,
     scores: List[dict],
 ):
     if not _enable_fulfillment():
         raise HTTPException(503, detail="Fulfillment system is not enabled")
+
+    await _verify_validator_request(
+        "FULFILLMENT_SCORE", validator_hotkey,
+        signature, nonce, timestamp,
+        request_id=request_id,
+    )
 
     supabase = _get_supabase()
 

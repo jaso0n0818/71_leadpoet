@@ -2523,14 +2523,32 @@ def gateway_reveal_fulfillment(
 # Lead Fulfillment System — Validator Functions
 # ═══════════════════════════════════════════════════════════════════
 
+def _sign_fulfillment_message(wallet: bt.wallet, msg: str) -> str:
+    """Ed25519-sign a fulfillment message, returning base64 string."""
+    return base64.b64encode(wallet.hotkey.sign(msg)).decode()
+
+
 def gateway_get_fulfillment_reveals(wallet: bt.wallet, request_id: str = None) -> dict:
     """Fetch revealed leads in scoring status, ready for scoring.
 
     Passes the validator's hotkey so the gateway excludes requests
     this validator has already scored (avoids redundant API costs).
     """
+    import uuid
     try:
-        params = {"validator_hotkey": wallet.hotkey.ss58_address}
+        hk = wallet.hotkey.ss58_address
+        nonce = str(uuid.uuid4())
+        ts = int(time.time())
+        # Global request (no request_id) — empty request_id segment in message
+        msg = f"FULFILLMENT_SCORING:{hk}::{nonce}:{ts}"
+        sig = _sign_fulfillment_message(wallet, msg)
+
+        params = {
+            "validator_hotkey": hk,
+            "signature": sig,
+            "nonce": nonce,
+            "timestamp": ts,
+        }
         response = requests.get(
             f"{GATEWAY_URL}/fulfillment/scoring",
             params=params,
@@ -2556,15 +2574,24 @@ def gateway_submit_fulfillment_scores(
     validator_hotkey: str = "",
 ) -> bool:
     """Submit fulfillment scores for a request (validator)."""
+    import uuid
     vhk = validator_hotkey or wallet.hotkey.ss58_address
 
     for attempt in range(1, 4):
         try:
+            nonce = str(uuid.uuid4())
+            ts = int(time.time())
+            msg = f"FULFILLMENT_SCORE:{vhk}:{request_id}:{nonce}:{ts}"
+            sig = _sign_fulfillment_message(wallet, msg)
+
             response = requests.post(
                 f"{GATEWAY_URL}/fulfillment/score",
                 params={
                     "request_id": request_id,
                     "validator_hotkey": vhk,
+                    "signature": sig,
+                    "nonce": nonce,
+                    "timestamp": ts,
                 },
                 json=scores,
                 timeout=30,
