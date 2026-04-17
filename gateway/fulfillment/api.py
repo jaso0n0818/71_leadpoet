@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException
 from gateway.fulfillment.config import (
     T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES,
     FULFILLMENT_BANS_ENABLED, FULFILLMENT_MAX_PARALLEL_REQUESTS,
+    FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES,
     epochs_to_seconds,
 )
 from gateway.fulfillment.hashing import HASH_SCHEMA_VERSION, hash_request, verify_commit
@@ -210,13 +211,22 @@ async def get_active_requests(miner_hotkey: str = ""):
 
     now = datetime.now(timezone.utc)
 
+    # Only surface requests with at least N minutes of commit window left,
+    # so a miner isn't handed a request they cannot realistically commit
+    # to before it expires. Requests that fall below this threshold are
+    # held back and will either be picked up by already-sourcing miners
+    # (who hold a local copy from earlier polls) or expire and recycle
+    # into a fresh successor with the full window.
+    min_remaining = timedelta(minutes=FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES)
+    cutoff = (now + min_remaining).isoformat()
+
     # FIFO: return up to FULFILLMENT_MAX_PARALLEL_REQUESTS oldest open requests.
     # Miners may work on any/all of them in parallel. Once a request is
     # fulfilled/recycled/expired, the next one in line becomes visible.
     resp = supabase.table("fulfillment_requests") \
         .select("*") \
         .eq("status", "open") \
-        .gt("window_end", now.isoformat()) \
+        .gt("window_end", cutoff) \
         .order("window_start", desc=False) \
         .limit(FULFILLMENT_MAX_PARALLEL_REQUESTS) \
         .execute()
