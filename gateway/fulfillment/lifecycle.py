@@ -204,38 +204,11 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 print(f"   ❌ Error transitioning {rid[:8]}... to scoring: {e}")
         else:
             print(f"   ⚠️  No reveals for {rid[:8]}... — recycling")
-            new_id = str(uuid4())
-            from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, epochs_to_seconds
-            tempo = _get_tempo(supabase)
-            new_window_end = now + timedelta(seconds=epochs_to_seconds(T_EPOCHS, tempo))
-            new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
-
-            try:
-                supabase.table("fulfillment_requests").insert({
-                    "request_id": new_id,
-                    "request_hash": "",
-                    "icp_details": r["icp_details"],
-                    "num_leads": r["num_leads"],
-                    "window_start": now_iso,
-                    "window_end": new_window_end.isoformat(),
-                    "reveal_window_end": new_reveal_end.isoformat(),
-                    "status": "open",
-                    "created_by": "recycled",
-                }).execute()
-
-                supabase.table("fulfillment_requests").update({
-                    "status": "recycled",
-                    "successor_request_id": new_id,
-                }).eq("request_id", rid).execute()
-
-                _log_event(EventType.FULFILLMENT_RECYCLED, {
-                    "old_request_id": rid,
-                    "new_request_id": new_id,
-                    "reason": "no_reveals",
-                })
-                print(f"   ♻️  {rid[:8]}... recycled -> {new_id[:8]}...")
-            except Exception as e:
-                print(f"   ❌ Error recycling {rid[:8]}...: {e}")
+            _recycle_request(
+                supabase, r, now, now_iso,
+                terminal_status="recycled",
+                reason="no_reveals",
+            )
 
     # Step 3: consensus aggregation for scoring requests
     scoring_requests = supabase.table("fulfillment_requests") \
@@ -266,11 +239,13 @@ async def _lifecycle_tick_inner(supabase) -> None:
             if len(unique_validators) == 0 and now >= timeout:
                 print(
                     f"   ⚠️  {rid[:8]}... has 0 validators after timeout — "
-                    f"moving to fulfilled (no winners)"
+                    f"expiring and recycling"
                 )
-                supabase.table("fulfillment_requests").update({
-                    "status": "fulfilled",
-                }).eq("request_id", rid).execute()
+                _recycle_request(
+                    supabase, r, now, now_iso,
+                    terminal_status="expired",
+                    reason="no_validators_timeout",
+                )
                 continue
 
             if len(unique_validators) < FULFILLMENT_MIN_VALIDATORS:
@@ -283,11 +258,13 @@ async def _lifecycle_tick_inner(supabase) -> None:
             if not consensus_results:
                 print(
                     f"   ⚠️  {rid[:8]}... produced empty consensus — "
-                    f"moving to fulfilled (no winners)"
+                    f"expiring and recycling"
                 )
-                supabase.table("fulfillment_requests").update({
-                    "status": "fulfilled",
-                }).eq("request_id", rid).execute()
+                _recycle_request(
+                    supabase, r, now, now_iso,
+                    terminal_status="expired",
+                    reason="empty_consensus",
+                )
                 continue
 
             supabase.rpc("fulfillment_upsert_consensus", {
@@ -402,6 +379,60 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
 
     return {w["lead_id"] for w in winners}
+
+
+def _recycle_request(
+    supabase,
+    original_request: dict,
+    now: datetime,
+    now_iso: str,
+    *,
+    terminal_status: str,
+    reason: str,
+) -> None:
+    """Create a successor request and mark the original as terminal.
+
+    Used when a request can't complete normally (no reveals, no validators,
+    empty consensus). The successor is a fresh ``open`` request with new
+    commit/reveal windows, added to the BACK of the FIFO queue via a new
+    ``window_start = now``.  The original is marked ``recycled`` (if nobody
+    responded) or ``expired`` (if validators failed to score) so dashboards
+    can distinguish why a request was recycled.
+    """
+    from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, epochs_to_seconds
+    rid = original_request["request_id"]
+    new_id = str(uuid4())
+    tempo = _get_tempo(supabase)
+    new_window_end = now + timedelta(seconds=epochs_to_seconds(T_EPOCHS, tempo))
+    new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
+
+    try:
+        supabase.table("fulfillment_requests").insert({
+            "request_id": new_id,
+            "request_hash": "",
+            "icp_details": original_request["icp_details"],
+            "num_leads": original_request["num_leads"],
+            "window_start": now_iso,
+            "window_end": new_window_end.isoformat(),
+            "reveal_window_end": new_reveal_end.isoformat(),
+            "status": "open",
+            "created_by": "recycled",
+        }).execute()
+
+        supabase.table("fulfillment_requests").update({
+            "status": terminal_status,
+            "successor_request_id": new_id,
+        }).eq("request_id", rid).execute()
+
+        _log_event(EventType.FULFILLMENT_RECYCLED, {
+            "old_request_id": rid,
+            "new_request_id": new_id,
+            "reason": reason,
+            "terminal_status": terminal_status,
+        })
+        print(f"   ♻️  {rid[:8]}... {terminal_status} -> {new_id[:8]}... (reason={reason})")
+    except Exception as e:
+        print(f"   ❌ Error recycling {rid[:8]}...: {e}")
 
 
 def _normalize_company(name: str) -> str:
