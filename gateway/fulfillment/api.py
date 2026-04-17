@@ -15,7 +15,11 @@ from typing import List
 from dateutil.parser import isoparse as _isoparse
 from fastapi import APIRouter, HTTPException
 
-from gateway.fulfillment.config import T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES, FULFILLMENT_BANS_ENABLED, epochs_to_seconds
+from gateway.fulfillment.config import (
+    T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES,
+    FULFILLMENT_BANS_ENABLED, FULFILLMENT_MAX_PARALLEL_REQUESTS,
+    epochs_to_seconds,
+)
 from gateway.fulfillment.hashing import HASH_SCHEMA_VERSION, hash_request, verify_commit
 from gateway.fulfillment.models import (
     FulfillmentICP,
@@ -206,14 +210,15 @@ async def get_active_requests(miner_hotkey: str = ""):
 
     now = datetime.now(timezone.utc)
 
-    # FIFO: only return the single oldest open request.
-    # Until it is fulfilled/recycled/closed, no other request is served.
+    # FIFO: return up to FULFILLMENT_MAX_PARALLEL_REQUESTS oldest open requests.
+    # Miners may work on any/all of them in parallel. Once a request is
+    # fulfilled/recycled/expired, the next one in line becomes visible.
     resp = supabase.table("fulfillment_requests") \
         .select("*") \
         .eq("status", "open") \
         .gt("window_end", now.isoformat()) \
         .order("window_start", desc=False) \
-        .limit(1) \
+        .limit(FULFILLMENT_MAX_PARALLEL_REQUESTS) \
         .execute()
 
     requests_out = []

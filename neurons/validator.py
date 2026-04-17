@@ -4041,62 +4041,71 @@ class Validator(BaseValidatorNeuron):
                                     if r.get("status") == "scoring" and r.get("submissions")]
 
                 if scoring_requests:
-                    req = scoring_requests[0]  # one request at a time
-                    request_id = req.get("request_id", "")
-                    icp_details = req.get("icp", {})
-                    submissions = req.get("submissions", [])
+                    # Option A parallelization: 1 request per worker container.
+                    # Each container scores ALL submissions for its assigned request
+                    # end-to-end. Up to num_workers (5) requests processed in parallel.
+                    requests_to_process = scoring_requests[:num_workers] if num_workers > 0 else scoring_requests[:1]
 
-                    print(f"\n🔍 Fulfillment: {len(submissions)} submission(s) for {request_id[:8]}...")
+                    print(f"\n🔍 Fulfillment: {len(requests_to_process)} request(s) ready for scoring "
+                          f"(of {len(scoring_requests)} total; max parallel = {max(num_workers, 1)})")
 
                     if num_workers > 0:
-                        # ── Container mode: distribute across workers ──
-                        worker_assignments = {i: [] for i in range(1, num_workers + 1)}
-                        for idx, sub in enumerate(submissions):
-                            worker_id = (idx % num_workers) + 1
-                            worker_assignments[worker_id].append(sub)
+                        # ── Container mode: 1 request per worker ──
+                        for req_idx, req in enumerate(requests_to_process):
+                            worker_id = req_idx + 1  # 1-indexed
+                            request_id = req.get("request_id", "")
+                            icp_details = req.get("icp", {})
+                            submissions = req.get("submissions", [])
 
-                        for worker_id, assigned_subs in worker_assignments.items():
-                            if not assigned_subs:
+                            if not submissions:
                                 continue
-                            work_file = weights_dir / f"fulfillment_worker_{worker_id}_work_{current_epoch}.json"
+
+                            # request_id is a UUID — safe for filenames
+                            work_file = weights_dir / f"fulfillment_worker_{worker_id}_work_{current_epoch}_{request_id}.json"
                             with open(work_file, 'w') as f:
                                 json.dump({
                                     "epoch": current_epoch,
                                     "request_id": request_id,
                                     "icp": icp_details,
-                                    "submissions": assigned_subs,
+                                    "submissions": submissions,
                                     "timestamp": time.time(),
                                 }, f, indent=2)
-                            print(f"   📝 Assigned {len(assigned_subs)} submission(s) to fulfillment worker {worker_id}")
+                            print(f"   📝 Worker {worker_id} → request {request_id[:8]} "
+                                  f"({len(submissions)} submission(s))")
 
                         self._ff_distributed_epochs.add(current_epoch)
-                        print(f"   ⏳ Work distributed to {num_workers} workers")
+                        print(f"   ⏳ Work distributed to {len(requests_to_process)} worker(s)")
                     else:
-                        # ── Inline mode (no containers) ──
+                        # ── Inline mode (no containers) — process sequentially ──
                         from qualification.scoring.fulfillment_scorer import (
                             score_miner_submission, format_scores_for_gateway,
                         )
                         from Leadpoet.utils.cloud_db import gateway_submit_fulfillment_scores
 
-                        for sub in submissions:
-                            miner_hk = sub.get("miner_hotkey", "")
-                            sub_id = sub.get("submission_id", "")
-                            leads_raw = sub.get("leads", [])
-                            lead_ids = sub.get("lead_ids", [])
-                            if not leads_raw:
-                                continue
-                            try:
-                                results = await score_miner_submission(leads_raw, icp_details)
-                                scores_payload = format_scores_for_gateway(
-                                    miner_hk, lead_ids, results,
-                                    request_id=request_id, submission_id=sub_id,
-                                )
-                                gateway_submit_fulfillment_scores(
-                                    self.wallet, request_id, scores_payload,
-                                )
-                                print(f"   ✅ Inline: submitted {len(scores_payload)} scores for {miner_hk[:8]}...")
-                            except Exception as e:
-                                print(f"   ❌ Inline scoring failed for {miner_hk[:8]}: {e}")
+                        for req in requests_to_process:
+                            request_id = req.get("request_id", "")
+                            icp_details = req.get("icp", {})
+                            submissions = req.get("submissions", [])
+
+                            for sub in submissions:
+                                miner_hk = sub.get("miner_hotkey", "")
+                                sub_id = sub.get("submission_id", "")
+                                leads_raw = sub.get("leads", [])
+                                lead_ids = sub.get("lead_ids", [])
+                                if not leads_raw:
+                                    continue
+                                try:
+                                    results = await score_miner_submission(leads_raw, icp_details)
+                                    scores_payload = format_scores_for_gateway(
+                                        miner_hk, lead_ids, results,
+                                        request_id=request_id, submission_id=sub_id,
+                                    )
+                                    gateway_submit_fulfillment_scores(
+                                        self.wallet, request_id, scores_payload,
+                                    )
+                                    print(f"   ✅ Inline: submitted {len(scores_payload)} scores for {miner_hk[:8]}...")
+                                except Exception as e:
+                                    print(f"   ❌ Inline scoring failed for {miner_hk[:8]}: {e}")
 
                         self._ff_distributed_epochs.add(current_epoch)
                         self._ff_collected_epochs.add(current_epoch)
@@ -4120,26 +4129,20 @@ class Validator(BaseValidatorNeuron):
         if last_processed < current_epoch:
             return  # sourcing not done yet
 
-        # Check if any work was distributed
-        any_work = False
-        for wid in range(1, num_workers + 1):
-            if (weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json").exists():
-                any_work = True
-                break
-        if not any_work:
+        # Multi-request parallelization: each worker may have a
+        # per-request work file: fulfillment_worker_{wid}_work_{epoch}_{reqid}.json
+        work_pattern = f"fulfillment_worker_*_work_{current_epoch}_*.json"
+        all_work_files = list(weights_dir.glob(work_pattern))
+        if not all_work_files:
             return
 
-        # Check if ALL workers that have work also have results
-        all_done = True
-        for wid in range(1, num_workers + 1):
-            work_file = weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json"
-            results_file = weights_dir / f"fulfillment_worker_{wid}_results_{current_epoch}.json"
-            if work_file.exists() and not results_file.exists():
-                all_done = False
-                break
+        # A matching results file is the same name with "work" → "results".
+        def _results_path_for(work_file: Path) -> Path:
+            return work_file.parent / work_file.name.replace("_work_", "_results_", 1)
 
-        if not all_done:
-            return  # workers still scoring — try again next iteration
+        pending = [wf for wf in all_work_files if not _results_path_for(wf).exists()]
+        if pending:
+            return  # some workers still scoring — try again next iteration
 
         # ── All workers done — aggregate and submit to gateway ──
         try:
@@ -4148,13 +4151,20 @@ class Validator(BaseValidatorNeuron):
             from gateway.fulfillment.models import FulfillmentScoreResult
 
             print(f"\n{'='*60}")
-            print(f"📊 FULFILLMENT: Collecting worker results (epoch {current_epoch})")
+            print(f"📊 FULFILLMENT: Collecting worker results (epoch {current_epoch}, "
+                  f"{len(all_work_files)} request-worker pair(s))")
             print(f"{'='*60}")
 
-            for wid in range(1, num_workers + 1):
-                results_file = weights_dir / f"fulfillment_worker_{wid}_results_{current_epoch}.json"
+            for work_file in sorted(all_work_files):
+                results_file = _results_path_for(work_file)
                 if not results_file.exists():
                     continue
+
+                # Parse worker id from filename for logging
+                try:
+                    wid_token = work_file.name.split("_")[2]  # fulfillment_worker_{wid}_...
+                except Exception:
+                    wid_token = "?"
 
                 with open(results_file, 'r') as f:
                     worker_data = json.load(f)
@@ -4163,10 +4173,17 @@ class Validator(BaseValidatorNeuron):
                 submission_results = worker_data.get("submission_results", [])
 
                 if worker_data.get("error"):
-                    print(f"   ⚠️ Worker {wid} error: {worker_data['error']}")
+                    print(f"   ⚠️ Worker {wid_token} (req {request_id[:8]}) error: {worker_data['error']}")
+                    # Still clean up files to avoid replays
+                    try:
+                        os.remove(work_file)
+                        os.remove(results_file)
+                    except Exception:
+                        pass
                     continue
 
-                print(f"   Worker {wid}: {len(submission_results)} submission(s)")
+                print(f"   Worker {wid_token} → request {request_id[:8]}: "
+                      f"{len(submission_results)} submission(s)")
 
                 for sub_result in submission_results:
                     miner_hk = sub_result.get("miner_hotkey", "")
@@ -4194,9 +4211,7 @@ class Validator(BaseValidatorNeuron):
 
                 # Clean up files
                 try:
-                    work_file = weights_dir / f"fulfillment_worker_{wid}_work_{current_epoch}.json"
-                    if work_file.exists():
-                        os.remove(work_file)
+                    os.remove(work_file)
                     os.remove(results_file)
                 except Exception:
                     pass
@@ -8902,23 +8917,47 @@ def run_dedicated_fulfillment_worker(config):
                 return data['block'], data['epoch'], data['blocks_into_epoch']
 
         async def process_fulfillment_leads(self, current_epoch: int):
-            """Score fulfillment leads assigned to this worker."""
+            """Score fulfillment leads assigned to this worker.
+
+            Under parallel processing, the coordinator writes a per-request
+            work file named:
+                fulfillment_worker_{fid}_work_{epoch}_{request_id}.json
+
+            In the original (non-parallel) layout, the name was:
+                fulfillment_worker_{fid}_work_{epoch}.json
+            We still handle that form for backward compatibility.
+            """
             fid = self.config.neuron.fulfillment_container_id
             weights_dir = Path("validator_weights")
 
-            work_file = weights_dir / f"fulfillment_worker_{fid}_work_{current_epoch}.json"
-            results_file = weights_dir / f"fulfillment_worker_{fid}_results_{current_epoch}.json"
+            # Prefer the new per-request layout; fall back to legacy.
+            candidates = sorted(weights_dir.glob(
+                f"fulfillment_worker_{fid}_work_{current_epoch}_*.json"
+            ))
+            legacy = weights_dir / f"fulfillment_worker_{fid}_work_{current_epoch}.json"
+            if legacy.exists():
+                candidates.append(legacy)
 
-            if not work_file.exists():
+            # Filter out work files that already have a matching results file.
+            def _results_for(wf: Path) -> Path:
+                return wf.parent / wf.name.replace("_work_", "_results_", 1)
+
+            pending = [wf for wf in candidates if not _results_for(wf).exists()]
+            if not pending:
+                if candidates:
+                    self._completed_epochs.add(current_epoch)
                 return
-            if results_file.exists():
-                self._completed_epochs.add(current_epoch)
-                return
-            if current_epoch in self._completed_epochs:
-                return
+
+            # In Option A there is at most 1 request per worker per epoch,
+            # but handle >1 defensively just in case.
+            work_file = pending[0]
+            results_file = _results_for(work_file)
 
             print(f"\n{'='*70}")
             print(f"🎯 FULFILLMENT WORKER {fid}: Work found for epoch {current_epoch}")
+            print(f"   Work file: {work_file.name}")
+            if len(pending) > 1:
+                print(f"   ⚠️ {len(pending) - 1} additional pending work file(s) will be processed next iteration")
             print(f"{'='*70}")
 
             try:
