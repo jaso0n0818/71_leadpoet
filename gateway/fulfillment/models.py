@@ -165,6 +165,19 @@ class FulfillmentLead(BaseModel):
     industry: str
     sub_industry: str
 
+    # Company description (free-form, written by the miner).
+    # REQUIRED — this flows into the validator's Stage 5 classification
+    # pipeline (validator_models/stage5_verification.py::classify_company_industry),
+    # which performs a 3-stage check:
+    #   1. Compare miner description against scraped website/LinkedIn content
+    #      (INVALID → stage1_invalid_description → reject)
+    #   2. Embed the refined description
+    #   3. LLM ranks top-3 industry/sub_industry pairs
+    # If the description is missing or doesn't match the website, Stage 5
+    # rejects the lead BEFORE intent scoring runs, the same way sourcing
+    # rejects leads with bad descriptions.
+    description: str = Field(..., min_length=30)
+
     # Contact location
     country: str
     city: str

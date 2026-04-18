@@ -664,6 +664,8 @@ Miners must submit leads with this exact structure via the commit-reveal endpoin
   "industry": "Software",
   "sub_industry": "SaaS",
 
+  "description": "Company Inc is a cloud-based SaaS platform that helps mid-market sales teams automate outbound prospecting with AI-driven email sequencing, deal tracking, and conversation intelligence.",
+
   "country": "United States",
   "city": "Austin",
   "state": "Texas",
@@ -688,6 +690,7 @@ Miners must submit leads with this exact structure via the commit-reveal endpoin
 - `city`/`state`/`country` — The **contact's** location (from their LinkedIn profile), not the company HQ
 - `company_hq_city`/`company_hq_state`/`company_hq_country` — The **company's** headquarters location
 - `industry`/`sub_industry` — Must match values from `validator_models/industry_taxonomy.py`
+- `description` — **Required**, min 30 characters. A free-form company description written by the miner. Fed to the validator's Stage 5 3-stage classification pipeline (`validator_models/stage5_verification.py::classify_company_industry`): an LLM compares it against the scraped website/LinkedIn content; if the LLM decides the two don't describe the same business, the lead is rejected with `stage1_invalid_description` before intent scoring runs. Same mechanism used by the sourcing flow.
 - `role_type` — One of: `C-Level Executive`, `VP`, `Director`, `Manager`, `Sales`, `Marketing`, `Engineering`, `Product`, `Operations`, `Finance`, `HR`, `Legal`, `IT`, `Customer Success`, `Business Development`, `Data & Analytics`, `Design`, `Research`, `Supply Chain`, `Consulting`, `Other`
 - `seniority` — One of: `C-Suite`, `VP`, `Director`, `Manager`, `Individual Contributor`
 - `intent_signals` — At least one signal required. Each signal needs `source`, `description`, `url`, `date` (ISO format or null), and `snippet` (verbatim text from the URL)
