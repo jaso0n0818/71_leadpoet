@@ -161,10 +161,12 @@ async def create_request(icp: FulfillmentICP):
         commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
     window_end = now + timedelta(seconds=commit_seconds)
     reveal_window_end = window_end + timedelta(minutes=M_MINUTES)
+    # model_dump() excludes `internal_label` (Field(exclude=True)) so the
+    # label never lands in icp_details (which is what miners see).
     icp_dict = icp.model_dump(mode="json")
     req_hash = hash_request(icp_dict)
 
-    supabase.table("fulfillment_requests").insert({
+    row = {
         "request_id": request_id,
         "request_hash": req_hash,
         "icp_details": icp_dict,
@@ -174,7 +176,22 @@ async def create_request(icp: FulfillmentICP):
         "reveal_window_end": reveal_window_end.isoformat(),
         "status": "open",
         "created_by": "api",
-    }).execute()
+    }
+    # Only attach the label if the client actually sent one — this way the
+    # insert still works against older DBs that don't yet have the
+    # `internal_label` column (fall-through retry below).
+    if icp.internal_label:
+        row["internal_label"] = icp.internal_label
+    try:
+        supabase.table("fulfillment_requests").insert(row).execute()
+    except Exception as e:
+        # If the column doesn't exist yet, retry without it so request
+        # creation never hard-blocks on schema drift.
+        if "internal_label" in str(e) and "internal_label" in row:
+            row.pop("internal_label", None)
+            supabase.table("fulfillment_requests").insert(row).execute()
+        else:
+            raise
 
     _log_event(EventType.FULFILLMENT_REQUEST_CREATED, {
         "request_id": request_id,

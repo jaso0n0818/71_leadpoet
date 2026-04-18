@@ -67,6 +67,14 @@ class FulfillmentICP(BaseModel):
     window_end: Optional[str] = None
     reveal_window_end: Optional[str] = None
 
+    # Internal-only label for client identification in Supabase dashboards
+    # (e.g. "Edward Burrowes 1").  Persisted to the dedicated `internal_label`
+    # column on `fulfillment_requests`, NOT inside `icp_details`, so it is
+    # never returned by /fulfillment/requests/active and miners never see it.
+    # exclude=True makes model_dump() drop it, so it can't leak into the
+    # hash/jsonb by accident.
+    internal_label: str = Field(default="", exclude=True)
+
     @field_validator("industry")
     @classmethod
     def validate_industry(cls, v: str) -> str:
