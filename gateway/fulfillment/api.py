@@ -645,6 +645,11 @@ async def get_results(request_id: str):
             "consensus_person_verified": row.get("consensus_person_verified"),
             "consensus_company_verified": row.get("consensus_company_verified"),
             "consensus_rep_score": row.get("consensus_rep_score"),
+            # Client-facing enrichments.  Populated only for winners; others
+            # get null/empty but the keys are always present for a stable API
+            # shape.
+            "intent_signal_mapping": row.get("intent_signal_mapping") or [],
+            "intent_details": row.get("intent_details"),
         }
         leads.append(lead_row)
 

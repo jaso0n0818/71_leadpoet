@@ -340,6 +340,11 @@ async def score_fulfillment_lead(
     icp_criteria = None
     seen_domains: Set[str] = set()
     signal_results = []
+    # Per-signal breakdown surfaced up to the score result so the gateway can
+    # persist the miner-signal -> ICP-signal mapping alongside the aggregate
+    # intent score. One dict per input miner signal, same order.
+    signal_details: List[dict] = []
+    icp_intent_signals_list = list(icp_prompt.intent_signals or [])
 
     lead_label = f"{lead.full_name} @ {lead_output.business}"
     print(f"🔍 Tier 3 Intent Scoring: {lead_label} — {len(lead.intent_signals)} signal(s)")
@@ -353,17 +358,36 @@ async def score_fulfillment_lead(
         if domain in seen_domains:
             print(f"   ⏭️  Duplicate domain '{domain}' — skipping")
             signal_results.append({"after_decay": 0.0, "decay_mult": 1.0, "confidence": 0})
+            signal_details.append({
+                "url": signal.url,
+                "description": signal.description,
+                "snippet": signal.snippet,
+                "date": str(signal.date) if signal.date else None,
+                "source": source_str,
+                "raw_score": 0.0,
+                "after_decay_score": 0.0,
+                "decay_multiplier": 1.0,
+                "confidence": 0,
+                "date_status": "duplicate_domain",
+                "matched_icp_signal_idx": -1,
+                "matched_icp_signal": None,
+            })
             continue
         seen_domains.add(domain)
 
+        matched_idx = -1
         try:
-            score, confidence, date_status, content_found_date = await _score_single_intent_signal(
+            (
+                score, confidence, date_status,
+                content_found_date, matched_idx,
+            ) = await _score_single_intent_signal(
                 signal, icp_prompt, icp_criteria,
                 lead_output.business, lead_output.company_website,
                 api_key=api_key,
             )
             print(f"   📊 Raw score={score:.1f}, confidence={confidence}, "
-                  f"date_status={date_status}, content_date={content_found_date}")
+                  f"date_status={date_status}, content_date={content_found_date}, "
+                  f"matched_icp_idx={matched_idx}")
         except Exception as e:
             print(f"   ❌ Signal scoring error: {e}")
             score, confidence, date_status, content_found_date = 0.0, 0, "fabricated", None
@@ -377,6 +401,25 @@ async def score_fulfillment_lead(
             "after_decay": after_decay,
             "decay_mult": decay_mult,
             "confidence": confidence,
+        })
+        matched_str = (
+            icp_intent_signals_list[matched_idx]
+            if 0 <= matched_idx < len(icp_intent_signals_list)
+            else None
+        )
+        signal_details.append({
+            "url": signal.url,
+            "description": signal.description,
+            "snippet": signal.snippet,
+            "date": str(signal.date) if signal.date else None,
+            "source": source_str,
+            "raw_score": float(score),
+            "after_decay_score": float(after_decay),
+            "decay_multiplier": float(decay_mult),
+            "confidence": int(confidence),
+            "date_status": date_status,
+            "matched_icp_signal_idx": int(matched_idx),
+            "matched_icp_signal": matched_str,
         })
 
     after_decay_scores = [r["after_decay"] for r in signal_results]
@@ -401,6 +444,7 @@ async def score_fulfillment_lead(
         intent_signal_final=intent_signal_final,
         intent_decay_multiplier=_avg([r["decay_mult"] for r in signal_results]),
         all_fabricated=all_fabricated,
+        intent_signals_detail=signal_details,
     )
 
     if intent_signal_final < FULFILLMENT_MIN_INTENT_SCORE:

@@ -415,7 +415,70 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
     current_epoch = _get_current_epoch()
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
 
+    # Enrich each winner with the client-ready "Intent Details" paragraph.
+    # Runs ONCE per winner (not per validator) because this happens post-consensus
+    # on the gateway.  A Perplexity outage must NOT block reward payout, so each
+    # call is individually wrapped.
+    await _attach_intent_details_for_winners(supabase, request_id, winners)
+
     return {w["lead_id"] for w in winners}
+
+
+async def _attach_intent_details_for_winners(
+    supabase,
+    request_id: str,
+    winners: list,
+) -> None:
+    """Generate + persist the Intent Details passage for each winning lead.
+
+    Uses the consensus row's ``intent_signal_mapping`` as the source of
+    verified signals and the request's ``icp_details`` as the ICP context.
+    Writes the generated paragraph back to
+    ``fulfillment_score_consensus.intent_details``.
+    """
+    if not winners:
+        return
+
+    try:
+        from gateway.fulfillment.intent_details import generate_intent_details_passage
+    except Exception as e:
+        print(f"   ⚠️  intent_details module unavailable, skipping: {e}")
+        return
+
+    # Fetch the ICP once — it's the same for every winner in this request.
+    try:
+        req_resp = supabase.table("fulfillment_requests") \
+            .select("icp_details") \
+            .eq("request_id", request_id) \
+            .execute()
+        icp = (req_resp.data or [{}])[0].get("icp_details") or {}
+    except Exception as e:
+        print(f"   ⚠️  Could not load ICP for intent_details: {e}")
+        icp = {}
+
+    for w in winners:
+        lead_id = w.get("lead_id")
+        submission_id = w.get("submission_id")
+        signals = w.get("intent_signal_mapping") or []
+        try:
+            passage = await generate_intent_details_passage(icp, signals)
+        except Exception as e:
+            print(f"   ⚠️  intent_details LLM call raised for {str(lead_id)[:8]}: {e}")
+            passage = ""
+
+        if not passage:
+            continue
+
+        try:
+            supabase.table("fulfillment_score_consensus").update({
+                "intent_details": passage,
+            }).eq("request_id", request_id) \
+              .eq("submission_id", submission_id) \
+              .eq("lead_id", lead_id) \
+              .execute()
+            print(f"   📝 Intent details stored for lead {str(lead_id)[:8]} ({len(passage)} chars)")
+        except Exception as e:
+            print(f"   ⚠️  Failed to persist intent_details for {str(lead_id)[:8]}: {e}")
 
 
 def _recycle_request(

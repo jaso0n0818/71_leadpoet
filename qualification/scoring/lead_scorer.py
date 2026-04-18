@@ -540,7 +540,11 @@ async def score_intent_signal(lead: LeadOutput, icp: ICPPrompt, api_key: str = "
             continue
         seen_domains.add(domain)
 
-        score, confidence, date_status, content_found_date = await _score_single_intent_signal(
+        # 5th tuple element is matched_icp_signal_idx; we don't thread it up
+        # through score_intent_signal (legacy sourcing callers don't need it),
+        # but it IS consumed by the fulfillment scorer which calls
+        # _score_single_intent_signal directly — see gateway/fulfillment/scoring.py.
+        score, confidence, date_status, content_found_date, _matched_idx = await _score_single_intent_signal(
             signal, icp, icp_criteria, lead.business, lead.company_website, api_key=api_key
         )
         source_str = (signal.source.value if hasattr(signal.source, 'value') else str(signal.source))
@@ -598,6 +602,45 @@ MAX_INTENT_NO_DATE_REQUIRED = 18   # Cap for undated signals where date IS requi
 MAX_INTENT_NO_DATE_UNKNOWN = 48   # Cap for undated signals from unrecognized source types
 MAX_INTENT_NO_DATE_OPTIONAL = 60  # Full score for undated signals where date is NOT required
 
+def _parse_intent_score_response(
+    response: str,
+    max_score: int,
+    num_icp_signals: int,
+) -> Tuple[float, int]:
+    """Parse the LLM response into ``(raw_score, matched_icp_signal_idx)``.
+
+    Prefers strict JSON (``{"score": N, "matched_icp_signal_idx": I}``) but
+    falls back to regex number extraction for score if JSON parsing fails.
+    ``matched_icp_signal_idx`` is clamped to ``[-1, num_icp_signals - 1]``
+    and defaults to ``-1`` (no match) on any parse failure.
+    """
+    import json as _json
+    import re as _re
+
+    if not response:
+        return 0.0, -1
+
+    text = response.strip()
+    if text.startswith("```"):
+        text = _re.sub(r"^```(?:json)?\s*", "", text)
+        text = _re.sub(r"\s*```$", "", text)
+    match = _re.search(r"\{[^{}]*\}", text, _re.DOTALL)
+    json_str = match.group(0) if match else text
+
+    try:
+        obj = _json.loads(json_str)
+        score = float(obj.get("score", 0))
+        idx = int(obj.get("matched_icp_signal_idx", -1))
+    except Exception:
+        score = float(extract_score(response, max_score=max_score))
+        idx = -1
+
+    score = max(0.0, min(score, float(max_score)))
+    if num_icp_signals <= 0 or idx < 0 or idx >= num_icp_signals:
+        idx = -1
+    return score, idx
+
+
 async def _score_single_intent_signal(
     signal: "IntentSignal",
     icp: ICPPrompt,
@@ -605,12 +648,18 @@ async def _score_single_intent_signal(
     company_name: str,
     company_website: str = "",
     api_key: str = "",
-) -> Tuple[float, int, str, Optional[str]]:
+) -> Tuple[float, int, str, Optional[str], int]:
     """
     Verify and score a single intent signal.
-    
+
     Returns:
-        Tuple of (score 0-60, verification_confidence 0-100, date_status, content_found_date)
+        Tuple of (score 0-60, verification_confidence 0-100, date_status,
+                  content_found_date, matched_icp_signal_idx)
+
+        ``matched_icp_signal_idx`` is the 0-based index into
+        ``icp.intent_signals`` of the client-requested signal this miner
+        signal satisfies, or ``-1`` if none. When ``icp.intent_signals``
+        is empty, this is always ``-1``.
     """
     # Verify the signal is real AND provides evidence of ICP fit
     verified, confidence, reason, date_status, content_found_date = await verify_intent_signal(
@@ -621,25 +670,33 @@ async def _score_single_intent_signal(
         company_website=company_website,
         api_key=api_key,
     )
-    
+
     if not verified:
         logger.info(f"Intent signal not verified: {reason}")
-        return 0.0, confidence, date_status, content_found_date
-    
+        return 0.0, confidence, date_status, content_found_date, -1
+
     # Get source as string
     source_str = signal.source.value if hasattr(signal.source, 'value') else str(signal.source)
     source_lower = source_str.lower()
-    
+
     # Get source type multiplier (penalize low-value sources like "other")
     source_multiplier = SOURCE_TYPE_MULTIPLIERS.get(source_lower, 0.5)
-    
+
     # Use both: full prompt for complete buyer context, product_service for what's being sold
     buyer_request = icp.prompt or icp.product_service
-    
-    icp_intent_list = ", ".join(str(s) for s in (icp.intent_signals or [])) if hasattr(icp, 'intent_signals') and icp.intent_signals else ""
-    icp_intent_section = f"\nBUYER'S EXPECTED INTENT SIGNALS: \"{icp_intent_list}\"\n" if icp_intent_list else ""
 
-    prompt = f"""Score how relevant this intent signal is to the buyer's request on a scale of 0-60.
+    # Render the ICP signals as an indexed list so the LLM can return an index.
+    icp_signals_list = list(icp.intent_signals or []) if hasattr(icp, 'intent_signals') and icp.intent_signals else []
+    if icp_signals_list:
+        indexed_signals = "\n".join(f"  {i}. \"{s}\"" for i, s in enumerate(icp_signals_list))
+        icp_intent_section = (
+            "\nBUYER'S EXPECTED INTENT SIGNALS (indexed):\n"
+            f"{indexed_signals}\n"
+        )
+    else:
+        icp_intent_section = ""
+
+    prompt = f"""Score how relevant this intent signal is to the buyer's request on a scale of 0-60, AND identify which of the buyer's expected intent signals it best matches.
 
 BUYER IS SELLING: "{icp.product_service}"
 
@@ -673,11 +730,19 @@ Consider:
 3. Would a salesperson use this signal to pitch "{icp.product_service}" to this company TODAY?
 4. Is the description specific enough to be verifiable (names, dates, amounts) or vague enough to apply to any company?
 
-Respond with ONLY a single number (0-60):"""
+MATCHING GUIDELINES (for matched_icp_signal_idx):
+- Return the integer INDEX of the buyer's expected intent signal that this signal most directly satisfies.
+- Return -1 if the buyer provided no expected signals, OR if this signal does not clearly satisfy any of them.
+- Pick exactly ONE index — the strongest match — even if the signal touches on multiple.
+
+Respond with ONLY a compact JSON object on a single line, no prose, no code fences:
+{{"score": <integer 0-60>, "matched_icp_signal_idx": <integer index or -1>}}"""
 
     response = await openrouter_chat(prompt, model="gpt-4o-mini", api_key=api_key)
-    raw_score = extract_score(response, max_score=MAX_INTENT_SIGNAL_SCORE)
-    
+    raw_score, matched_idx = _parse_intent_score_response(
+        response, MAX_INTENT_SIGNAL_SCORE, len(icp_signals_list),
+    )
+
     # Apply source-dependent date requirements
     if date_status == "no_date":
         if source_lower in SOURCES_DATE_NOT_REQUIRED:
@@ -691,14 +756,14 @@ Respond with ONLY a single number (0-60):"""
             # Unknown source type — moderate cap (more lenient than date-required)
             raw_score = min(raw_score, MAX_INTENT_NO_DATE_UNKNOWN)
             logger.info(f"Undated {source_str} signal (unknown source) — capped at {MAX_INTENT_NO_DATE_UNKNOWN}")
-    
+
     # Weight by verification confidence AND source type quality
     weighted_score = raw_score * (confidence / 100) * source_multiplier
-    
+
     if source_multiplier < 1.0:
         logger.info(f"Applied source type penalty: {source_str} -> {source_multiplier}x")
-    
-    return weighted_score, confidence, date_status, content_found_date
+
+    return weighted_score, confidence, date_status, content_found_date, matched_idx
 
 
 # =============================================================================

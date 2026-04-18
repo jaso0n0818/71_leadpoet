@@ -74,6 +74,21 @@ def _build_consensus_row(
         w = sum(ws["weight"] for ws in weighted_scores if ws.get(field))
         return w / total_weight > 0.5 if total_weight else False
 
+    # Per-signal mapping: take the breakdown from the highest-weighted
+    # validator that actually produced one (Tier 3 runs -> non-empty).
+    # Per-signal aggregation across validators isn't well-defined (signal
+    # ordering can differ), and for single-validator subnets this degenerates
+    # to "the one validator's list", which is exactly what we want.
+    intent_signal_mapping: list = []
+    best_score_with_detail = -1.0
+    for ws in weighted_scores:
+        detail = ws.get("intent_signals_detail") or []
+        if not detail:
+            continue
+        if ws.get("weight", 0) > best_score_with_detail:
+            best_score_with_detail = ws["weight"]
+            intent_signal_mapping = detail
+
     return {
         "request_id": request_id,
         "submission_id": submission_id,
@@ -88,6 +103,7 @@ def _build_consensus_row(
         "consensus_company_verified": _weighted_majority("company_verified"),
         "consensus_rep_score": round(rep_score, 2),
         "any_fabricated": any(ws.get("all_fabricated") for ws in weighted_scores),
+        "intent_signal_mapping": intent_signal_mapping,
     }
 
 
