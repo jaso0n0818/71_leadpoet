@@ -2629,7 +2629,7 @@ def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -
             response = requests.get(
                 f"{GATEWAY_URL}/fulfillment/rewards/active",
                 params={"current_epoch": current_epoch},
-                timeout=30,
+                timeout=60,
             )
             response.raise_for_status()
             data = response.json()
