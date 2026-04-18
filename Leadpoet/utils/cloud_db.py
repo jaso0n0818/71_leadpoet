@@ -2617,9 +2617,10 @@ def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -
     weight calculation to determine the fulfillment emission carve-out.
 
     Retries on transient failures with exponential backoff (total ~14s).
-    Raises ``RuntimeError`` on exhausted retries so the caller can choose
-    a fallback (e.g. cached last-known-good) rather than silently
-    defaulting to zero emission for miners that earned rewards.
+    Raises ``RuntimeError`` when all retries are exhausted.  No cross-epoch
+    caching is performed — the caller treats an exhausted fetch as "no
+    active rewards for this epoch" so stale snapshots never drive weight
+    decisions.
     """
     last_err: Optional[Exception] = None
     backoffs = [1, 3, 10]  # 4 attempts total (initial + 3 retries), cumulative ~14s
@@ -2642,7 +2643,6 @@ def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -
                     f"({type(e).__name__}: {e}); retrying in {delay}s"
                 )
                 time.sleep(delay)
-    # All retries exhausted.  Raise so caller can fall back to cache.
     raise RuntimeError(
         f"gateway_get_all_fulfillment_rewards failed after {len(backoffs) + 1} attempts: {last_err}"
     )
