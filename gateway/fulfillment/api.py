@@ -29,6 +29,7 @@ from gateway.fulfillment.models import (
     FulfillmentRevealRequest,
     LeadHashEntry,
     FulfillmentScoreResult,
+    scrub_company_name,
 )
 from gateway.models.events import EventType
 from gateway.utils.bans import is_hotkey_banned, ban_hotkey
@@ -161,8 +162,20 @@ async def create_request(icp: FulfillmentICP):
         commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
     window_end = now + timedelta(seconds=commit_seconds)
     reveal_window_end = window_end + timedelta(minutes=M_MINUTES)
-    # model_dump() excludes `internal_label` (Field(exclude=True)) so the
-    # label never lands in icp_details (which is what miners see).
+
+    # Scrub the client's company name out of every free-text field miners
+    # will see BEFORE hashing / persistence.  Each match becomes
+    # "[company_name]" so grammar stays natural.  `company` itself is never
+    # serialized into model_dump() (Field(exclude=True)); it only lives in
+    # the dedicated DB column we insert below.
+    company = icp.company
+    icp.prompt = scrub_company_name(icp.prompt, company)
+    icp.product_service = scrub_company_name(icp.product_service, company)
+    icp.intent_signals = [scrub_company_name(s, company) for s in icp.intent_signals]
+    icp.target_roles = [scrub_company_name(s, company) for s in icp.target_roles]
+
+    # model_dump() excludes `internal_label` and `company` (both Field(exclude=True))
+    # so neither lands in icp_details (which is what miners see).
     icp_dict = icp.model_dump(mode="json")
     req_hash = hash_request(icp_dict)
 
@@ -176,6 +189,8 @@ async def create_request(icp: FulfillmentICP):
         "reveal_window_end": reveal_window_end.isoformat(),
         "status": "open",
         "created_by": "api",
+        # `company` is validated as required by Pydantic, so always present.
+        "company": company,
     }
     # Only attach the label if the client actually sent one — this way the
     # insert still works against older DBs that don't yet have the
@@ -185,10 +200,16 @@ async def create_request(icp: FulfillmentICP):
     try:
         supabase.table("fulfillment_requests").insert(row).execute()
     except Exception as e:
-        # If the column doesn't exist yet, retry without it so request
-        # creation never hard-blocks on schema drift.
-        if "internal_label" in str(e) and "internal_label" in row:
-            row.pop("internal_label", None)
+        # If a newly-added column doesn't exist on this deployment yet,
+        # retry without it so request creation never hard-blocks on schema
+        # drift.  Handles both `internal_label` and `company`.
+        err = str(e)
+        retried = False
+        for missing in ("internal_label", "company"):
+            if missing in err and missing in row:
+                row.pop(missing, None)
+                retried = True
+        if retried:
             supabase.table("fulfillment_requests").insert(row).execute()
         else:
             raise

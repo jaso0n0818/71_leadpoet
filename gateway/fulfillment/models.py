@@ -43,6 +43,42 @@ VALID_ROLE_TYPES: set = {
     "Supply Chain", "Consulting", "Other",
 }
 
+
+# ---------------------------------------------------------------------------
+# Company-name scrubbing helper
+# ---------------------------------------------------------------------------
+
+COMPANY_PLACEHOLDER = "[company_name]"
+
+
+def scrub_company_name(text: str, company: str) -> str:
+    """Replace every whole-word occurrence of ``company`` in ``text`` with
+    ``[company_name]``, case-insensitive.
+
+    Used by the fulfillment request ingestion path so miners never see the
+    identity of the client who submitted the request.  Possessive forms
+    (``AcmeCorp's``) are preserved because the ``\\b`` word boundary ends
+    before the apostrophe, so the ``'s`` stays attached to the placeholder
+    (``[company_name]'s``).
+
+    Short or generic company names (e.g. ``"Apple"``) may match unrelated
+    occurrences of the same token elsewhere in the text.  That is an
+    accepted trade-off; callers should supply a distinctive name.
+
+    Returns the input unchanged when either ``text`` or ``company`` is
+    empty.  Never raises.
+    """
+    if not text or not company:
+        return text or ""
+
+    pattern = re.compile(r"\b" + re.escape(company) + r"\b", re.IGNORECASE)
+    scrubbed = pattern.sub(COMPANY_PLACEHOLDER, text)
+    # Collapse any accidental whitespace runs that could have been created
+    # if the original text had odd spacing around the name.
+    scrubbed = re.sub(r"[ \t]{2,}", " ", scrubbed).strip()
+    return scrubbed
+
+
 # ---------------------------------------------------------------------------
 # FulfillmentICP
 # ---------------------------------------------------------------------------
@@ -74,6 +110,16 @@ class FulfillmentICP(BaseModel):
     # exclude=True makes model_dump() drop it, so it can't leak into the
     # hash/jsonb by accident.
     internal_label: str = Field(default="", exclude=True)
+
+    # Client company name (e.g. "AcmeCorp").  REQUIRED.  Stored in the
+    # dedicated `company` column on fulfillment_requests.  The gateway's
+    # create_request endpoint additionally scrubs every occurrence of this
+    # string from the free-text ICP fields (prompt, product_service,
+    # intent_signals, target_roles) before persisting, replacing each match
+    # with "[company_name]" so miners can never learn which client made the
+    # request.  Like internal_label, Field(exclude=True) guarantees it never
+    # reaches model_dump() -> icp_details -> miners.
+    company: str = Field(..., min_length=1, exclude=True)
 
     @field_validator("industry")
     @classmethod
