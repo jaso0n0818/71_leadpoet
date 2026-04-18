@@ -2616,20 +2616,20 @@ def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -
     reward_expires_epoch > current_epoch. Used by the validator during
     weight calculation to determine the fulfillment emission carve-out.
 
-    Retries on transient failures with exponential backoff (total ~14s).
-    Raises ``RuntimeError`` when all retries are exhausted.  No cross-epoch
-    caching is performed — the caller treats an exhausted fetch as "no
-    active rewards for this epoch" so stale snapshots never drive weight
-    decisions.
+    3 total attempts with 1s and 3s backoff between them; per-attempt
+    timeout 45s.  Worst-case budget: ~139s.  Raises ``RuntimeError`` when
+    all retries are exhausted.  No cross-epoch caching is performed — the
+    caller treats an exhausted fetch as "no active rewards for this epoch"
+    so stale snapshots never drive weight decisions.
     """
     last_err: Optional[Exception] = None
-    backoffs = [1, 3, 10]  # 4 attempts total (initial + 3 retries), cumulative ~14s
+    backoffs = [1, 3]  # 3 attempts total (initial + 2 retries), 4s cumulative sleep
     for attempt in range(len(backoffs) + 1):
         try:
             response = requests.get(
                 f"{GATEWAY_URL}/fulfillment/rewards/active",
                 params={"current_epoch": current_epoch},
-                timeout=60,
+                timeout=45,
             )
             response.raise_for_status()
             data = response.json()
