@@ -271,13 +271,29 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 "p_consensus": consensus_results,
             }).execute()
 
-            num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or len(consensus_results)
+            num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or 0
             winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results, num_requested)
+
+            # Quota gate: only mark `fulfilled` when the client's full N-lead
+            # quota is satisfied. Otherwise discard this batch and recycle
+            # into a fresh successor so miners can take another pass at the
+            # same ICP. Clients never see a partial-fulfillment state.
+            if num_requested > 0 and len(winner_lead_ids) < num_requested:
+                print(
+                    f"   ♻️  {rid[:8]}... insufficient winners "
+                    f"({len(winner_lead_ids)}/{num_requested}) — recycling"
+                )
+                _recycle_request(
+                    supabase, r, now, now_iso,
+                    terminal_status="recycled",
+                    reason=f"insufficient_winners_{len(winner_lead_ids)}_of_{num_requested}",
+                )
+                continue
 
             supabase.table("fulfillment_requests").update({
                 "status": "fulfilled",
             }).eq("request_id", rid).execute()
-            print(f"   ✅ {rid[:8]}... -> fulfilled ({len(consensus_results)} leads)")
+            print(f"   ✅ {rid[:8]}... -> fulfilled ({len(winner_lead_ids)}/{num_requested} winners from {len(consensus_results)} scored)")
 
             ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
             print(f"\n{'='*60}")
@@ -310,8 +326,17 @@ async def _lifecycle_tick_inner(supabase) -> None:
 async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_leads: int = 0) -> set:
     """Deduplicate across miners and assign rewards. Returns set of winner lead_ids.
 
-    Only the top ``num_leads`` deduped leads earn rewards.  If num_leads
-    is 0 or not provided, all deduped leads are rewarded (backwards compat).
+    Quota gate: a request is only considered fulfillable when the number of
+    unique deduped leads with ``score > 0`` is GREATER THAN OR EQUAL TO
+    ``num_leads``.  If the quota is not met, this function returns an empty
+    set WITHOUT writing any rewards — the caller is expected to recycle the
+    request into a fresh successor. Clients only receive a complete batch
+    of N leads; partial fulfillment is not emitted and miners who submitted
+    an insufficient batch get no reward for this request (they can
+    re-participate in the successor).
+
+    If ``num_leads`` is 0 (legacy / unspecified), all deduped leads are
+    rewarded as before.
     """
     from gateway.fulfillment.rewards import calculate_lead_rewards
     supabase = _get_supabase()
@@ -365,8 +390,20 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
                 and c.get("consensus_intent_signal_final", 0) == best_raw]
         group_results.append((best_score, best_raw, tied))
 
-    # Rank unique leads by score, take top num_leads (respect uniqueness, not row count)
+    # Rank unique leads (dedup groups) by score
     group_results.sort(key=lambda g: (-g[0], -g[1]))
+
+    # Quota gate: if the client asked for N leads, require at least N unique
+    # qualifying deduped leads. Otherwise return empty (no rewards written);
+    # caller will recycle into a fresh successor.
+    if num_leads > 0 and len(group_results) < num_leads:
+        print(
+            f"   ⚠️  {request_id[:8]}... quota not met: "
+            f"{len(group_results)} unique leads with score>0 < {num_leads} requested — "
+            f"no rewards assigned, caller should recycle"
+        )
+        return set()
+
     top_groups = group_results[:num_leads] if num_leads > 0 else group_results
 
     # Flatten to winners; tie_count reflects only tied miners SELECTED (not dropped)
