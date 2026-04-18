@@ -75,6 +75,11 @@ class PriorityMiddleware(BaseHTTPMiddleware):
             "/fulfillment/score",           # Validator fulfillment scoring
             "/fulfillment/scoring",         # Validator fetching reveals to score
             "/fulfillment/ban",             # Validator fulfillment ban requests
+            "/fulfillment/rewards/",        # Validator fetching active rewards
+                                            # for weight calculation (time-
+                                            # sensitive; one failed fetch ==
+                                            # one missed epoch of emission).
+            "/fulfillment/results/",        # Validator/dashboard queries
         ]
         return any(vpath in path for vpath in validator_paths)
     

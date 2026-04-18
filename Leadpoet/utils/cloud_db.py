@@ -8,7 +8,7 @@ import time
 import base64
 import requests
 import bittensor as bt
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from Leadpoet.utils.misc import generate_timestamp
@@ -2615,16 +2615,34 @@ def gateway_get_all_fulfillment_rewards(wallet: bt.wallet, current_epoch: int) -
     Returns {miner_hotkey: sum_of_reward_pct} for all rewards where
     reward_expires_epoch > current_epoch. Used by the validator during
     weight calculation to determine the fulfillment emission carve-out.
+
+    Retries on transient failures with exponential backoff (total ~14s).
+    Raises ``RuntimeError`` on exhausted retries so the caller can choose
+    a fallback (e.g. cached last-known-good) rather than silently
+    defaulting to zero emission for miners that earned rewards.
     """
-    try:
-        response = requests.get(
-            f"{GATEWAY_URL}/fulfillment/rewards/active",
-            params={"current_epoch": current_epoch},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("rewards", {})
-    except Exception as e:
-        bt.logging.warning(f"Failed to fetch fulfillment rewards: {e}")
-        return {}
+    last_err: Optional[Exception] = None
+    backoffs = [1, 3, 10]  # 4 attempts total (initial + 3 retries), cumulative ~14s
+    for attempt in range(len(backoffs) + 1):
+        try:
+            response = requests.get(
+                f"{GATEWAY_URL}/fulfillment/rewards/active",
+                params={"current_epoch": current_epoch},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("rewards", {})
+        except Exception as e:
+            last_err = e
+            if attempt < len(backoffs):
+                delay = backoffs[attempt]
+                bt.logging.warning(
+                    f"gateway_get_all_fulfillment_rewards attempt {attempt + 1} failed "
+                    f"({type(e).__name__}: {e}); retrying in {delay}s"
+                )
+                time.sleep(delay)
+    # All retries exhausted.  Raise so caller can fall back to cache.
+    raise RuntimeError(
+        f"gateway_get_all_fulfillment_rewards failed after {len(backoffs) + 1} attempts: {last_err}"
+    )
