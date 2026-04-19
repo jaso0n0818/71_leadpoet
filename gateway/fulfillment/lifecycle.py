@@ -506,29 +506,32 @@ def _recycle_request(
     new_window_end = now + timedelta(seconds=epochs_to_seconds(T_EPOCHS, tempo))
     new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
 
+    # Recycle protocol:
+    #   1. INSERT the successor row first.  This satisfies the DB-level FK
+    #      constraint fulfillment_requests_successor_request_id_fkey, which
+    #      requires the successor to exist BEFORE any row can point at it.
+    #   2. Atomically claim the predecessor with a guarded UPDATE
+    #      (WHERE successor_request_id IS NULL).  Only one concurrent tick
+    #      can win; the loser sees claim.data empty and cleans up its own
+    #      successor insert.
+    #   3. If step 2 fails for ANY reason — race-lost, network error,
+    #      exception — the try/finally below deletes the just-inserted
+    #      successor so we never leak an orphan "open" row back into the
+    #      miner-facing queue.
+    #
+    # Failure modes and their handling:
+    #   * Race with another tick         -> claim_won=False, finally deletes X
+    #   * UPDATE throws (network / DB)   -> exception re-raised, finally deletes X
+    #   * Hard kill between INSERT and   -> orphan X left (only residual risk;
+    #     the finally block                  a periodic orphan-sweep can clean it)
+    #
+    # This is the opposite ordering from the previous attempt, which did
+    # UPDATE-before-INSERT and was rejected by the FK constraint on every
+    # tick (see the "foreign key constraint ... is not present" errors that
+    # piled up in gateway.log).
+    successor_inserted = False
+    claim_won = False
     try:
-        # Claim the predecessor FIRST with a guarded UPDATE: only proceed if the
-        # predecessor doesn't already have a successor. This is idempotent and
-        # race-free — if two lifecycle ticks try to recycle the same request,
-        # only one succeeds in claiming it; the other sees zero affected rows
-        # and exits without creating an orphan successor.
-        #
-        # The previous implementation did INSERT-then-UPDATE without a guard,
-        # which under concurrent ticks produced orphan successor rows (both
-        # ticks would INSERT, only the last UPDATE would win, leaving the
-        # first successor with no predecessor pointing to it).
-        claim = supabase.table("fulfillment_requests").update({
-            "status": terminal_status,
-            "successor_request_id": new_id,
-        }).eq("request_id", rid) \
-          .is_("successor_request_id", "null") \
-          .execute()
-
-        if not claim.data:
-            # Another tick already recycled this request — do nothing.
-            return
-
-        # We own the backlink; safe to insert the successor.
         supabase.table("fulfillment_requests").insert({
             "request_id": new_id,
             "request_hash": "",
@@ -540,16 +543,36 @@ def _recycle_request(
             "status": "open",
             "created_by": "recycled",
         }).execute()
+        successor_inserted = True
 
-        _log_event(EventType.FULFILLMENT_RECYCLED, {
-            "old_request_id": rid,
-            "new_request_id": new_id,
-            "reason": reason,
-            "terminal_status": terminal_status,
-        })
-        print(f"   ♻️  {rid[:8]}... {terminal_status} -> {new_id[:8]}... (reason={reason})")
+        claim = supabase.table("fulfillment_requests").update({
+            "status": terminal_status,
+            "successor_request_id": new_id,
+        }).eq("request_id", rid) \
+          .is_("successor_request_id", "null") \
+          .execute()
+
+        if claim.data:
+            claim_won = True
+            _log_event(EventType.FULFILLMENT_RECYCLED, {
+                "old_request_id": rid,
+                "new_request_id": new_id,
+                "reason": reason,
+                "terminal_status": terminal_status,
+            })
+            print(f"   ♻️  {rid[:8]}... {terminal_status} -> {new_id[:8]}... (reason={reason})")
     except Exception as e:
         print(f"   ❌ Error recycling {rid[:8]}...: {e}")
+    finally:
+        if successor_inserted and not claim_won:
+            # Either we lost the race (another tick beat us) or the UPDATE
+            # raised before we could confirm the claim.  Clean up the orphan
+            # successor unconditionally — the miner-facing queue should never
+            # see a successor that no predecessor points to.
+            try:
+                supabase.table("fulfillment_requests").delete().eq("request_id", new_id).execute()
+            except Exception as cleanup_err:
+                print(f"   ⚠️  Orphan cleanup failed for {new_id[:8]}: {cleanup_err}")
 
 
 def _normalize_company(name: str) -> str:
