@@ -4034,7 +4034,23 @@ class Validator(BaseValidatorNeuron):
             try:
                 from Leadpoet.utils.cloud_db import gateway_get_fulfillment_reveals
 
-                data = gateway_get_fulfillment_reveals(self.wallet)
+                # Reveals fetch may raise RuntimeError after exhausting its
+                # 5 retries.  Catch it here and return from Phase 1 WITHOUT
+                # adding the epoch to ``_ff_distributed_epochs``, so the
+                # next main-loop iteration retries the fetch.  A true empty
+                # response (gateway replies with {"requests": []}) is NOT
+                # an error and falls through the normal "no scoring-ready
+                # requests" branch below.
+                try:
+                    data = gateway_get_fulfillment_reveals(self.wallet)
+                except RuntimeError as e:
+                    bt.logging.warning(
+                        f"Fulfillment reveals unreachable after retries — "
+                        f"skipping Phase 1 for epoch {current_epoch}, "
+                        f"will retry next iteration: {e}"
+                    )
+                    return
+
                 active_requests = data.get("requests", []) if isinstance(data, dict) else []
 
                 scoring_requests = [r for r in active_requests

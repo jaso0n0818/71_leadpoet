@@ -2533,38 +2533,70 @@ def gateway_get_fulfillment_reveals(wallet: bt.wallet, request_id: str = None) -
 
     Passes the validator's hotkey so the gateway excludes requests
     this validator has already scored (avoids redundant API costs).
+
+    Retry policy:
+        5 total attempts with exponential backoff (1s, 2s, 4s, 8s between
+        attempts).  Each attempt has a 30s HTTP timeout.  Worst-case total
+        wall time on full failure: ~165s.
+
+    A genuinely empty response (``{"requests": []}`` from the gateway) is
+    NOT an error — we return it as-is.  Raises RuntimeError ONLY after all
+    attempts fail with a network / HTTP / parse error, so the caller can
+    distinguish "no work available" (empty dict) from "couldn't reach the
+    gateway" (exception).  Previous behavior was to swallow any error and
+    return ``{}``, which was indistinguishable from a quiet epoch and
+    silently skipped the whole Phase 1 scoring path.
     """
     import uuid
-    try:
-        hk = wallet.hotkey.ss58_address
-        nonce = str(uuid.uuid4())
-        ts = int(time.time())
-        # Global request (no request_id) — empty request_id segment in message
-        msg = f"FULFILLMENT_SCORING:{hk}::{nonce}:{ts}"
-        sig = _sign_fulfillment_message(wallet, msg)
+    hk = wallet.hotkey.ss58_address
 
-        params = {
-            "validator_hotkey": hk,
-            "signature": sig,
-            "nonce": nonce,
-            "timestamp": ts,
-        }
-        response = requests.get(
-            f"{GATEWAY_URL}/fulfillment/scoring",
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if request_id and isinstance(data, dict):
-            data["requests"] = [
-                r for r in data.get("requests", [])
-                if r.get("request_id") == request_id
-            ]
-        return data
-    except Exception as e:
-        bt.logging.warning(f"Failed to get fulfillment reveals: {e}")
-        return {}
+    backoffs = [1, 2, 4, 8]  # 5 total attempts, 4 sleeps between them
+    last_err: Optional[Exception] = None
+    for attempt in range(len(backoffs) + 1):
+        try:
+            nonce = str(uuid.uuid4())
+            ts = int(time.time())
+            # Global request (no request_id) — empty request_id segment in message
+            msg = f"FULFILLMENT_SCORING:{hk}::{nonce}:{ts}"
+            sig = _sign_fulfillment_message(wallet, msg)
+
+            params = {
+                "validator_hotkey": hk,
+                "signature": sig,
+                "nonce": nonce,
+                "timestamp": ts,
+            }
+            response = requests.get(
+                f"{GATEWAY_URL}/fulfillment/scoring",
+                params=params,
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if request_id and isinstance(data, dict):
+                data["requests"] = [
+                    r for r in data.get("requests", [])
+                    if r.get("request_id") == request_id
+                ]
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt < len(backoffs):
+                delay = backoffs[attempt]
+                bt.logging.warning(
+                    f"Fulfillment reveals fetch attempt {attempt+1}/{len(backoffs)+1} "
+                    f"failed: {type(e).__name__}: {e} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+            else:
+                bt.logging.error(
+                    f"Fulfillment reveals fetch failed all {len(backoffs)+1} attempts: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    raise RuntimeError(
+        f"Failed to get fulfillment reveals after {len(backoffs)+1} attempts: {last_err}"
+    )
 
 
 def gateway_submit_fulfillment_scores(
