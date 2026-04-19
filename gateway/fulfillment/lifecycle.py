@@ -70,27 +70,28 @@ _ADVISORY_LOCK_KEY = int.from_bytes(
 
 
 def _try_advisory_lock(supabase) -> bool:
-    """Acquire PostgreSQL advisory lock to prevent duplicate processing
-    across multiple gateway instances.  Calls a public-schema wrapper
-    because pg_catalog functions are not exposed via PostgREST."""
-    try:
-        resp = supabase.rpc("fulfillment_try_lifecycle_lock", {
-            "p_key": _ADVISORY_LOCK_KEY,
-        }).execute()
-        return bool(resp.data)
-    except Exception as e:
-        logger.warning(f"Advisory lock acquire failed (proceeding without lock): {e}")
-        return True
+    """No-op. The lifecycle tick is already idempotent and race-safe at the
+    per-request level (guarded UPDATE + orphan cleanup in _recycle_request),
+    so a global lock is unnecessary.  It was actively harmful because
+    pg_advisory_lock is SESSION-scoped and PostgREST uses a pooled
+    connection: the acquire-lock RPC and release-lock RPC land on different
+    pooled sessions, so the acquire would succeed on session A but the
+    release would run on session B (a no-op there).  Session A would keep
+    the lock indefinitely, blocking every subsequent tick until the
+    gateway restarted.  This bug silently wedged the fulfillment lifecycle
+    for hours at a time (observed: 5 client requests stuck in commit_closed
+    for 16+ hours, zero recycles while the lock was orphaned).
+
+    Kept the function signature so the call sites remain compatible and
+    we don't have to restructure the tick code.  Always returns True so
+    the tick proceeds.
+    """
+    return True
 
 
 def _release_advisory_lock(supabase) -> None:
-    """Release the advisory lock after processing."""
-    try:
-        supabase.rpc("fulfillment_release_lifecycle_lock", {
-            "p_key": _ADVISORY_LOCK_KEY,
-        }).execute()
-    except Exception as e:
-        logger.warning(f"Advisory lock release failed: {e}")
+    """No-op companion to _try_advisory_lock.  Historical rationale above."""
+    return None
 
 
 async def fulfillment_lifecycle_task() -> None:
