@@ -319,7 +319,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
 
     # Step 4: reward expiry
     try:
-        _expire_rewards(supabase)
+        await _expire_rewards(supabase)
     except Exception as e:
         print(f"❌ Reward expiry error: {e}")
 
@@ -413,7 +413,7 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
         for c in tied:
             winners.append({**c, "tie_count": len(tied)})
 
-    current_epoch = _get_current_epoch()
+    current_epoch = await _get_current_epoch()
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
 
     # Enrich each winner with the client-ready "Intent Details" paragraph.
@@ -590,32 +590,39 @@ def _normalize_company(name: str) -> str:
     return name
 
 
-def _get_current_epoch() -> int:
-    """Return the current Bittensor epoch ID.
+async def _get_current_epoch() -> int:
+    """Return the current Bittensor epoch ID (async-safe).
 
-    Uses the gateway's canonical epoch helper, which derives the epoch from
-    the live chain block. The previous implementation queried a
-    ``subnet_state`` table that does not exist in the Supabase schema, so
-    it always silently returned 0 — which made every freshly-awarded
-    ``reward_expires_epoch`` equal to ``L_EPOCHS`` (e.g. 30) instead of
-    ``current_epoch + L_EPOCHS`` (e.g. 22227). That caused every winning
-    fulfillment lead to be treated as already-expired and never earn
-    emission.
+    MUST be awaited.  Called from inside the gateway's running event loop
+    (fulfillment_lifecycle_task), which means the synchronous variant
+    ``get_current_epoch_id()`` is unsafe: it internally runs
+    ``_get_current_block()``, which explicitly raises ``RuntimeError`` when
+    invoked from a thread that already has a running loop.  The previous
+    implementation swallowed that error and returned 0, causing every
+    newly-awarded ``reward_expires_epoch`` to be ``0 + L_EPOCHS`` (e.g. 30)
+    instead of ``current_epoch + L_EPOCHS`` (e.g. 22264) — making every
+    winner expired-at-birth and silently zeroing out fulfillment emission.
+
+    Using the async helper lets the lifecycle tick call ``await`` on a
+    helper that reads the cached block without going through the
+    sync-wrapper guard.  A broad ``except`` still returns 0 as a last
+    resort, but only for a genuine subtensor outage, not the routine
+    async-context mismatch the previous bug suffered from.
     """
     try:
-        from gateway.utils.epoch import get_current_epoch_id
-        return int(get_current_epoch_id())
+        from gateway.utils.epoch import get_current_epoch_id_async
+        return int(await get_current_epoch_id_async())
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(
-            f"_get_current_epoch() fell back to 0: {e}"
+        logger.warning(
+            f"_get_current_epoch() fell back to 0 (genuine subtensor failure): "
+            f"{type(e).__name__}: {e}"
         )
         return 0
 
 
-def _expire_rewards(supabase) -> None:
-    """NULL out reward_pct on expired consensus rows."""
-    current_epoch = _get_current_epoch()
+async def _expire_rewards(supabase) -> None:
+    """NULL out reward_pct on expired consensus rows (async)."""
+    current_epoch = await _get_current_epoch()
     if current_epoch <= 0:
         return
     try:
