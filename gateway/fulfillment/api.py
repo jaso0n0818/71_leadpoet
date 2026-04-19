@@ -587,13 +587,22 @@ async def get_scoring_requests(
 
         submissions = []
         for s in (subs_resp.data or []):
+            # SAFETY: both `leads` and `lead_ids` MUST be sourced from the
+            # same list (`lead_data`) so they stay index-aligned.  Previous
+            # code sourced `lead_ids` from `lead_hashes` (the full committed
+            # list) while `leads` came from `lead_data` (only matched entries
+            # after /reveal dropped hash-mismatched ones).  When miners had
+            # any partial-reveal hash mismatch, the two arrays had different
+            # lengths and the validator's zip(lead_ids, results) mapped the
+            # wrong lead_id onto each score — silently corrupting downstream
+            # consensus and winner selection.  `lead_data` entries are
+            # {"lead_id": ..., "data": ...} so both projections are safe.
             lead_data = s.get("lead_data") or []
-            lead_hashes = s.get("lead_hashes") or []
             submissions.append({
                 "submission_id": s["submission_id"],
                 "miner_hotkey": s["miner_hotkey"],
                 "leads": [entry.get("data", {}) for entry in lead_data],
-                "lead_ids": [entry.get("lead_id", "") for entry in lead_hashes],
+                "lead_ids": [entry.get("lead_id", "") for entry in lead_data],
             })
 
         print(f"   Returning {r['request_id'][:8]}... with {len(submissions)} submission(s), "
