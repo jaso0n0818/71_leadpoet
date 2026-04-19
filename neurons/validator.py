@@ -4155,6 +4155,17 @@ class Validator(BaseValidatorNeuron):
                   f"{len(all_work_files)} request-worker pair(s))")
             print(f"{'='*60}")
 
+            # Track whether ALL work files for this epoch submitted cleanly.
+            # If any one of them has even a single failed gateway submit, we
+            # keep its work+results files on disk and skip adding this epoch
+            # to ``_ff_collected_epochs``, so the next iteration re-enters
+            # this block and retries just the failed submits (scoring is not
+            # re-run — the results_file already exists with the computed
+            # scores).  The gateway's /fulfillment/score endpoint upserts on
+            # (request_id, validator_hotkey, lead_id), so duplicate retries
+            # are idempotent.
+            any_submit_failed = False
+
             for work_file in sorted(all_work_files):
                 results_file = _results_path_for(work_file)
                 if not results_file.exists():
@@ -4174,7 +4185,9 @@ class Validator(BaseValidatorNeuron):
 
                 if worker_data.get("error"):
                     print(f"   ⚠️ Worker {wid_token} (req {request_id[:8]}) error: {worker_data['error']}")
-                    # Still clean up files to avoid replays
+                    # Worker-level error is terminal (scoring itself failed,
+                    # not gateway submit).  There's nothing to retry, so we
+                    # clean up to avoid perpetual replays.
                     try:
                         os.remove(work_file)
                         os.remove(results_file)
@@ -4184,6 +4197,12 @@ class Validator(BaseValidatorNeuron):
 
                 print(f"   Worker {wid_token} → request {request_id[:8]}: "
                       f"{len(submission_results)} submission(s)")
+
+                # Per-work-file success flag.  Only when ALL submissions
+                # within this work file are acknowledged by the gateway do we
+                # delete the files.  Partial failures keep the files for the
+                # next iteration's retry.
+                worker_all_ok = True
 
                 for sub_result in submission_results:
                     miner_hk = sub_result.get("miner_hotkey", "")
@@ -4207,17 +4226,35 @@ class Validator(BaseValidatorNeuron):
                         )
                         print(f"   ✅ Submitted {len(scores_payload)} scores for miner {miner_hk[:8]}...")
                     except Exception as e:
-                        print(f"   ❌ Gateway submit failed for {miner_hk[:8]}: {e}")
+                        worker_all_ok = False
+                        print(f"   ❌ Gateway submit failed for {miner_hk[:8]}: {e} "
+                              f"— keeping files, will retry next iteration")
 
-                # Clean up files
-                try:
-                    os.remove(work_file)
-                    os.remove(results_file)
-                except Exception:
-                    pass
+                # Clean up files only if every submit in this work file
+                # succeeded.  Otherwise keep them; Phase 1 will NOT re-dispatch
+                # (current_epoch is already in ``_ff_distributed_epochs``),
+                # and Phase 2 will re-enter this block because the epoch is
+                # not in ``_ff_collected_epochs``.
+                if worker_all_ok:
+                    try:
+                        os.remove(work_file)
+                        os.remove(results_file)
+                    except Exception:
+                        pass
+                else:
+                    any_submit_failed = True
+                    print(f"   ⏸  Kept {work_file.name} for retry")
 
-            self._ff_collected_epochs.add(current_epoch)
-            print(f"{'='*60}\n")
+            # Gate epoch-level collection on full success across every work
+            # file.  If any work file had a failure, leave this epoch OUT of
+            # _ff_collected_epochs so the next iteration re-runs this block.
+            if not any_submit_failed:
+                self._ff_collected_epochs.add(current_epoch)
+                print(f"{'='*60}\n")
+            else:
+                print(f"   ⏸  Epoch {current_epoch} NOT marked collected — "
+                      f"some submits failed, will retry next iteration")
+                print(f"{'='*60}\n")
 
         except ImportError as e:
             if not getattr(self, "_fulfillment_collect_warned", False):
