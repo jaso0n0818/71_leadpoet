@@ -151,6 +151,20 @@ async def create_request(icp: FulfillmentICP):
     if not _enable_fulfillment():
         raise HTTPException(503, detail="Fulfillment system is not enabled on this gateway")
 
+    # Enforce `company` at the API boundary only.  The model itself defaults
+    # this to "" so later re-parses of the scrubbed icp_details dict by the
+    # validator don't fail with "Field required" (which wedges scoring).
+    # See models.py FulfillmentICP.company for the full rationale.
+    if not (icp.company or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail=[{
+                "loc": ["body", "company"],
+                "msg": "company is required",
+                "type": "value_error.missing",
+            }],
+        )
+
     supabase = _get_supabase()
     now = datetime.now(timezone.utc)
     request_id = str(uuid4())

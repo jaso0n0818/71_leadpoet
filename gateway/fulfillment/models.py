@@ -111,15 +111,25 @@ class FulfillmentICP(BaseModel):
     # hash/jsonb by accident.
     internal_label: str = Field(default="", exclude=True)
 
-    # Client company name (e.g. "AcmeCorp").  REQUIRED.  Stored in the
-    # dedicated `company` column on fulfillment_requests.  The gateway's
-    # create_request endpoint additionally scrubs every occurrence of this
-    # string from the free-text ICP fields (prompt, product_service,
-    # intent_signals, target_roles) before persisting, replacing each match
-    # with "[company_name]" so miners can never learn which client made the
+    # Client company name (e.g. "AcmeCorp").  Stored in the dedicated
+    # `company` column on fulfillment_requests.  The gateway's create_request
+    # endpoint additionally scrubs every occurrence of this string from the
+    # free-text ICP fields (prompt, product_service, intent_signals,
+    # target_roles) before persisting, replacing each match with
+    # "[company_name]" so miners can never learn which client made the
     # request.  Like internal_label, Field(exclude=True) guarantees it never
     # reaches model_dump() -> icp_details -> miners.
-    company: str = Field(..., min_length=1, exclude=True)
+    #
+    # IMPORTANT: Defaults to "" at the MODEL layer because the gateway's
+    # model_dump() strips this field before persisting to icp_details, so
+    # when the validator later reconstructs FulfillmentICP(**icp_details)
+    # the field will be absent.  Marking it required on the model would
+    # crash every re-parse with "Field required [type=missing]" and wedge
+    # the entire scoring pipeline (observed: 9 requests stuck for 13h+).
+    # Enforcement of "company must be non-empty on client POST" is handled
+    # explicitly in gateway/fulfillment/api.py::create_request rather than
+    # via min_length on the field.
+    company: str = Field(default="", exclude=True)
 
     @field_validator("industry")
     @classmethod
