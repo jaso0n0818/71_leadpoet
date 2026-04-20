@@ -48,8 +48,13 @@ def _get_tempo(supabase) -> int:
     return 360
 
 
-def _log_event(event_type: EventType, payload: dict) -> None:
-    from gateway.config import BITTENSOR_NETWORK
+def _log_event(event_type: EventType, actor_hotkey: str, payload: dict) -> None:
+    """Best-effort transparency log insert.  Populates the full audit-log
+    shape (nonce, ts, payload_hash, build_id, signature, actor_hotkey) to
+    satisfy the NOT NULL constraints that previously caused every
+    FULFILLMENT_* insert to be silently dropped.  See the twin function in
+    gateway/fulfillment/api.py for the full rationale."""
+    from gateway.config import BITTENSOR_NETWORK, BUILD_ID
 
     if BITTENSOR_NETWORK == "test":
         logger.info(
@@ -57,12 +62,24 @@ def _log_event(event_type: EventType, payload: dict) -> None:
         )
         return
 
+    import hashlib, json as _json, uuid as _uuid
+    now = datetime.now(timezone.utc).isoformat()
+    payload_hash = hashlib.sha256(
+        _json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
     try:
         supabase = _get_supabase()
         supabase.table("transparency_log").insert({
             "event_type": event_type.value,
+            "actor_hotkey": actor_hotkey,
+            "nonce": str(_uuid.uuid4()),
+            "ts": now,
+            "payload_hash": payload_hash,
+            "build_id": BUILD_ID,
+            "signature": "",
             "payload": payload,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": now,
         }).execute()
     except Exception as e:
         logger.warning(f"Failed to log {event_type.value}: {e}")
@@ -618,7 +635,7 @@ def _recycle_request(
 
         if claim.data:
             claim_won = True
-            _log_event(EventType.FULFILLMENT_RECYCLED, {
+            _log_event(EventType.FULFILLMENT_RECYCLED, "gateway", {
                 "old_request_id": rid,
                 "new_request_id": new_id,
                 "reason": reason,

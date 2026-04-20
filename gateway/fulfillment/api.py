@@ -87,9 +87,23 @@ def _miner_submission_cap(num_leads: int) -> int:
     return max(cap, num_leads)
 
 
-def _log_event(event_type: EventType, payload: dict) -> None:
-    """Best-effort transparency log insert."""
-    from gateway.config import BITTENSOR_NETWORK
+def _log_event(event_type: EventType, actor_hotkey: str, payload: dict) -> None:
+    """Best-effort transparency log insert.
+
+    The transparency_log table enforces NOT NULL on several audit columns
+    (``actor_hotkey``, ``nonce``, ``ts``, ``payload_hash``, ``build_id``,
+    ``signature``).  The pre-fix version only populated ``event_type``,
+    ``payload``, and ``created_at``, so every FULFILLMENT_* insert failed
+    the NOT NULL check and was silently dropped by the except branch —
+    meaning rejection reasons and commit/reveal/score events were missing
+    from the log since the fulfillment system went live.
+
+    Non-TEE gateway events (FULFILLMENT_*) can't carry a real enclave
+    signature; we write ``signature=''`` so the NOT NULL is satisfied.
+    TEE-signed events continue to go through gateway/utils/logger.py which
+    does populate a real signature.
+    """
+    from gateway.config import BITTENSOR_NETWORK, BUILD_ID
 
     if BITTENSOR_NETWORK == "test":
         logger.info(
@@ -97,12 +111,24 @@ def _log_event(event_type: EventType, payload: dict) -> None:
         )
         return
 
+    import hashlib, json as _json, uuid as _uuid
+    now = datetime.now(timezone.utc).isoformat()
+    payload_hash = hashlib.sha256(
+        _json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
     try:
         supabase = _get_supabase()
         supabase.table("transparency_log").insert({
             "event_type": event_type.value,
+            "actor_hotkey": actor_hotkey,
+            "nonce": str(_uuid.uuid4()),
+            "ts": now,
+            "payload_hash": payload_hash,
+            "build_id": BUILD_ID,
+            "signature": "",
             "payload": payload,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": now,
         }).execute()
     except Exception as e:
         logger.warning(f"Failed to log {event_type.value}: {e}")
@@ -250,7 +276,7 @@ async def create_request(icp: FulfillmentICP):
         else:
             raise
 
-    _log_event(EventType.FULFILLMENT_REQUEST_CREATED, {
+    _log_event(EventType.FULFILLMENT_REQUEST_CREATED, "gateway", {
         "request_id": request_id,
         "request_hash": req_hash,
         "status": "pending",
@@ -463,7 +489,7 @@ async def commit_leads(commit: FulfillmentCommitRequest):
 
     lead_hash_entries = new_entries
 
-    _log_event(EventType.FULFILLMENT_COMMIT, {
+    _log_event(EventType.FULFILLMENT_COMMIT, commit.miner_hotkey, {
         "request_id": commit.request_id,
         "submission_id": submission_id,
         "miner_hotkey": commit.miner_hotkey,
@@ -565,7 +591,7 @@ async def reveal_leads(reveal: FulfillmentRevealRequest):
           f"leads={len(lead_data_list)}/{len(reveal.leads)} revealed=True"
           + (f" (dropped {len(mismatched)} mismatched)" if mismatched else ""))
 
-    _log_event(EventType.FULFILLMENT_REVEAL, {
+    _log_event(EventType.FULFILLMENT_REVEAL, reveal.miner_hotkey, {
         "request_id": reveal.request_id,
         "miner_hotkey": reveal.miner_hotkey,
         "reveal_timestamp": now.isoformat(),
@@ -699,7 +725,7 @@ async def submit_scores(
     except Exception as e:
         raise HTTPException(500, detail=f"Score submission failed: {e}")
 
-    _log_event(EventType.FULFILLMENT_SCORED, {
+    _log_event(EventType.FULFILLMENT_SCORED, validator_hotkey, {
         "request_id": request_id,
         "scores": [
             {"miner_hotkey": s.get("miner_hotkey"), "lead_id": s.get("lead_id"),
@@ -806,7 +832,7 @@ async def request_ban(hotkey: str, reason: str = "", validator_hotkey: str = "",
     if not _enable_fulfillment():
         raise HTTPException(503, detail="Fulfillment system is not enabled")
 
-    _log_event(EventType.FULFILLMENT_BAN, {
+    _log_event(EventType.FULFILLMENT_BAN, validator_hotkey or "admin", {
         "hotkey": hotkey,
         "reason": reason,
         "banned_by": validator_hotkey or "admin",
