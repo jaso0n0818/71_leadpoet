@@ -169,14 +169,6 @@ async def create_request(icp: FulfillmentICP):
     now = datetime.now(timezone.utc)
     request_id = str(uuid4())
 
-    if T_SECONDS_OVERRIDE > 0:
-        commit_seconds = T_SECONDS_OVERRIDE
-    else:
-        tempo = _get_tempo(supabase)
-        commit_seconds = epochs_to_seconds(T_EPOCHS, tempo)
-    window_end = now + timedelta(seconds=commit_seconds)
-    reveal_window_end = window_end + timedelta(minutes=M_MINUTES)
-
     # Scrub the client's company name out of every free-text field miners
     # will see BEFORE hashing / persistence.  Each match becomes
     # "[company_name]" so grammar stays natural.  `company` itself is never
@@ -193,15 +185,23 @@ async def create_request(icp: FulfillmentICP):
     icp_dict = icp.model_dump(mode="json")
     req_hash = hash_request(icp_dict)
 
+    # New requests enter the queue as `pending`: no commit timer yet.
+    # The lifecycle tick promotes the oldest pending rows to `open` (and
+    # stamps window_start = NOW, window_end = NOW + T_EPOCHS,
+    # reveal_window_end = window_end + M_MINUTES) as soon as the open
+    # pool has room (max FULFILLMENT_MAX_PARALLEL_REQUESTS at a time).
+    # This guarantees a request's commit window only starts ticking once
+    # miners can actually see it, so queued requests can never silently
+    # expire while invisible.
     row = {
         "request_id": request_id,
         "request_hash": req_hash,
         "icp_details": icp_dict,
         "num_leads": icp.num_leads,
-        "window_start": now.isoformat(),
-        "window_end": window_end.isoformat(),
-        "reveal_window_end": reveal_window_end.isoformat(),
-        "status": "open",
+        "window_start": None,
+        "window_end": None,
+        "reveal_window_end": None,
+        "status": "pending",
         "created_by": "api",
         # `company` is validated as required by Pydantic, so always present.
         "company": company,
@@ -231,18 +231,19 @@ async def create_request(icp: FulfillmentICP):
     _log_event(EventType.FULFILLMENT_REQUEST_CREATED, {
         "request_id": request_id,
         "request_hash": req_hash,
-        "window_start": now.isoformat(),
-        "window_end": window_end.isoformat(),
-        "reveal_window_end": reveal_window_end.isoformat(),
+        "status": "pending",
     })
 
     return {
         "request_id": request_id,
         "request_hash": req_hash,
-        "window_start": now.isoformat(),
-        "window_end": window_end.isoformat(),
-        "reveal_window_end": reveal_window_end.isoformat(),
+        "status": "pending",
         "num_leads": icp.num_leads,
+        "note": (
+            "Request is queued.  Its commit window starts only when a slot "
+            f"opens in the miner-visible pool (max {FULFILLMENT_MAX_PARALLEL_REQUESTS} "
+            "concurrent).  Query /fulfillment/results/{request_id} to follow progress."
+        ),
     }
 
 

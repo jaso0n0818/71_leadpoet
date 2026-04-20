@@ -15,8 +15,13 @@ from gateway.fulfillment.config import (
     FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS,
     FULFILLMENT_MIN_VALIDATORS,
     FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES,
+    FULFILLMENT_MAX_PARALLEL_REQUESTS,
     L_EPOCHS,
+    M_MINUTES,
+    T_EPOCHS,
+    T_SECONDS_OVERRIDE,
     Z_PERCENT,
+    epochs_to_seconds,
 )
 from gateway.fulfillment.consensus import compute_fulfillment_consensus
 from gateway.models.events import EventType
@@ -129,17 +134,79 @@ async def _lifecycle_tick_inner(supabase) -> None:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
+    # ────────────────────────────────────────────────────────────────
+    # STEP 0: Promote 'pending' → 'open' to fill the miner-visible pool
+    # ────────────────────────────────────────────────────────────────
+    # Requests are created in 'pending' with NULL window timestamps.
+    # We promote the oldest pending rows to 'open' whenever the open
+    # pool has room, and ONLY THEN stamp window_start / window_end /
+    # reveal_window_end based on the current wall clock.  This means:
+    #
+    #   * No request's commit timer ever ticks down while the request
+    #     is invisible to miners (the pre-migration bug that caused
+    #     the 6-over-the-cap requests to silently expire).
+    #   * The 5-concurrent cap on the miner-facing endpoint is
+    #     enforced at the data layer, not just at the query layer.
+    #   * FIFO order: oldest `created_at` in 'pending' is promoted
+    #     first, so clients' requests and recycled successors are
+    #     served in the order they arrived.
+    #
+    # The UPDATE is guarded on `status='pending'` so concurrent ticks
+    # can't double-promote the same row.  If two ticks race and both
+    # pick the same pending row, only one UPDATE lands; the other is
+    # a no-op.  Idempotent and safe.
+    try:
+        open_count_resp = supabase.table("fulfillment_requests") \
+            .select("request_id", count="exact") \
+            .eq("status", "open") \
+            .execute()
+        open_count = open_count_resp.count or 0
+        slots = FULFILLMENT_MAX_PARALLEL_REQUESTS - open_count
+        if slots > 0:
+            pending = supabase.table("fulfillment_requests") \
+                .select("request_id") \
+                .eq("status", "pending") \
+                .order("created_at", desc=False) \
+                .limit(slots) \
+                .execute()
+            if pending.data:
+                if T_SECONDS_OVERRIDE > 0:
+                    commit_seconds = T_SECONDS_OVERRIDE
+                else:
+                    commit_seconds = epochs_to_seconds(T_EPOCHS, _get_tempo(supabase))
+                w_end = now + timedelta(seconds=commit_seconds)
+                r_end = w_end + timedelta(minutes=M_MINUTES)
+                for p in pending.data:
+                    rid = p["request_id"]
+                    try:
+                        supabase.table("fulfillment_requests").update({
+                            "status": "open",
+                            "window_start": now_iso,
+                            "window_end": w_end.isoformat(),
+                            "reveal_window_end": r_end.isoformat(),
+                        }).eq("request_id", rid) \
+                          .eq("status", "pending") \
+                          .execute()
+                        print(f"   ⬆️  {rid[:8]}... promoted pending → open "
+                              f"(window_end {w_end.strftime('%H:%M:%S')}Z)")
+                    except Exception as e:
+                        print(f"   ⚠️  Promote failed for {rid[:8]}: {e}")
+    except Exception as e:
+        print(f"❌ Promotion step error: {e}")
+
     # Debug: show all non-terminal request statuses
     all_req = supabase.table("fulfillment_requests") \
         .select("request_id, status, window_end, reveal_window_end") \
-        .in_("status", ["open", "commit_closed", "scoring"]) \
+        .in_("status", ["pending", "open", "commit_closed", "scoring"]) \
         .execute()
     if all_req.data:
         print(f"🔄 Lifecycle tick @ {now_iso[:19]}Z — {len(all_req.data)} active request(s):")
         for ar in (all_req.data or []):
+            we = ar.get("window_end") or "?"
+            re_ = ar.get("reveal_window_end") or "?"
             print(f"   {ar['request_id'][:8]}... status={ar['status']} "
-                  f"window_end={ar.get('window_end', '?')[:19]} "
-                  f"reveal_end={ar.get('reveal_window_end', '?')[:19]}")
+                  f"window_end={str(we)[:19]} "
+                  f"reveal_end={str(re_)[:19]}")
 
     # Step 1: open -> commit_closed (past window_end)
     open_past_window = supabase.table("fulfillment_requests") \
@@ -500,36 +567,32 @@ def _recycle_request(
     responded) or ``expired`` (if validators failed to score) so dashboards
     can distinguish why a request was recycled.
     """
-    from gateway.fulfillment.config import T_EPOCHS, M_MINUTES, epochs_to_seconds
     rid = original_request["request_id"]
     new_id = str(uuid4())
-    tempo = _get_tempo(supabase)
-    new_window_end = now + timedelta(seconds=epochs_to_seconds(T_EPOCHS, tempo))
-    new_reveal_end = new_window_end + timedelta(minutes=M_MINUTES)
 
     # Recycle protocol:
     #   1. INSERT the successor row first.  This satisfies the DB-level FK
     #      constraint fulfillment_requests_successor_request_id_fkey, which
     #      requires the successor to exist BEFORE any row can point at it.
+    #      The successor enters the queue in 'pending' state with NULL
+    #      window timestamps — its commit timer only starts when the
+    #      lifecycle promotion step (Step 0) moves it to 'open'.  This
+    #      guarantees a recycled request never ticks down its window
+    #      while invisible to miners.
     #   2. Atomically claim the predecessor with a guarded UPDATE
     #      (WHERE successor_request_id IS NULL).  Only one concurrent tick
     #      can win; the loser sees claim.data empty and cleans up its own
     #      successor insert.
     #   3. If step 2 fails for ANY reason — race-lost, network error,
     #      exception — the try/finally below deletes the just-inserted
-    #      successor so we never leak an orphan "open" row back into the
-    #      miner-facing queue.
+    #      successor so we never leak an orphan 'pending' row back into
+    #      the queue.
     #
     # Failure modes and their handling:
     #   * Race with another tick         -> claim_won=False, finally deletes X
     #   * UPDATE throws (network / DB)   -> exception re-raised, finally deletes X
     #   * Hard kill between INSERT and   -> orphan X left (only residual risk;
     #     the finally block                  a periodic orphan-sweep can clean it)
-    #
-    # This is the opposite ordering from the previous attempt, which did
-    # UPDATE-before-INSERT and was rejected by the FK constraint on every
-    # tick (see the "foreign key constraint ... is not present" errors that
-    # piled up in gateway.log).
     successor_inserted = False
     claim_won = False
     try:
@@ -538,10 +601,10 @@ def _recycle_request(
             "request_hash": "",
             "icp_details": original_request["icp_details"],
             "num_leads": original_request["num_leads"],
-            "window_start": now_iso,
-            "window_end": new_window_end.isoformat(),
-            "reveal_window_end": new_reveal_end.isoformat(),
-            "status": "open",
+            "window_start": None,
+            "window_end": None,
+            "reveal_window_end": None,
+            "status": "pending",
             "created_by": "recycled",
         }).execute()
         successor_inserted = True
