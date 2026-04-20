@@ -19,8 +19,10 @@ from gateway.fulfillment.config import (
     T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES,
     FULFILLMENT_BANS_ENABLED, FULFILLMENT_MAX_PARALLEL_REQUESTS,
     FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES,
+    FULFILLMENT_MINER_SUBMISSION_MULTIPLIER,
     epochs_to_seconds,
 )
+import math
 from gateway.fulfillment.hashing import HASH_SCHEMA_VERSION, hash_request, verify_commit
 from gateway.fulfillment.models import (
     FulfillmentICP,
@@ -63,6 +65,26 @@ def _get_tempo(supabase) -> int:
     except Exception:
         pass
     return 360
+
+
+def _miner_submission_cap(num_leads: int) -> int:
+    """Max leads a single miner can commit to a request.
+
+    Returns ceil(num_leads * FULFILLMENT_MINER_SUBMISSION_MULTIPLIER), with a
+    hard floor of num_leads (so the cap can never drop below what the client
+    asked for — a miner must always be able to fulfill on their own).
+
+    Default multiplier is 1.5, meaning for a 10-lead request a miner can
+    submit up to 15 leads.  The surplus buffers against transient validation
+    failures (TrueList/LinkedIn pass-rate is ~70-80%).  Only the top
+    num_leads by score actually win rewards, so the cap has no effect on
+    reward inflation — it only reduces the probability that the whole
+    batch is discarded because one or two leads hit a coin-flip failure.
+    """
+    if num_leads <= 0:
+        return 0
+    cap = math.ceil(num_leads * FULFILLMENT_MINER_SUBMISSION_MULTIPLIER)
+    return max(cap, num_leads)
 
 
 def _log_event(event_type: EventType, payload: dict) -> None:
@@ -286,7 +308,14 @@ async def get_active_requests(miner_hotkey: str = ""):
 
     requests_out = []
     for r in (resp.data or []):
-        # If miner already committed the full num_leads, don't return this request
+        per_miner_cap = _miner_submission_cap(r["num_leads"])
+
+        # Hide requests this miner has already fully committed to.  The
+        # threshold is the per-miner CAP (num_leads * multiplier), not
+        # num_leads itself — a miner can commit up to the cap, so they
+        # are only "done" once they've hit it.  Using num_leads here
+        # would hide a request from a miner who committed exactly N
+        # but still has headroom to commit up to 1.5×N.
         if miner_hotkey:
             existing = supabase.table("fulfillment_submissions") \
                 .select("submission_id, lead_hashes") \
@@ -295,7 +324,7 @@ async def get_active_requests(miner_hotkey: str = ""):
                 .execute()
             if existing.data:
                 committed_count = len(existing.data[0].get("lead_hashes", []))
-                if committed_count >= r["num_leads"]:
+                if committed_count >= per_miner_cap:
                     continue  # fully committed — hide this request
 
         icp = r.get("icp_details", {})
@@ -303,6 +332,7 @@ async def get_active_requests(miner_hotkey: str = ""):
             "request_id": r["request_id"],
             "icp": icp,
             "num_leads": r["num_leads"],
+            "max_submissions_per_miner": per_miner_cap,
             "window_end": r["window_end"],
             "reveal_window_end": r["reveal_window_end"],
         })
@@ -353,9 +383,20 @@ async def commit_leads(commit: FulfillmentCommitRequest):
     if now > _isoparse(req["window_end"]):
         raise HTTPException(400, detail="Commit window expired")
 
-    num_leads_max = req["num_leads"]
+    # Per-miner cap: num_leads * FULFILLMENT_MINER_SUBMISSION_MULTIPLIER,
+    # ceil'd.  Default 1.5 so a miner has headroom for transient validation
+    # failures (TrueList / LinkedIn scrape flakiness).  Only the top
+    # num_leads by score actually win rewards, so the surplus is pure
+    # headroom for the miner; it cannot inflate emission.
+    num_leads_target = req["num_leads"]
+    num_leads_max = _miner_submission_cap(num_leads_target)
+    cap_suffix = (
+        f"request asks for {num_leads_target}; per-miner cap is "
+        f"{num_leads_max} (= {FULFILLMENT_MINER_SUBMISSION_MULTIPLIER}× ceiling) "
+        f"to absorb validation flakiness."
+    )
 
-    # Check for existing submission (allows appending up to num_leads)
+    # Check for existing submission (allows appending up to num_leads_max)
     existing_sub = supabase.table("fulfillment_submissions") \
         .select("submission_id, lead_hashes") \
         .eq("request_id", commit.request_id) \
@@ -379,13 +420,16 @@ async def commit_leads(commit: FulfillmentCommitRequest):
         if total_after > num_leads_max:
             raise HTTPException(422, detail=(
                 f"Too many leads: already committed {len(existing_hashes)}, "
-                f"adding {len(new_entries)} would exceed max {num_leads_max}"
+                f"adding {len(new_entries)} would total {total_after} "
+                f"which exceeds cap {num_leads_max}.  {cap_suffix}"
             ))
 
         if len(existing_hashes) >= num_leads_max:
             raise HTTPException(409, detail={
-                "message": f"Already committed {len(existing_hashes)}/{num_leads_max} leads",
+                "message": f"Already at cap: {len(existing_hashes)}/{num_leads_max} leads committed",
                 "submission_id": submission_id,
+                "num_leads": num_leads_target,
+                "max_submissions_per_miner": num_leads_max,
             })
 
         merged_hashes = existing_hashes + new_entries
@@ -400,7 +444,8 @@ async def commit_leads(commit: FulfillmentCommitRequest):
         # First commit for this miner + request
         if len(new_entries) > num_leads_max:
             raise HTTPException(422, detail=(
-                f"Too many leads: submitted {len(new_entries)}, max {num_leads_max}"
+                f"Too many leads: submitted {len(new_entries)}, "
+                f"cap is {num_leads_max}.  {cap_suffix}"
             ))
 
         try:

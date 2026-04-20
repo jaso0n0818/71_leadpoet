@@ -23,6 +23,25 @@ FULFILLMENT_BANS_ENABLED = os.getenv("FULFILLMENT_BANS_ENABLED", "false").lower(
 FULFILLMENT_MAX_PARALLEL_REQUESTS = int(os.getenv("FULFILLMENT_MAX_PARALLEL_REQUESTS", "5"))
 FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES = int(os.getenv("FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES", "15"))
 
+# Per-miner submission cap is (request.num_leads * this multiplier), ceil'd.
+# Default 1.5 so a miner can commit ~50% more leads than the request requires
+# to absorb the real-time validation flakiness (TrueList + LinkedIn scrapes
+# currently pass ~70-80% of legitimate leads).  Only the top num_leads by
+# score actually win rewards — the surplus just protects the miner from
+# having their whole batch discarded because a couple of leads lost the
+# coin flip on a transient failure.
+#
+# Increase on days with low miner participation, decrease once pass-rate
+# improves.  Must be >= 1.0 (can't commit fewer than num_leads or the
+# quota gate can never be met from a single miner).
+FULFILLMENT_MINER_SUBMISSION_MULTIPLIER = float(os.getenv("FULFILLMENT_MINER_SUBMISSION_MULTIPLIER", "1.5"))
+if FULFILLMENT_MINER_SUBMISSION_MULTIPLIER < 1.0:
+    logging.warning(
+        f"FULFILLMENT_MINER_SUBMISSION_MULTIPLIER={FULFILLMENT_MINER_SUBMISSION_MULTIPLIER} < 1.0; "
+        "clamping to 1.0 so miners can always commit at least num_leads."
+    )
+    FULFILLMENT_MINER_SUBMISSION_MULTIPLIER = 1.0
+
 FULFILLMENT_MIN_INTENT_SCORE = float(os.getenv("FULFILLMENT_MIN_INTENT_SCORE", "5.0"))
 FULFILLMENT_INTENT_QUALITY_FLOOR = float(os.getenv("FULFILLMENT_INTENT_QUALITY_FLOOR", "5.0"))
 FULFILLMENT_INTENT_BREADTH_WEIGHT = float(os.getenv("FULFILLMENT_INTENT_BREADTH_WEIGHT", "0.10"))
