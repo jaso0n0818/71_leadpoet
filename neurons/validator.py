@@ -1698,6 +1698,60 @@ class Validator(BaseValidatorNeuron):
             # Block file is now updated inline in process_gateway_validation_workflow()
             # (No separate background thread needed - eliminates websocket concurrency)
 
+            # ════════════════════════════════════════════════════════════
+            # FULFILLMENT POLLING TASK (decoupled from main loop)
+            # ════════════════════════════════════════════════════════════
+            # Runs process_fulfillment_workflow every 30s on its own asyncio
+            # task, independent of the main loop.  The main loop can stall
+            # for many minutes during "Skipping epoch X (already processed)"
+            # spin phases or during heavy sourcing/qualification work, and
+            # when that happens the fulfillment polling starves — gateway
+            # requests in `scoring` status expire before we fetch them (we
+            # lost a dozen client requests this way on 2026-04-21 even after
+            # bumping the gateway's consensus timeout from 5 to 15 minutes).
+            #
+            # The background task is the sole caller of
+            # process_fulfillment_workflow; the old main-loop call site was
+            # removed below (same function name, so both calling it at the
+            # same time would race on `_ff_distributed_epochs`).
+            #
+            # The 5-min asyncio.wait_for guard prevents a hung workflow call
+            # from permanently freezing the polling loop.  If a tick exceeds
+            # the guard we log and move on; the next tick retries fresh.
+            fulfillment_scoring_task = None
+            if os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true":
+                async def _fulfillment_polling_loop():
+                    bt.logging.info("🎯 Fulfillment polling loop started (ticks every 30s)")
+                    while not self.should_exit:
+                        try:
+                            await asyncio.wait_for(
+                                self.process_fulfillment_workflow(),
+                                timeout=300,
+                            )
+                        except asyncio.TimeoutError:
+                            bt.logging.warning(
+                                "Fulfillment polling tick exceeded 300s guard — "
+                                "skipping this tick, will retry next interval"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            bt.logging.warning(
+                                f"Fulfillment polling tick error (non-fatal): {e}"
+                            )
+                        try:
+                            await asyncio.sleep(30)
+                        except asyncio.CancelledError:
+                            raise
+                    bt.logging.info("🎯 Fulfillment polling loop exiting (should_exit)")
+
+                fulfillment_scoring_task = asyncio.create_task(_fulfillment_polling_loop())
+                bt.logging.info("✅ Fulfillment polling task scheduled")
+            else:
+                bt.logging.info(
+                    "ℹ️  ENABLE_FULFILLMENT != 'true', skipping fulfillment polling task"
+                )
+
             try:
                 # Keep the validator running and continuously process leads
                 while not self.should_exit:
@@ -1720,15 +1774,10 @@ class Validator(BaseValidatorNeuron):
                         bt.logging.warning(f"Error in process_curation_requests_continuous: {e}")
                         await asyncio.sleep(5)  # Wait before retrying
                     
-                    # ════════════════════════════════════════════════════════════
-                    # FULFILLMENT SCORING WORKFLOW
-                    # Distributes work at epoch start, collects after sourcing
-                    # Enable with: export ENABLE_FULFILLMENT=true
-                    # ════════════════════════════════════════════════════════════
-                    try:
-                        await self.process_fulfillment_workflow()
-                    except Exception as e:
-                        bt.logging.warning(f"Error in process_fulfillment_workflow: {e}")
+                    # FULFILLMENT: now runs on its own background task (see
+                    # fulfillment_scoring_task created above).  Polls every 30s
+                    # independent of this main loop's state, so it cannot be
+                    # starved by "Skipping epoch" spins or heavy sourcing work.
 
                     # ════════════════════════════════════════════════════════════
                     # QUALIFICATION MODEL EVALUATION (polls gateway for miner models)
