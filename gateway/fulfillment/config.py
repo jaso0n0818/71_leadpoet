@@ -17,7 +17,18 @@ FULFILLMENT_MAX_CONCURRENT_SOURCES = int(os.getenv("FULFILLMENT_MAX_CONCURRENT_S
 FULFILLMENT_OPENROUTER_API_KEY = os.getenv("FULFILLMENT_OPENROUTER_API_KEY", "")
 FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS = int(os.getenv("FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS", "30"))
 FULFILLMENT_MIN_VALIDATORS = int(os.getenv("FULFILLMENT_MIN_VALIDATORS", "1"))
-FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "5"))
+# How long the gateway waits (after reveal_window_end) for validators to
+# score a request before recycling it with reason=no_validators_timeout.
+# Must exceed the validator's worst-case Phase 1 polling cadence. During
+# heavy sourcing/qualification work the validator's main loop can stall
+# well beyond 5 min between fulfillment polls, so 5 min was too tight —
+# multiple requests expired with 0 validator scores despite miners having
+# committed + revealed cleanly (observed 2026-04-21: requests 42763887,
+# a20d269e, 76d8c404, c37097db, 7cbb4f4a all died this way).
+# 15 min gives the validator ~3× more polling windows to pick up a newly-
+# scoring request, while still leaving plenty of headroom inside a 72-min
+# epoch for downstream consensus + dedup + reward computation.
+FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "15"))
 FULFILLMENT_BANS_ENABLED = os.getenv("FULFILLMENT_BANS_ENABLED", "false").lower() == "true"
 
 FULFILLMENT_MAX_PARALLEL_REQUESTS = int(os.getenv("FULFILLMENT_MAX_PARALLEL_REQUESTS", "5"))
