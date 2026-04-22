@@ -3100,10 +3100,10 @@ class Validator(BaseValidatorNeuron):
             # Allocation shares (dynamic based on champion status)
             BASE_BURN_SHARE = 0.0          # 0% base burn to UID 0
             CHAMPION_SHARE = 0.05          # 5% to qualification model champion (when active)
-            FULFILLMENT_POOL_SHARE = 0.50  # 50% reserved for fulfillment (when enabled)
+            FULFILLMENT_POOL_SHARE = 0.60  # 60% reserved for fulfillment (when enabled)
             # MAX_SOURCING_SHARE is computed dynamically:
             #   No champion, no fulfillment → 100% to sourcing miners
-            #   Both active → 45% sourcing, 5% champion, 50% fulfillment pool
+            #   Both active → 35% sourcing, 5% champion, 60% fulfillment pool
             
             # CONFIGURABLE THRESHOLD: Approved leads needed in 30 epochs for full sourcing share
             # If network produces >= this many leads, full share is distributed
@@ -3238,7 +3238,7 @@ class Validator(BaseValidatorNeuron):
             except Exception as e:
                 print(f"   ⚠️  Error reading champion: {e} - 100% to sourcing miners")
             
-            # Fulfillment pool is ALWAYS reserved (50%). If fulfillment is disabled
+            # Fulfillment pool is ALWAYS reserved (60%). If fulfillment is disabled
             # on this validator, or no miners earned rewards this epoch, the unused
             # portion flows to burn — it does NOT redistribute back to sourcing.
             ff_enabled = os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true"

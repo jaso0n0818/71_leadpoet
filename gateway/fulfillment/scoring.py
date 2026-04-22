@@ -316,7 +316,21 @@ async def score_fulfillment_lead(
     email_verified = verif_data.get("stage_3_email", {}).get("email_status") == "valid"
     person_verified = verif_data.get("stage_4_linkedin", {}).get("linkedin_verified", False)
     stage5 = verif_data.get("stage_5_verification", {})
-    company_verified = stage5.get("role_verified", False) and stage5.get("industry_verified", False)
+    # Stage 5 populates company_name_verified, company_size_verified,
+    # company_hq_verified, and industry_verified (see
+    # validator_models/automated_checks.py ~L919-922).  The previous
+    # code read `role_verified` from here, which is actually a Stage 4
+    # field (stage4_person_verification sets it), not Stage 5 — so
+    # this flag was always False for every lead ever scored, even
+    # though Stage 5 itself hard-rejects name / size / HQ-country /
+    # domain mismatches and therefore WAS verifying the company.
+    # The display flag now correctly reflects Stage 5's company-name
+    # match: if LinkedIn's scraped company name matches the miner's
+    # submitted company, company_verified=True.  This does not change
+    # any rejection behavior (Stage 5 already rejects mismatches); it
+    # only fixes the informational flag that surfaces to clients via
+    # consensus_company_verified in /fulfillment/results/{id}.
+    company_verified = stage5.get("company_name_verified", False)
     rep_score_val = float(verif_data.get("rep_score", {}).get("total_score", 0))
 
     if verif_failure:
