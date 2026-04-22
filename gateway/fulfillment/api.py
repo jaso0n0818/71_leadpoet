@@ -228,6 +228,33 @@ async def create_request(icp: FulfillmentICP):
     icp.intent_signals = [scrub_company_name(s, company) for s in icp.intent_signals]
     icp.target_roles = [scrub_company_name(s, company) for s in icp.target_roles]
 
+    # Auto-expand target_roles into common variant spellings / near-
+    # synonyms so downstream per-lead matching doesn't reject legitimate
+    # leads just because their LinkedIn title uses a slightly different
+    # wording (e.g. "VP Sales" vs client-submitted "VP of Sales").  One
+    # LLM call per request at creation time, deterministic afterwards:
+    # the expanded list is locked into icp_details before hashing, so
+    # every miner + validator sees the same canonical list for the
+    # life of the request.  Failure of the LLM call leaves icp.target_roles
+    # unchanged — the function is best-effort.
+    try:
+        from gateway.fulfillment.role_expander import expand_target_roles
+        expanded = await expand_target_roles(
+            icp.target_roles,
+            target_seniority=icp.target_seniority,
+        )
+        if expanded and len(expanded) > len(icp.target_roles):
+            logger.info(
+                f"create_request: expanded target_roles "
+                f"{len(icp.target_roles)} → {len(expanded)}"
+            )
+            icp.target_roles = expanded
+    except Exception as e:
+        logger.warning(
+            f"create_request: target_roles expansion failed (keeping seeds): "
+            f"{type(e).__name__}: {e}"
+        )
+
     # model_dump() excludes `internal_label` and `company` (both Field(exclude=True))
     # so neither lands in icp_details (which is what miners see).
     icp_dict = icp.model_dump(mode="json")
