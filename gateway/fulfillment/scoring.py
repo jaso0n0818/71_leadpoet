@@ -635,6 +635,19 @@ async def _run_fulfillment_stage0_2(
     head_task = asyncio.create_task(check_head_request(validator_dict))
 
     # -- Stage 1: DNS checks in parallel --
+    # check_domain_age still RUNS (to populate WHOIS metadata used by the
+    # rep-score check downstream) but its "<7 days old → reject" gate no
+    # longer rejects fulfillment leads.  Stage 5 website confirmation
+    # already verifies the miner's domain appears on the company's real
+    # LinkedIn page, which is a stronger signal than raw registration
+    # age.  A legitimately new startup (< 7 days old but already on
+    # LinkedIn) used to be wrongly rejected here; ~7% of rejected leads
+    # hit this path on 2026-04-21.  check_mx_record and check_spf_dmarc
+    # stay hard-gating — a domain with no MX record genuinely can't
+    # receive mail.
+    CHECK_INDEX = {0: "check_domain_age", 1: "check_mx_record", 2: "check_spf_dmarc"}
+    DOMAIN_AGE_INDEX = 0
+
     dns_results = await asyncio.gather(
         check_domain_age(validator_dict),
         check_mx_record(validator_dict),
@@ -642,18 +655,30 @@ async def _run_fulfillment_stage0_2(
         return_exceptions=True,
     )
 
-    for result in dns_results:
+    for idx, result in enumerate(dns_results):
+        is_domain_age = (idx == DOMAIN_AGE_INDEX)
+
         if isinstance(result, Exception):
+            if is_domain_age:
+                # WHOIS flakiness shouldn't tank the lead — rep score
+                # will reflect reduced confidence automatically.
+                print(f"   ℹ️  check_domain_age errored (non-fatal, bypassed): {result}")
+                continue
             _collect_dns_data()
             head_task.cancel()
             return _fail({
                 "stage": "Stage 1: DNS Layer",
-                "check_name": "stage1_dns_failure",
+                "check_name": CHECK_INDEX.get(idx, "stage1_dns_failure"),
                 "message": str(result),
                 "failed_fields": ["domain"],
             })
+
         passed, rejection = result
         if not passed:
+            if is_domain_age:
+                msg = (rejection or {}).get("message", "domain too young")
+                print(f"   ℹ️  check_domain_age failed but bypassed in fulfillment: {msg}")
+                continue
             _collect_dns_data()
             head_task.cancel()
             return _fail(rejection)
