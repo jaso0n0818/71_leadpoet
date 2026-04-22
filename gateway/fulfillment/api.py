@@ -725,6 +725,37 @@ async def submit_scores(
     except Exception as e:
         raise HTTPException(500, detail=f"Score submission failed: {e}")
 
+    # The fulfillment_upsert_scores RPC was defined before the
+    # `intent_signals_detail` column existed on fulfillment_scores; it
+    # silently drops that field from the payload when writing the row.
+    # Empirically 0 of 345 rows had this column populated pre-fix even
+    # though the validator has always been POSTing it in the payload.
+    # Without this column, consensus can't build intent_signal_mapping,
+    # and the client-facing intent_details narrative falls back to an
+    # LLM error message saying "no intent signals were provided".
+    # Patch it with a direct UPDATE keyed on (request_id, validator,
+    # lead_id) which is the same natural key the RPC upserts on.  This
+    # is best-effort: one failed patch doesn't fail the whole submission.
+    for s in scores:
+        detail = s.get("intent_signals_detail")
+        if not detail:
+            continue
+        lid = s.get("lead_id")
+        if not lid:
+            continue
+        try:
+            supabase.table("fulfillment_scores").update({
+                "intent_signals_detail": detail,
+            }).eq("request_id", s.get("request_id", request_id)) \
+              .eq("validator_hotkey", validator_hotkey) \
+              .eq("lead_id", lid) \
+              .execute()
+        except Exception as e:
+            logger.warning(
+                f"Failed to patch intent_signals_detail for lead "
+                f"{str(lid)[:8]}: {e}"
+            )
+
     _log_event(EventType.FULFILLMENT_SCORED, validator_hotkey, {
         "request_id": request_id,
         "scores": [
