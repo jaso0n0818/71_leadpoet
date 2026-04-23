@@ -19,16 +19,19 @@ FULFILLMENT_LIFECYCLE_INTERVAL_SECONDS = int(os.getenv("FULFILLMENT_LIFECYCLE_IN
 FULFILLMENT_MIN_VALIDATORS = int(os.getenv("FULFILLMENT_MIN_VALIDATORS", "1"))
 # How long the gateway waits (after reveal_window_end) for validators to
 # score a request before recycling it with reason=no_validators_timeout.
-# Must exceed the validator's worst-case Phase 1 polling cadence. During
-# heavy sourcing/qualification work the validator's main loop can stall
-# well beyond 5 min between fulfillment polls, so 5 min was too tight —
-# multiple requests expired with 0 validator scores despite miners having
-# committed + revealed cleanly (observed 2026-04-21: requests 42763887,
-# a20d269e, 76d8c404, c37097db, 7cbb4f4a all died this way).
-# 15 min gives the validator ~3× more polling windows to pick up a newly-
-# scoring request, while still leaving plenty of headroom inside a 72-min
-# epoch for downstream consensus + dedup + reward computation.
-FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "15"))
+# Must exceed the validator's worst-case end-to-end scoring time, not
+# just its polling cadence.  Scoring a single request with 60+ leads
+# takes 30-60 minutes under real load (Stage 4 LinkedIn scrapes, Tier
+# 3 LLM calls per signal, TrueList batch verification, per-lead rep
+# score lookup).  5 min was too tight (2026-04-21).  15 min was also
+# too tight (2026-04-22: requests 669fd2b7 and 7c666b4e both expired
+# with no consensus computed even though the validator DID score them
+# minutes later — scores landed in fulfillment_scores after the gateway
+# had already marked the request expired, orphaning real miner work).
+# 90 min gives the validator plenty of headroom for a backed-up scoring
+# queue across multiple concurrent requests and is still well under the
+# 72-min epoch × multiple-epoch runway that the reward system allows.
+FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "90"))
 FULFILLMENT_BANS_ENABLED = os.getenv("FULFILLMENT_BANS_ENABLED", "false").lower() == "true"
 
 FULFILLMENT_MAX_PARALLEL_REQUESTS = int(os.getenv("FULFILLMENT_MAX_PARALLEL_REQUESTS", "5"))
