@@ -251,7 +251,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
 
     # Step 2: commit_closed -> scoring or recycled (past reveal_window_end)
     closed_past_reveal = supabase.table("fulfillment_requests") \
-        .select("request_id, icp_details, num_leads, reveal_window_end") \
+        .select("request_id, icp_details, num_leads, reveal_window_end, internal_label, company") \
         .eq("status", "commit_closed") \
         .lt("reveal_window_end", now_iso) \
         .execute()
@@ -297,7 +297,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
 
     # Step 3: consensus aggregation for scoring requests
     scoring_requests = supabase.table("fulfillment_requests") \
-        .select("request_id, reveal_window_end, icp_details, num_leads") \
+        .select("request_id, reveal_window_end, icp_details, num_leads, internal_label, company") \
         .eq("status", "scoring") \
         .execute()
 
@@ -635,11 +635,19 @@ def _recycle_request(
     successor_inserted = False
     claim_won = False
     try:
+        # internal_label and company are client-side attribution fields that
+        # must survive recycle — a successor still represents the same client
+        # request, so dashboards and billing keep the same owner identity.
+        # Neither is ever shown to miners (company is scrubbed out of the
+        # ICP by api.py::create_request before hashing), but they must match
+        # the predecessor so audit trails stay clean across recycles.
         supabase.table("fulfillment_requests").insert({
             "request_id": new_id,
             "request_hash": "",
             "icp_details": original_request["icp_details"],
             "num_leads": original_request["num_leads"],
+            "internal_label": original_request.get("internal_label"),
+            "company": original_request.get("company"),
             "window_start": None,
             "window_end": None,
             "reveal_window_end": None,
