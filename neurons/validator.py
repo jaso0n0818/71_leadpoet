@@ -101,7 +101,7 @@ try:
         is_keypair_initialized,
         is_enclave_running,
     )
-    from leadpoet_canonical.weights import normalize_to_u16, bundle_weights_hash
+    from leadpoet_canonical.weights import normalize_to_u16, normalize_to_u16_with_uids, bundle_weights_hash
     from leadpoet_canonical.binding import create_binding_message
     TEE_AVAILABLE = True
 except ImportError as e:
@@ -3582,32 +3582,59 @@ class Validator(BaseValidatorNeuron):
                 git_commit_short = "unknown"
             
             # ═══════════════════════════════════════════════════════════════════
-            # Step 1: Convert floats to u16 using canonical function
-            # CRITICAL FIX: Bittensor's convert_weights_and_uids_for_emit removes
-            # zero-weight UIDs, so we must filter BEFORE calling normalize_to_u16
-            # to ensure UIDs and weights stay aligned.
+            # Step 1: Convert floats to u16 using canonical function.
+            #
+            # Bittensor's convert_weights_and_uids_for_emit drops UIDs whose
+            # u16 weight rounds to 0 — that includes tiny-but-positive floats
+            # (e.g. 1/65535 / N) that survive our ``w > 0`` pre-filter but
+            # quantize to zero after scaling.  Previous implementation pre-
+            # filtered ``w > 0`` and then aborted when bittensor STILL
+            # dropped a UID (length mismatch check), which silently killed
+            # every gateway submission since those tiny weights are a
+            # normal outcome of weighted-stake distribution.  Auditor
+            # validators starved: the ``published_weight_bundles`` table
+            # went 23 h without an insert.
+            #
+            # Fix: use ``normalize_to_u16_with_uids`` which returns the
+            # same list of UIDs bittensor actually accepted, so our
+            # (uids, weights_u16) stay in lockstep regardless of how many
+            # small-weight rows bittensor decided to truncate.
             # ═══════════════════════════════════════════════════════════════════
-            
-            # First, filter out zero weights to keep UIDs aligned with weights
+
             non_zero_pairs = [(uid, w) for uid, w in zip(uids, weights) if w > 0]
             if not non_zero_pairs:
                 bt.logging.warning("⚠️ No non-zero weights to submit")
                 return None
-            
+
             non_zero_pairs.sort(key=lambda x: x[0])  # Sort by UID
-            filtered_uids = [p[0] for p in non_zero_pairs]
-            filtered_weights = [p[1] for p in non_zero_pairs]
-            
-            # Now convert to u16 - all weights are non-zero so no UID removal will occur
-            weights_u16 = normalize_to_u16(filtered_uids, filtered_weights)
-            
-            # Verify lengths match (sanity check)
-            if len(filtered_uids) != len(weights_u16):
-                bt.logging.error(f"⚠️ UID/weight length mismatch after u16 conversion: {len(filtered_uids)} vs {len(weights_u16)}")
+            pre_uids = [p[0] for p in non_zero_pairs]
+            pre_weights = [p[1] for p in non_zero_pairs]
+
+            sparse_uids, sparse_weights_u16 = normalize_to_u16_with_uids(
+                pre_uids, pre_weights
+            )
+
+            if not sparse_uids or not sparse_weights_u16:
+                bt.logging.warning(
+                    "⚠️ All weights rounded to 0 during u16 conversion - nothing to submit"
+                )
                 return None
-            
-            sparse_uids = filtered_uids
-            sparse_weights_u16 = weights_u16
+
+            if len(sparse_uids) != len(sparse_weights_u16):
+                bt.logging.error(
+                    f"⚠️ UID/weight length mismatch after u16 conversion: "
+                    f"{len(sparse_uids)} vs {len(sparse_weights_u16)}"
+                )
+                return None
+
+            if len(sparse_uids) < len(pre_uids):
+                dropped = len(pre_uids) - len(sparse_uids)
+                bt.logging.info(
+                    f"ℹ️ bittensor dropped {dropped} UID(s) with u16-rounded-to-0 "
+                    f"weight during normalization "
+                    f"({len(pre_uids)} -> {len(sparse_uids)}). "
+                    f"Gateway bundle will match what actually lands on chain."
+                )
             
             # ═══════════════════════════════════════════════════════════════════
             # Step 2: Sign weights with enclave key

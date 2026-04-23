@@ -149,26 +149,54 @@ def weights_within_tolerance(
 def normalize_to_u16(uids: List[int], weights: List[float]) -> List[int]:
     """
     Convert float weights to u16 using Bittensor's EXACT method.
-    
+
     CRITICAL: Do NOT reimplement this. Rounding differences will cause
     false "equivocation detected" events because hashes won't match.
-    
+
     Args:
         uids: List of UIDs (MUST pass real UIDs, not range(len(weights)))
         weights: List of float weights corresponding to uids
-        
+
     Returns:
         List of u16 weights [0-65535]
-    
+
     NOTE: This function lives in leadpoet_canonical/ shared module
     to ensure gateway, validator, and auditor all use identical logic.
-    
+
     Fail-Closed: If bittensor import fails, raises ImportError.
     We do NOT fall back to a custom implementation that might differ.
+
+    IMPORTANT: Bittensor's ``convert_weights_and_uids_for_emit`` can
+    drop UIDs whose u16 weight rounds to 0 (tiny-but-positive floats
+    that lose precision after scaling by 65535), so the returned list
+    may be SHORTER than the input.  Callers that need to keep their
+    UID list in lockstep with the u16 list must use
+    :func:`normalize_to_u16_with_uids` instead.
+    """
+    _, normalized = normalize_to_u16_with_uids(uids, weights)
+    return normalized
+
+
+def normalize_to_u16_with_uids(
+    uids: List[int], weights: List[float]
+) -> tuple:
+    """Same as :func:`normalize_to_u16`, but also returns the
+    (possibly-filtered) UIDs that bittensor kept.
+
+    Use this when you're building a payload that pairs each UID with
+    its u16 weight (e.g. the TEE-signed bundle POSTed to the gateway's
+    ``/weights/submit`` endpoint).  bittensor's
+    ``convert_weights_and_uids_for_emit`` silently drops any UID whose
+    u16 value rounds to 0 — before this helper existed, the gateway
+    path would see ``len(filtered_uids) != len(weights_u16)`` and abort
+    every epoch, starving auditor validators of weight bundles.
+
+    Returns:
+        ``(uids, weights_u16)`` — both lists are the same length.
     """
     if not weights:
-        return []
-    
+        return [], []
+
     try:
         from bittensor.utils.weight_utils import convert_weights_and_uids_for_emit
         import numpy as np
@@ -178,17 +206,15 @@ def normalize_to_u16(uids: List[int], weights: List[float]) -> List[int]:
             "This module requires the exact Bittensor library to ensure hash consistency. "
             f"Original error: {e}"
         )
-    
-    # CRITICAL: Pass the REAL uids, not range(len(weights))
-    # Convert to numpy arrays as required by Bittensor API
+
     uids_array = np.array(uids, dtype=np.int64)
     weights_array = np.array(weights, dtype=np.float32)
-    
-    _, normalized = convert_weights_and_uids_for_emit(
+
+    filtered_uids, normalized = convert_weights_and_uids_for_emit(
         uids_array,
         weights_array,
     )
-    return list(normalized)
+    return list(filtered_uids), list(normalized)
 
 
 def u16_to_emit_floats(uids: List[int], weights_u16: List[int]) -> List[float]:
