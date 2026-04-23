@@ -7,7 +7,13 @@ All values are read from environment variables with sensible defaults.
 import os
 import logging
 
-T_EPOCHS = int(os.getenv("FULFILLMENT_T_EPOCHS", "2"))
+# Commit-window duration in epochs (1 epoch = 360 blocks × 12s = 72 min on
+# this subnet).  Miners have this long, from the moment the request is
+# promoted from pending to open, to source leads and submit a commit hash.
+# Set to 1 (down from 2) on 2026-04-22 — observed miner pipelines finish
+# well under an epoch and holding requests open longer just means more
+# queued requests backing up behind FULFILLMENT_MAX_PARALLEL_REQUESTS.
+T_EPOCHS = int(os.getenv("FULFILLMENT_T_EPOCHS", "1"))
 T_SECONDS_OVERRIDE = int(os.getenv("FULFILLMENT_T_SECONDS", "0"))
 M_MINUTES = int(os.getenv("FULFILLMENT_M_MINUTES", "15"))
 BLOCK_TIME_SECONDS = 12
