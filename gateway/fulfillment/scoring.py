@@ -226,19 +226,25 @@ def _tier1_check(
     if icp.sub_industry and lead.sub_industry != icp.sub_industry:
         return "sub_industry_mismatch"
 
-    # Excluded companies: leads whose company matches any entry in the
-    # ICP's excluded_companies list are hard-rejected at Tier 1.  The
-    # list is populated by the gateway at create_request time from the
-    # client's prior FULFILLED requests (so a company never gets
-    # delivered twice to the same client), unless the client supplied
+    # Excluded companies: leads whose company EXACTLY matches any entry
+    # in the ICP's excluded_companies list (case-insensitive only, no
+    # suffix stripping, no punctuation normalization) are hard-rejected
+    # at Tier 1.  Populated by the gateway at create_request time from
+    # the client's prior FULFILLED requests unless the client supplied
     # an explicit list in the create payload.
-    # Compared via _normalize_company so "Acme Inc.", "Acme, Inc",
-    # "acme" all collapse to the same dedup key as the winner-dedup
-    # pass in _run_dedup_and_rewards (single source of truth).
+    #
+    # Exact-match is intentional: the lead's `business` field gets
+    # coerced to LinkedIn's canonical company name at Stage 5 of the
+    # original submit flow, so two submissions for the same company
+    # will have byte-identical `business` strings.  If the client
+    # manually types "Microsoft" in their excluded list and LinkedIn
+    # returns "Microsoft Corporation", those are treated as DIFFERENT
+    # companies here by design — fuzzy suffix-stripping would be too
+    # eager and could incorrectly block legitimate parent / subsidiary
+    # distinctions (e.g. "Meta" vs "Meta Platforms, Inc.").
     if icp.excluded_companies and lead.business:
-        from gateway.fulfillment.lifecycle import _normalize_company
-        excluded_keys = {_normalize_company(c) for c in icp.excluded_companies if c}
-        if _normalize_company(lead.business) in excluded_keys:
+        excluded_keys = {c.strip().lower() for c in icp.excluded_companies if c and c.strip()}
+        if lead.business.strip().lower() in excluded_keys:
             return "company_excluded"
 
     if icp.target_role_types and lead.role_type not in icp.target_role_types:
