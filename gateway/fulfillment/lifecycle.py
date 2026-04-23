@@ -356,6 +356,28 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 "p_consensus": consensus_results,
             }).execute()
 
+            # The upsert RPC's SQL signature doesn't know about the
+            # `intent_signal_mapping` column (added in a later migration),
+            # so it silently drops that field on insert/update.  Same class
+            # of bug as the `intent_signals_detail` patch in api.py::submit_scores.
+            # Backfill it directly here so the column always reflects the
+            # most-recent validator's per-signal breakdown and the downstream
+            # Perplexity intent_details step has something to ground against.
+            for cr in consensus_results:
+                mapping = cr.get("intent_signal_mapping") or []
+                if not mapping:
+                    continue
+                try:
+                    supabase.table("fulfillment_score_consensus").update({
+                        "intent_signal_mapping": mapping,
+                    }).eq("request_id", rid) \
+                      .eq("submission_id", cr["submission_id"]) \
+                      .eq("lead_id", cr["lead_id"]) \
+                      .execute()
+                except Exception as e:
+                    print(f"   ⚠️  Failed to patch intent_signal_mapping for "
+                          f"lead {str(cr.get('lead_id',''))[:8]}: {e}")
+
             num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or 0
             winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results, num_requested)
 
