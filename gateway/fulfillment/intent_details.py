@@ -5,8 +5,18 @@ Runs on the gateway once per winning fulfillment lead, after consensus.
 Synthesizes the miner's verified intent signals into a single
 client-ready paragraph for the "Intent Details" UI column.
 
-Model: perplexity/sonar-pro (via OpenRouter).
-Key:   FULFILLMENT_OPENROUTER_API_KEY (already wired into the gateway env).
+Model: ``openai/gpt-4o-mini`` via OpenRouter.
+Key:   ``FULFILLMENT_OPENROUTER_API_KEY`` (already wired into the gateway env).
+
+Why not Perplexity sonar-pro (previous model)?  sonar-pro is a
+web-search-augmented model — when its search returns no hits for the
+company name, it *refuses* and emits strings like "I need to clarify..."
+or "the search results don't contain information about...".  That's the
+correct bias for an open-web Q&A product but wrong for us: we already
+have the evidence (miner-submitted intent signals with URLs, snippets,
+and dates) and just want faithful synthesis.  gpt-4o-mini is non-search,
+deterministic-leaning, cheaper, faster, and much better at staying
+strictly inside the provided context.
 
 This module is self-contained: no dependency on miner-side helpers
 (``target_fit_model`` / ``openrouter.py``) which aren't deployed on the
@@ -26,38 +36,58 @@ logger = logging.getLogger(__name__)
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-SONAR_MODEL = "perplexity/sonar-pro"
-SONAR_TIMEOUT_SECONDS = 60
+LLM_MODEL = "openai/gpt-4o-mini"
+LLM_TIMEOUT_SECONDS = 60
 
 
-# The exact wording the user specified.  Adjusting this should be a
-# product decision, not a code change, so keep the rules verbatim.
-_PROMPT_TEMPLATE = """Add to the Intent Details column using the provided ICP and the identified intent signals for the company. Synthesize these signals into a clear, evidence-based explanation of why the company's observed activity indicates meaningful buying intent and aligns with the priorities, needs, or pain points defined in the ICP.
+# Prompt text closely mirrors the exact rule list the client uses when
+# hand-crafting Intent Details in Perplexity.  If you adjust a rule, this
+# should be a product decision synced with whatever's in the client-facing
+# UI spec, not a silent code change.
+_PROMPT_TEMPLATE = """Fill in the Intent Details paragraph for one specific company using the provided ICP and the identified intent signals below.
 
-Rules:
-- Only produce the Intent Details passage (no other text).
-- Intent Details must be expanded with rich buying-signal context explaining why the signal indicates relevance for the ICP.
-- Write Intent Details as a single natural paragraph (no subtitles, bullets, or labels).
-- Do not reference "this list," "these candidates," or the source file.
-- Do not add links or references in the Intent Details.
+Rules (strictly enforced):
+- Only produce the Intent Details paragraph. No preamble, no apology, no disclaimer, no mention of "search results", "available information", or your own limitations.
+- Synthesize ONLY from the intent signals provided below. Do not invent facts, do not speculate beyond what the signals support, and do not reference any source outside the inputs.
+- Intent Details must be expanded with rich buying-signal context explaining why the observed activity indicates relevance for the ICP.
+- Write as a single natural paragraph. No subtitles, bullets, labels, or markdown.
+- Do not reference "this list", "these candidates", or the source file.
+- Do not add links, citations, or references.
 - Output must be client-ready for direct use in the UI.
-- Ensure intent details are in natural paragraph format, not using any em dashes and not overusing hyphens.
-- Do not re-reference the client name in intent details.
-- Do not restate ICP facts like country / employee count.
-- Ensure all details are factual, evidence-based, and grounded in verifiable sources; do not include claims unless they can be supported by credible source material.
-- Do not include links. Output should be client-ready.
+- Use natural paragraph prose. No em dashes. Avoid over-using hyphens.
+- Do not restate the client name or ICP facts (country, employee count, industry, etc.).
+- Ensure every claim is grounded in the provided evidence. If a specific claim cannot be supported by the provided signals, omit it — write a shorter paragraph rather than fabricating detail.
 
 Inputs:
 
 ICP:
 {icp_block}
 
-Intent Signals:
+Intent Signals (the only evidence you may cite):
 {signals_block}
 
 Output:
 
-A single polished paragraph for the Intent Details column that clearly explains the relevance and strength of the company's buying intent."""
+A single polished paragraph for the Intent Details column that clearly explains the relevance and strength of this company's buying intent, grounded in the provided signals."""
+
+
+# Patterns that indicate the LLM emitted meta-commentary / refusal instead
+# of a real passage.  If the first ~200 characters match any of these, we
+# discard the output and return empty — the caller (lifecycle) treats that
+# as "skip this lead, don't persist intent_details".
+_REFUSAL_RE = re.compile(
+    r"\b(i need to clarify|i appreciate (the )?(detailed )?request|"
+    r"i apologi[sz]e|i(?:'m| am) (unable|sorry|not able)|"
+    r"unfortunately (i|we) (cannot|can't|don't|do not)|"
+    r"i (cannot|can't|don't|do not) (generate|produce|find|have)|"
+    r"the (provided )?(search results|available information|given "
+    r"(data|information|context|signals|search results)) (do not|does not|don't|doesn't) "
+    r"contain|no (verifiable |factual |specific |explicit )?"
+    r"(information|data|evidence|details) (about|on|regarding|for) "
+    r"[a-z0-9][\w\s&.,'()-]*? (is|was|has been|could|can) "
+    r"(found|available|provided|located|retrieved))",
+    flags=re.IGNORECASE,
+)
 
 
 def _format_icp_block(icp: Dict[str, Any]) -> str:
@@ -131,28 +161,48 @@ def _format_signals_block(signals: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _is_refusal(text: str) -> bool:
+    """Detect LLM refusal / meta-commentary outputs we should discard.
+
+    Checks only the opening ~200 characters so a passage that legitimately
+    mentions a keyword deep in the prose isn't thrown away.  The regex
+    covers the families of refusal openings we've actually observed in
+    production: "I need to clarify...", "I appreciate the detailed
+    request...", "the search results don't contain...", etc.
+    """
+    if not text:
+        return False
+    head = text[:250].lower()
+    return bool(_REFUSAL_RE.search(head))
+
+
 def _clean_passage(text: str) -> str:
     """Post-process the LLM output so it actually conforms to the rules.
 
-    Even with clear instructions, models sometimes emit em-dashes or
-    wrap the paragraph in quotes.  This is a belt-and-suspenders clean-up
-    that never changes the semantic content.
+    Returns empty string if the output is a refusal — the caller treats
+    empty as "don't persist", so refusals are dropped silently rather
+    than shown to the client as if they were real intent data.
     """
     if not text:
         return ""
 
     cleaned = text.strip()
-    # Strip wrapping quotes if present.
     if (cleaned.startswith("\"") and cleaned.endswith("\"")) or \
        (cleaned.startswith("'") and cleaned.endswith("'")):
         cleaned = cleaned[1:-1].strip()
 
-    # Replace em/en-dashes with commas (preserves readability).
+    # Em/en-dashes -> commas (rules explicitly forbid em dashes).
     cleaned = cleaned.replace("\u2014", ",").replace("\u2013", ",")
-    # Collapse runs of whitespace (incl. accidental newlines mid-paragraph).
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    # Strip any markdown header or list prefix that sometimes sneaks in.
     cleaned = re.sub(r"^(#+\s*|[-*]\s+)", "", cleaned)
+
+    if _is_refusal(cleaned):
+        logger.warning(
+            f"Intent details LLM returned a refusal / meta-commentary, "
+            f"discarding.  First 200 chars: {cleaned[:200]!r}"
+        )
+        return ""
+
     return cleaned
 
 
@@ -189,7 +239,7 @@ async def generate_intent_details_passage(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=SONAR_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers={
@@ -199,14 +249,24 @@ async def generate_intent_details_passage(
                     "X-Title": "LeadPoet Intent Details",
                 },
                 json={
-                    "model": SONAR_MODEL,
+                    "model": LLM_MODEL,
                     "messages": [
                         {
                             "role": "system",
                             "content": (
-                                "You write concise, client-ready buying-intent "
-                                "summaries. Respond with ONLY the final paragraph, "
-                                "no preamble, no labels, no markdown."
+                                "You write client-ready buying-intent summaries "
+                                "strictly from the evidence provided by the user. "
+                                "Absolute rules: respond with ONLY the final "
+                                "paragraph. Never apologize, never say 'I need to "
+                                "clarify', 'I appreciate', 'unfortunately', 'based "
+                                "on search results', or any similar meta-commentary. "
+                                "Never mention your own limitations or the source "
+                                "of the information. Never invent facts beyond the "
+                                "provided intent signals. If the provided signals "
+                                "are thin, write a shorter paragraph using only "
+                                "what is there, but still write a paragraph. "
+                                "No preamble, no labels, no markdown, no em dashes, "
+                                "no links."
                             ),
                         },
                         {"role": "user", "content": prompt},
