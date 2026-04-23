@@ -1305,10 +1305,18 @@ async def fetch_url_content(url: str, source: str) -> str:
     elif source_lower == "social_media":
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
-        if hostname in ("twitter.com", "www.twitter.com", "x.com", "www.x.com", "mobile.twitter.com"):
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+        if hostname in ("twitter.com", "x.com", "mobile.twitter.com"):
             if "/status/" in url:
                 return await scrapingdog_x_post(url)
             return await scrapingdog_x_profile(url)
+        if hostname in ("youtube.com", "youtu.be", "m.youtube.com"):
+            return await scrapingdog_youtube(url)
+        if hostname in ("tiktok.com", "m.tiktok.com", "vm.tiktok.com"):
+            return await scrapingdog_tiktok(url)
+        # Facebook, Instagram, Reddit, Threads, Pinterest etc. — no dedicated
+        # ScrapingDog endpoints, fall back to generic rendered scrape.
         return await scrapingdog_generic(url)
     elif source_lower == "review_site":
         return await scrapingdog_generic(url)
@@ -1585,6 +1593,424 @@ async def scrapingdog_generic(url: str) -> str:
         response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         return response.text
+
+
+# =============================================================================
+# YouTube — dedicated ScrapingDog endpoints (5 credits each)
+# =============================================================================
+#
+# YouTube was previously routed to scrapingdog_generic which returned the
+# rendered watch page HTML.  That has two big problems for intent scoring:
+#   1. Video metadata (title, description, views, publish date) is buried
+#      in JSON blobs inside <script> tags so the grounding LLM struggles.
+#   2. Spoken video content (the actual claim being made) is completely
+#      absent — we'd only see the title/description, never the transcript.
+#
+# Using the dedicated endpoints we can return structured JSON with metadata
+# + the full transcript, which is dramatically stronger evidence for claims
+# like "CEO announced migration to Snowflake at 12:34 in this earnings call"
+# than a skeleton HTML shell.
+
+_YT_VIDEO_ID_RE = re.compile(
+    r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^&]+&)*v=|shorts/|embed/|v/))'
+    r'([A-Za-z0-9_-]{11})'
+)
+_YT_CHANNEL_ID_RE = re.compile(r'youtube\.com/channel/(UC[A-Za-z0-9_-]{22})')
+_YT_CHANNEL_HANDLE_RE = re.compile(r'youtube\.com/(@[A-Za-z0-9_.-]+|c/[A-Za-z0-9_.-]+|user/[A-Za-z0-9_.-]+)')
+
+
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+    """Extract 11-char YouTube video ID from watch/shorts/embed/youtu.be URLs."""
+    m = _YT_VIDEO_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _extract_youtube_channel_id(url: str) -> Optional[str]:
+    """Extract canonical UC... channel id from a /channel/ URL.
+
+    Handle-style URLs (``/@handle``, ``/c/name``, ``/user/name``) do not
+    contain the canonical ID and need a channel-page resolve step, which
+    :func:`scrapingdog_youtube` handles as a fallback.
+    """
+    m = _YT_CHANNEL_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+async def scrapingdog_youtube_video(video_id: str) -> dict:
+    """
+    Fetch YouTube video metadata via ScrapingDog YouTube Video API (5 credits).
+
+    Endpoint: api.scrapingdog.com/youtube/video
+    Parameter: v (video ID)
+
+    Returns the parsed JSON dict (title, description, views, likes, channel,
+    published_date, etc.) or an empty dict on failure.
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/youtube/video"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "v": video_id}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            return response.json() or {}
+    except Exception as e:
+        logger.warning(f"YouTube Video API failed for {video_id}: {e}")
+        return {}
+
+
+async def scrapingdog_youtube_transcript(video_id: str) -> str:
+    """
+    Fetch the spoken transcript for a YouTube video (5 credits).
+
+    Endpoint: api.scrapingdog.com/youtube/transcripts
+    Parameter: v (video ID)
+
+    Returns the concatenated transcript text (one space-joined string of all
+    segments) or an empty string if the video has no transcript or the call
+    fails.  We intentionally drop per-segment timestamps here — the downstream
+    LLM grounding step only needs the prose.
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/youtube/transcripts"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "v": video_id}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            data = response.json() or {}
+        segments = data.get("transcripts") or data.get("transcript") or []
+        if isinstance(segments, list):
+            parts = []
+            for seg in segments:
+                if isinstance(seg, dict):
+                    t = seg.get("text") or ""
+                else:
+                    t = str(seg)
+                if t:
+                    parts.append(t.strip())
+            return " ".join(parts)
+        if isinstance(segments, str):
+            return segments
+        return ""
+    except Exception as e:
+        logger.info(f"YouTube Transcript API returned no transcript for {video_id}: {e}")
+        return ""
+
+
+async def scrapingdog_youtube_channel(channel_id: str) -> dict:
+    """
+    Fetch YouTube channel metadata via ScrapingDog Channel API (5 credits).
+
+    Endpoint: api.scrapingdog.com/youtube/channel
+    Parameter: channel_id (the canonical UC... id)
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/youtube/channel"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "channel_id": channel_id}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            return response.json() or {}
+    except Exception as e:
+        logger.warning(f"YouTube Channel API failed for {channel_id}: {e}")
+        return {}
+
+
+async def scrapingdog_youtube_search_channel(query: str) -> dict:
+    """
+    Look up a YouTube channel via ScrapingDog Search API (5 credits).
+
+    Used to resolve ``/@handle``-style URLs — the Search endpoint returns a
+    ``channel_results`` array whose first item carries everything we need for
+    grounding (title, handle, subscribers, description, verified flag),
+    without requiring the canonical UC… id that the Channel API demands.
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/youtube/search"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "search_query": query}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            data = response.json() or {}
+        results = data.get("channel_results") or []
+        if results and isinstance(results[0], dict):
+            return results[0]
+        return {}
+    except Exception as e:
+        logger.info(f"YouTube Search API failed for query {query!r}: {e}")
+        return {}
+
+
+def _format_youtube_search_channel_blob(ch: dict) -> str:
+    """Format a ``channel_results[0]`` entry into a grounding blob.
+
+    Shape: ``{"title", "link", "verified", "handle", "subscribers",
+              "description", "thumbnail", "position"}``
+    Subscribers is an int here (e.g. ``20900000``), not the ``"20.9M subscribers"``
+    string the Channel API returns — we stringify it for consistency.
+    """
+    if not isinstance(ch, dict) or not ch.get("title"):
+        return ""
+    parts = ["[YOUTUBE CHANNEL]"]
+    if ch.get("title"):       parts.append(f"Title: {ch['title']}")
+    if ch.get("handle"):      parts.append(f"Handle: {ch['handle']}")
+    if ch.get("link"):        parts.append(f"Link: {ch['link']}")
+    if ch.get("verified") is not None: parts.append(f"Verified: {bool(ch['verified'])}")
+    subs = ch.get("subscribers")
+    if subs is not None:      parts.append(f"Subscribers: {subs}")
+    desc = ch.get("description") or ""
+    if desc:                  parts.append(f"\nAbout:\n{desc}")
+    return "\n".join(parts)
+
+
+def _format_youtube_video_blob(video_data: dict, transcript: str) -> str:
+    """Turn the YouTube Video + Transcript API responses into a single text
+    blob the LLM can ground against.
+
+    Response shape (confirmed 2026-04-23):
+      video_data = {
+        "video":   {"id", "title", "views", "likes", "author",
+                    "published_time", "description", "keywords": [...]},
+        "channel": {"id", "name", "link", "subscribers", ...},
+        "comment": {"total"},
+        ...
+      }
+    Title/description can legitimately be ``null`` for age-restricted or
+    music-catalog uploads even on valid IDs — in that case the transcript
+    is still the strongest grounding signal, so we include whatever we have.
+    """
+    video = (video_data or {}).get("video") or {}
+    channel = (video_data or {}).get("channel") or {}
+    comment = (video_data or {}).get("comment") or {}
+
+    # Invalid / unavailable video: all the identifying fields come back null
+    # and ``channel.id`` is null.  Don't return a misleading stub.
+    if (not video.get("title")
+            and not video.get("author")
+            and not video.get("description")
+            and not channel.get("id")
+            and not transcript):
+        return ""
+
+    title = video.get("title") or ""
+    author = video.get("author") or channel.get("name") or ""
+    published = video.get("published_time") or ""
+    views = video.get("views") or ""
+    likes = video.get("likes") or ""
+    desc = video.get("description") or ""
+    keywords = video.get("keywords") or []
+    total_comments = comment.get("total") or ""
+
+    parts = ["[YOUTUBE VIDEO METADATA]"]
+    if title:     parts.append(f"Title: {title}")
+    if author:    parts.append(f"Channel: {author}")
+    if published: parts.append(f"Published: {published}")
+    if views:     parts.append(f"Views: {views}")
+    if likes:     parts.append(f"Likes: {likes}")
+    if total_comments: parts.append(f"Comments: {total_comments}")
+    if keywords and isinstance(keywords, list):
+        parts.append(f"Keywords: {', '.join(str(k) for k in keywords[:20])}")
+    if desc:
+        parts.append(f"\nDescription:\n{desc}")
+    metadata_blob = "\n".join(parts)
+
+    if transcript:
+        return f"{metadata_blob}\n\n[YOUTUBE VIDEO TRANSCRIPT]\n{transcript}"
+    return metadata_blob
+
+
+def _format_youtube_channel_blob(channel_data: dict) -> str:
+    """Format the YouTube Channel API response into a grounding-ready blob.
+
+    Response shape (confirmed 2026-04-23):
+      {
+        "about":   {"description", "subscribers", "subscribers_extracted",
+                    "videos", "views", "joined_date", "links": [{title, link}]},
+        "channel": {"handle", "id", "title", "subscribers", "videos",
+                    "description", "keywords"},
+        ...
+      }
+    """
+    about = (channel_data or {}).get("about") or {}
+    ch = (channel_data or {}).get("channel") or {}
+    if not (about or ch):
+        return ""
+
+    title = ch.get("title") or ""
+    handle = ch.get("handle") or ""
+    desc = about.get("description") or ch.get("description") or ""
+    subs = about.get("subscribers") or ch.get("subscribers") or ""
+    videos = about.get("videos") or ch.get("videos") or ""
+    views = about.get("views") or ""
+    joined = about.get("joined_date") or ""
+    keywords = ch.get("keywords") or ""
+    links = about.get("links") or []
+
+    parts = ["[YOUTUBE CHANNEL]"]
+    if title:   parts.append(f"Title: {title}")
+    if handle:  parts.append(f"Handle: {handle}")
+    if subs:    parts.append(f"Subscribers: {subs}")
+    if videos:  parts.append(f"Videos: {videos}")
+    if views:   parts.append(f"Total views: {views}")
+    if joined:  parts.append(f"Joined: {joined}")
+    if keywords: parts.append(f"Keywords: {keywords}")
+    if links and isinstance(links, list):
+        link_lines = [f"  - {l.get('title','')}: {l.get('link','')}"
+                      for l in links if isinstance(l, dict)]
+        if link_lines:
+            parts.append("Links:\n" + "\n".join(link_lines))
+    if desc:
+        parts.append(f"\nAbout:\n{desc}")
+    return "\n".join(parts)
+
+
+async def scrapingdog_youtube(url: str) -> str:
+    """
+    Route a YouTube URL to the right dedicated ScrapingDog endpoint and
+    return a single text blob suitable for LLM grounding.
+
+    - /watch?v=… , /shorts/… , /embed/… , youtu.be/…  → Video API + Transcript
+    - /channel/UC…                                    → Channel API
+    - /@handle , /c/name , /user/name                 → resolve via channel
+      page scrape → Channel API (best-effort; falls back to generic scrape
+      of the handle page if resolution fails)
+    """
+    # Note: we never fall back to scrapingdog_generic for youtube.com URLs
+    # because ScrapingDog's /scrape endpoint explicitly refuses them with a
+    # 250-byte error message pointing at the dedicated YouTube APIs.  For
+    # anything we can't identify (e.g. /playlist links), return an empty
+    # string — the caller treats empty content as ungrounded and scores 0.
+    video_id = _extract_youtube_video_id(url)
+    if video_id:
+        video_data = await scrapingdog_youtube_video(video_id)
+        transcript = await scrapingdog_youtube_transcript(video_id)
+        return _format_youtube_video_blob(video_data, transcript)
+
+    channel_id = _extract_youtube_channel_id(url)
+    if channel_id:
+        channel_data = await scrapingdog_youtube_channel(channel_id)
+        return _format_youtube_channel_blob(channel_data)
+
+    # /@handle, /c/name, /user/name — resolve via Search API (5 credits)
+    handle_match = _YT_CHANNEL_HANDLE_RE.search(url)
+    if handle_match:
+        handle = handle_match.group(1)
+        ch_data = await scrapingdog_youtube_search_channel(handle)
+        return _format_youtube_search_channel_blob(ch_data)
+
+    return ""
+
+
+# =============================================================================
+# TikTok — dedicated ScrapingDog profile endpoint (5 credits)
+# =============================================================================
+#
+# ScrapingDog only exposes a TikTok *Profile* API — there's no dedicated
+# TikTok video endpoint.  A video URL looks like
+# ``tiktok.com/@username/video/1234…`` so we extract the username and return
+# the profile payload (bio, link-in-bio, follower count, recent video titles).
+# That's enough to ground signals like "Company X's founder posted on TikTok
+# about migrating to Snowflake" even if we can't read the video itself.
+
+_TIKTOK_USERNAME_RE = re.compile(r'tiktok\.com/@([A-Za-z0-9_.]+)')
+
+
+def _extract_tiktok_username(url: str) -> Optional[str]:
+    """Extract TikTok username (without the ``@``) from any tiktok.com URL."""
+    m = _TIKTOK_USERNAME_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _format_tiktok_profile_blob(data: dict) -> str:
+    """Format the TikTok Profile API response into a grounding blob.
+
+    Response shape (confirmed 2026-04-23):
+      {"username", "nickname", "bio", "bio_link", "verified",
+       "is_commerce_account", "commerce_category", "is_organization",
+       "is_seller", "followers", "following", "likes", "video_count",
+       "created_at_iso", "region", "language", ...}
+    """
+    if not isinstance(data, dict) or not data.get("username"):
+        return ""
+
+    parts = ["[TIKTOK PROFILE]"]
+    username = data.get("username") or ""
+    nickname = data.get("nickname") or ""
+    bio = data.get("bio") or ""
+    bio_link = data.get("bio_link") or ""
+    verified = data.get("verified")
+    is_commerce = data.get("is_commerce_account")
+    commerce_cat = data.get("commerce_category") or ""
+    is_org = data.get("is_organization")
+    is_seller = data.get("is_seller")
+    followers = data.get("followers")
+    following = data.get("following")
+    likes = data.get("likes")
+    video_count = data.get("video_count")
+    created_iso = data.get("created_at_iso") or ""
+    region = data.get("region") or ""
+    language = data.get("language") or ""
+
+    if username:                       parts.append(f"Username: @{username}")
+    if nickname:                       parts.append(f"Display name: {nickname}")
+    if verified is not None:           parts.append(f"Verified: {bool(verified)}")
+    if is_commerce is not None:        parts.append(f"Commerce account: {bool(is_commerce)}")
+    if commerce_cat:                   parts.append(f"Commerce category: {commerce_cat}")
+    if is_org is not None:             parts.append(f"Is organization: {bool(is_org)}")
+    if is_seller is not None:          parts.append(f"Is seller: {bool(is_seller)}")
+    if followers is not None:          parts.append(f"Followers: {followers}")
+    if following is not None:          parts.append(f"Following: {following}")
+    if likes is not None:              parts.append(f"Total likes: {likes}")
+    if video_count is not None:        parts.append(f"Video count: {video_count}")
+    if region:                         parts.append(f"Region: {region}")
+    if language:                       parts.append(f"Language: {language}")
+    if created_iso:                    parts.append(f"Account created: {created_iso}")
+    if bio_link:                       parts.append(f"Link in bio: {bio_link}")
+    if bio:                            parts.append(f"\nBio:\n{bio}")
+    return "\n".join(parts)
+
+
+async def scrapingdog_tiktok_profile(username: str) -> str:
+    """
+    Fetch TikTok profile via ScrapingDog TikTok Profile API (5 credits).
+
+    Endpoint: api.scrapingdog.com/tiktok/profile
+    Parameter: username (without the leading ``@``)
+    """
+    if not SCRAPINGDOG_API_KEY:
+        raise ValueError("SCRAPINGDOG_API_KEY not configured")
+
+    api_url = "https://api.scrapingdog.com/tiktok/profile"
+    params = {"api_key": SCRAPINGDOG_API_KEY, "username": username}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, params=params, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            data = response.json() or {}
+        return _format_tiktok_profile_blob(data)
+    except Exception as e:
+        logger.warning(f"TikTok Profile API failed for @{username}: {e}")
+        return ""
+
+
+async def scrapingdog_tiktok(url: str) -> str:
+    """Route any tiktok.com URL to the Profile API via username extraction."""
+    username = _extract_tiktok_username(url)
+    if not username:
+        logger.info(f"Could not extract TikTok username from {url[:100]}, using generic scrape")
+        return await scrapingdog_generic(url)
+    return await scrapingdog_tiktok_profile(username)
 
 
 # =============================================================================
