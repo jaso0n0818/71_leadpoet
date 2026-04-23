@@ -172,6 +172,17 @@ class FulfillmentICP(BaseModel):
     country: str = ""
     product_service: str = ""
     intent_signals: List[str] = Field(default_factory=list)
+    # Companies whose leads must be rejected at Tier 1 for this request.
+    # Populated either (a) explicitly by the client in the create payload
+    # (client-provided list takes precedence) or (b) automatically by the
+    # gateway at create_request time, by pulling the set of company names
+    # this client has already received as winners in prior FULFILLED
+    # requests for the same `company` (matched via the non-nullable
+    # client-company column on fulfillment_requests).  Intentionally NOT
+    # Field(exclude=True) — miners need to see it in
+    # /fulfillment/requests/active so they can pre-filter their search
+    # and avoid wasting work on companies that would be Tier-1-rejected.
+    excluded_companies: List[str] = Field(default_factory=list)
     num_leads: int = 10
     window_end: Optional[str] = None
     reveal_window_end: Optional[str] = None
@@ -203,6 +214,34 @@ class FulfillmentICP(BaseModel):
     # explicitly in gateway/fulfillment/api.py::create_request rather than
     # via min_length on the field.
     company: str = Field(default="", exclude=True)
+
+    @field_validator("excluded_companies", mode="before")
+    @classmethod
+    def normalize_excluded_companies(cls, v) -> List[str]:
+        """Strip entries, drop empties, dedupe case-insensitively while
+        preserving the first casing seen.  Keeps the miner-facing payload
+        tidy without changing the scoring contract (which lowercases both
+        sides before comparing)."""
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list):
+            raise ValueError(
+                f"excluded_companies must be a list, got {type(v).__name__}"
+            )
+        seen = set()
+        out: List[str] = []
+        for entry in v:
+            s = str(entry).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
 
     @field_validator("industry")
     @classmethod

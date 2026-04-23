@@ -641,10 +641,43 @@ def _recycle_request(
         # Neither is ever shown to miners (company is scrubbed out of the
         # ICP by api.py::create_request before hashing), but they must match
         # the predecessor so audit trails stay clean across recycles.
+        successor_icp = dict(original_request.get("icp_details") or {})
+
+        # Refresh excluded_companies on every recycle.  The predecessor's
+        # list was a snapshot at its creation time; in the meantime other
+        # requests for the same client may have fulfilled, so their winner
+        # companies should also be excluded going forward.  Only refresh
+        # when the predecessor was itself auto-populated (detected as:
+        # empty list OR populated but client_company is present) — if the
+        # client explicitly seeded a non-empty list at create_request time
+        # we'd need a marker to preserve it, but since we rebuild the same
+        # way create_request does the computed list will be a superset of
+        # the client-seeded one plus new winners.  For safety we only
+        # refresh when the client_company is known (non-empty).
+        client_company = (original_request.get("company") or "").strip()
+        if client_company:
+            try:
+                from gateway.fulfillment.api import _load_previously_delivered_companies
+                refreshed = _load_previously_delivered_companies(supabase, client_company)
+                if refreshed:
+                    # Merge with whatever was already there so a client-
+                    # supplied exclusion is never silently dropped on recycle.
+                    prior = successor_icp.get("excluded_companies") or []
+                    seen = {str(x).strip().lower() for x in prior if str(x).strip()}
+                    merged = list(prior)
+                    for biz in refreshed:
+                        if biz.strip().lower() not in seen:
+                            merged.append(biz)
+                            seen.add(biz.strip().lower())
+                    successor_icp["excluded_companies"] = merged
+            except Exception as e:
+                print(f"   ⚠️  recycle: excluded_companies refresh failed "
+                      f"for {rid[:8]} → {new_id[:8]}: {type(e).__name__}: {e}")
+
         supabase.table("fulfillment_requests").insert({
             "request_id": new_id,
             "request_hash": "",
-            "icp_details": original_request["icp_details"],
+            "icp_details": successor_icp,
             "num_leads": original_request["num_leads"],
             "internal_label": original_request.get("internal_label"),
             "company": original_request.get("company"),

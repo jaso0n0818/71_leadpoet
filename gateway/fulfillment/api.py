@@ -87,6 +87,100 @@ def _miner_submission_cap(num_leads: int) -> int:
     return max(cap, num_leads)
 
 
+def _load_previously_delivered_companies(supabase, client_company: str) -> List[str]:
+    """Pull every lead-company name this client has already received as a
+    winner in a prior FULFILLED request.
+
+    Only ``status='fulfilled'`` rows count — recycled / expired leads
+    were never delivered to the client and never paid out to miners, so
+    they remain eligible for inclusion in future batches.  Case-insensitive
+    client-company match so "Apple" and "apple" are the same client.
+
+    Returns the list of distinct winner ``business`` strings (original
+    casing preserved), ready to drop into FulfillmentICP.excluded_companies.
+    The ICP's field validator will handle dedup and normalization; this
+    helper just gathers the raw candidates.
+    """
+    if not client_company or not client_company.strip():
+        return []
+
+    try:
+        # Step 1: find every fulfilled request for this client.
+        req_resp = supabase.table("fulfillment_requests") \
+            .select("request_id") \
+            .ilike("company", client_company.strip()) \
+            .eq("status", "fulfilled") \
+            .execute()
+        fulfilled_ids = [r["request_id"] for r in (req_resp.data or [])]
+    except Exception as e:
+        logger.warning(
+            f"_load_previously_delivered_companies: failed to fetch fulfilled "
+            f"requests for {client_company!r}: {type(e).__name__}: {e}"
+        )
+        return []
+
+    if not fulfilled_ids:
+        return []
+
+    # Step 2: find every winning consensus row across those requests.
+    try:
+        cons_resp = supabase.table("fulfillment_score_consensus") \
+            .select("submission_id,lead_id") \
+            .in_("request_id", fulfilled_ids) \
+            .eq("is_winner", True) \
+            .execute()
+        winner_keys = [(r["submission_id"], r["lead_id"]) for r in (cons_resp.data or [])]
+    except Exception as e:
+        logger.warning(
+            f"_load_previously_delivered_companies: failed to fetch winners: "
+            f"{type(e).__name__}: {e}"
+        )
+        return []
+
+    if not winner_keys:
+        return []
+
+    # Step 3: pull lead_data for those submissions and extract each
+    # winner's ``business`` field.  The consensus row identifies the
+    # exact (submission_id, lead_id) pair; the lead_data column is the
+    # JSON array the miner committed + revealed, keyed by lead_id.
+    submission_ids = list({sid for sid, _ in winner_keys})
+    try:
+        subs_resp = supabase.table("fulfillment_submissions") \
+            .select("submission_id,lead_data") \
+            .in_("submission_id", submission_ids) \
+            .execute()
+    except Exception as e:
+        logger.warning(
+            f"_load_previously_delivered_companies: failed to fetch "
+            f"submissions: {type(e).__name__}: {e}"
+        )
+        return []
+
+    # Build a (submission_id, lead_id) -> business lookup.
+    lead_company: dict = {}
+    for row in (subs_resp.data or []):
+        sid = row.get("submission_id")
+        for entry in (row.get("lead_data") or []):
+            lid = entry.get("lead_id")
+            biz = (entry.get("data") or {}).get("business") or ""
+            if sid and lid and biz:
+                lead_company[(sid, lid)] = biz.strip()
+
+    seen: set = set()
+    out: List[str] = []
+    for key in winner_keys:
+        biz = lead_company.get(key)
+        if not biz:
+            continue
+        norm = biz.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(biz)
+    return out
+
+
 def _log_event(event_type: EventType, actor_hotkey: str, payload: dict) -> None:
     """Best-effort transparency log insert.
 
@@ -254,6 +348,31 @@ async def create_request(icp: FulfillmentICP):
             f"create_request: target_roles expansion failed (keeping seeds): "
             f"{type(e).__name__}: {e}"
         )
+
+    # Auto-populate excluded_companies from the client's prior fulfilled
+    # requests ONLY when the client didn't supply the list themselves.
+    # Client-supplied lists (even empty) take precedence — if the client
+    # explicitly wants "no exclusions" they can pass ``["__none__"]`` or
+    # similar, but in practice an empty list means "please auto-populate".
+    # Only FULFILLED predecessors count: recycled / expired requests had
+    # their leads discarded (miners were never paid, client never
+    # received them), so they should remain eligible for the new batch.
+    if not icp.excluded_companies:
+        try:
+            icp.excluded_companies = _load_previously_delivered_companies(
+                supabase, company
+            )
+            if icp.excluded_companies:
+                logger.info(
+                    f"create_request: auto-populated excluded_companies for "
+                    f"company={company!r}: {len(icp.excluded_companies)} entries"
+                )
+        except Exception as e:
+            logger.warning(
+                f"create_request: excluded_companies auto-populate failed "
+                f"(proceeding with empty list): {type(e).__name__}: {e}"
+            )
+            icp.excluded_companies = []
 
     # model_dump() excludes `internal_label` and `company` (both Field(exclude=True))
     # so neither lands in icp_details (which is what miners see).

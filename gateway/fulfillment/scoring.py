@@ -226,6 +226,21 @@ def _tier1_check(
     if icp.sub_industry and lead.sub_industry != icp.sub_industry:
         return "sub_industry_mismatch"
 
+    # Excluded companies: leads whose company matches any entry in the
+    # ICP's excluded_companies list are hard-rejected at Tier 1.  The
+    # list is populated by the gateway at create_request time from the
+    # client's prior FULFILLED requests (so a company never gets
+    # delivered twice to the same client), unless the client supplied
+    # an explicit list in the create payload.
+    # Compared via _normalize_company so "Acme Inc.", "Acme, Inc",
+    # "acme" all collapse to the same dedup key as the winner-dedup
+    # pass in _run_dedup_and_rewards (single source of truth).
+    if icp.excluded_companies and lead.business:
+        from gateway.fulfillment.lifecycle import _normalize_company
+        excluded_keys = {_normalize_company(c) for c in icp.excluded_companies if c}
+        if _normalize_company(lead.business) in excluded_keys:
+            return "company_excluded"
+
     if icp.target_role_types and lead.role_type not in icp.target_role_types:
         return "role_type_mismatch"
 
