@@ -380,7 +380,40 @@ async def get_active_requests(miner_hotkey: str = ""):
                 if committed_count >= per_miner_cap:
                     continue  # fully committed — hide this request
 
-        icp = r.get("icp_details", {})
+        icp = dict(r.get("icp_details", {}) or {})
+
+        # Miner compatibility: ICP's employee_count is stored as a list of
+        # canonical buckets (e.g. ["201-500", "501-1,000", "1,001-5,000"])
+        # but the miner-facing JSON surface has always been a single range
+        # string.  We include BOTH:
+        #   - ``employee_count``: collapsed range string (back-compat)
+        #   - ``employee_count_buckets``: the authoritative list of allowed
+        #     canonical buckets (new field).  Miners that want exact-bucket
+        #     matching should prefer this — the validator's scoring is an
+        #     exact set-membership check against these buckets, so anything
+        #     not in the list will be rejected as employee_count_mismatch.
+        ec_val = icp.get("employee_count")
+        try:
+            from gateway.fulfillment.models import _BUCKET_RANGES, range_string_to_buckets
+        except Exception:
+            _BUCKET_RANGES = {}
+            range_string_to_buckets = lambda _s: []
+        if isinstance(ec_val, list):
+            buckets = [b for b in ec_val if b in _BUCKET_RANGES]
+        elif isinstance(ec_val, str) and ec_val:
+            # Legacy stored string — coerce to canonical buckets for the
+            # new `employee_count_buckets` field so miners that opt into
+            # the exact-bucket vocabulary see the same set the scorer uses.
+            buckets = range_string_to_buckets(ec_val)
+        else:
+            buckets = []
+        if buckets:
+            los, his = zip(*(_BUCKET_RANGES[b] for b in buckets))
+            icp["employee_count"] = f"{min(los)}-{max(his)}"
+        else:
+            icp["employee_count"] = ""
+        icp["employee_count_buckets"] = buckets
+
         requests_out.append({
             "request_id": r["request_id"],
             "icp": icp,

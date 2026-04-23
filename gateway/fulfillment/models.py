@@ -45,6 +45,68 @@ VALID_ROLE_TYPES: set = {
 
 
 # ---------------------------------------------------------------------------
+# Canonical employee-count buckets
+# ---------------------------------------------------------------------------
+# Must stay in sync with VALID_EMPLOYEE_COUNTS in gateway/api/submit.py — that's
+# the vocabulary miners are allowed to submit, so clients must request in the
+# same vocabulary for exact-match scoring to work.  Format mirrors LinkedIn's
+# scraped strings (with thousands separators on the wider buckets).
+CANONICAL_EMPLOYEE_BUCKETS: List[str] = [
+    "0-1", "2-10", "11-50", "51-200", "201-500",
+    "501-1,000", "1,001-5,000", "5,001-10,000", "10,001+",
+]
+_BUCKET_RANGES: dict = {
+    "0-1":          (0, 1),
+    "2-10":         (2, 10),
+    "11-50":        (11, 50),
+    "51-200":       (51, 200),
+    "201-500":      (201, 500),
+    "501-1,000":    (501, 1_000),
+    "1,001-5,000":  (1_001, 5_000),
+    "5,001-10,000": (5_001, 10_000),
+    "10,001+":      (10_001, 10_000_000),
+}
+
+
+def _parse_legacy_range_to_bounds(s: str) -> Optional[tuple]:
+    """Turn a legacy free-form range string like ``"200-5000"`` or ``"500+"``
+    or ``"1000"`` into a ``(lo, hi)`` numeric tuple.  Returns ``None`` if the
+    input can't be parsed."""
+    s = (s or "").strip().replace(",", "")
+    if not s:
+        return None
+    if re.match(r"^\d+$", s):
+        n = int(s)
+        return (n, n)
+    m = re.match(r"^(\d+)-(\d+)$", s)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (lo, hi) if lo <= hi else None
+    m = re.match(r"^(\d+)\+$", s)
+    if m:
+        return (int(m.group(1)), 10_000_000)
+    return None
+
+
+def range_string_to_buckets(s: str) -> List[str]:
+    """Coerce a legacy free-form employee-count range string to the list of
+    canonical buckets whose numeric range is FULLY CONTAINED within it.
+
+    Endpoint-touching partials are deliberately excluded — ``"200-5000"``
+    matches ``"201-500"``/``"501-1,000"``/``"1,001-5,000"`` but NOT
+    ``"51-200"`` (which would overlap only at a single employee).
+    """
+    bounds = _parse_legacy_range_to_bounds(s)
+    if bounds is None:
+        return []
+    lo, hi = bounds
+    return [
+        b for b, (b_lo, b_hi) in _BUCKET_RANGES.items()
+        if b_lo >= lo and b_hi <= hi
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Company-name scrubbing helper
 # ---------------------------------------------------------------------------
 
@@ -93,7 +155,18 @@ class FulfillmentICP(BaseModel):
     target_role_types: List[str] = Field(default_factory=list)
     target_roles: List[str] = Field(default_factory=list)
     target_seniority: str = ""
-    employee_count: str = ""
+    # List of canonical employee-count buckets (e.g.
+    # ``["201-500", "501-1,000", "1,001-5,000"]``) that the client will
+    # accept for this request.  Must use the same vocabulary miners are
+    # allowed to submit (see gateway/api/submit.py::VALID_EMPLOYEE_COUNTS)
+    # so Tier 1 ICP Fit is a pure set-membership check on exact strings.
+    #
+    # The field validator below also accepts a legacy free-form range
+    # string like ``"200-5000"`` (for backward compat with older requests
+    # that stored a single string) — it coerces into the list of canonical
+    # buckets whose numeric range is FULLY CONTAINED within the requested
+    # range (see range_string_to_buckets).
+    employee_count: List[str] = Field(default_factory=list)
     company_stage: str = ""
     geography: str = ""
     country: str = ""
@@ -160,26 +233,67 @@ class FulfillmentICP(BaseModel):
             raise ValueError(f"Invalid role types: {invalid}. Valid: {sorted(VALID_ROLE_TYPES)}")
         return v
 
-    @field_validator("employee_count")
+    @field_validator("employee_count", mode="before")
     @classmethod
-    def validate_employee_count(cls, v: str) -> str:
-        if not v:
-            return v
-        v = v.strip()
-        if re.match(r"^\d+$", v):
-            return v
-        if re.match(r"^\d+-\d+$", v):
-            lo, hi = v.split("-")
-            if int(lo) > int(hi):
-                raise ValueError(f"Invalid range: {v}")
-            return v
-        if re.match(r"^\d+\+$", v):
-            return v
-        raise ValueError(f"Invalid employee_count format: '{v}'. Use '50-200', '500+', or '1000'")
+    def validate_employee_count(cls, v) -> List[str]:
+        """Normalize employee_count to a list of canonical buckets.
+
+        Accepts:
+          * ``[]`` / ``""`` / ``None``                   -> ``[]``
+          * ``List[str]`` of canonical buckets           -> unchanged (deduped)
+          * Legacy ``str`` range like ``"200-5000"``,
+            ``"500+"``, or ``"1000"``                    -> coerced via
+            range_string_to_buckets() to the list of buckets whose numeric
+            range is fully contained within the input range.
+
+        Rejects any list entry that isn't in CANONICAL_EMPLOYEE_BUCKETS.
+        """
+        if v is None or v == "" or v == []:
+            return []
+        if isinstance(v, str):
+            buckets = range_string_to_buckets(v)
+            if not buckets:
+                raise ValueError(
+                    f"Invalid employee_count range: '{v}'. Provide a list of "
+                    f"canonical buckets or a range string fully containing at "
+                    f"least one of {CANONICAL_EMPLOYEE_BUCKETS}."
+                )
+            return buckets
+        if isinstance(v, list):
+            seen = set()
+            out: List[str] = []
+            for entry in v:
+                e = str(entry).strip()
+                if e in seen:
+                    continue
+                if e not in CANONICAL_EMPLOYEE_BUCKETS:
+                    raise ValueError(
+                        f"employee_count entry '{e}' not in canonical buckets "
+                        f"{CANONICAL_EMPLOYEE_BUCKETS}"
+                    )
+                seen.add(e)
+                out.append(e)
+            return out
+        raise ValueError(
+            f"Invalid employee_count type {type(v).__name__}; expected list or str"
+        )
 
     def to_icp_prompt(self) -> ICPPrompt:
-        """Convert to ICPPrompt for scoring functions."""
+        """Convert to ICPPrompt for scoring functions.
+
+        ``ICPPrompt.employee_count`` is still a single ``str`` across many
+        downstream consumers (qualification/sourcing miners, validator
+        ICPPrompt re-parses, etc.), so we collapse the list of allowed
+        buckets to the smallest range string that contains all of them.
+        Example: ``["201-500", "501-1,000", "1,001-5,000"]`` -> ``"201-5000"``.
+        """
         roles = self.target_roles or self.target_role_types
+        buckets = self.employee_count or []
+        if buckets:
+            los, his = zip(*(_BUCKET_RANGES[b] for b in buckets))
+            ec_str = f"{min(los)}-{max(his)}"
+        else:
+            ec_str = ""
         return ICPPrompt(
             icp_id=self.icp_id,
             prompt=self.prompt,
@@ -187,7 +301,7 @@ class FulfillmentICP(BaseModel):
             sub_industry=self.sub_industry,
             target_roles=roles,
             target_seniority=self.target_seniority,
-            employee_count=self.employee_count,
+            employee_count=ec_str,
             company_stage=self.company_stage,
             geography=self.geography,
             country=self.country,

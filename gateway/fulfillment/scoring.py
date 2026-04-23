@@ -245,12 +245,19 @@ def _tier1_check(
         if _normalize_country(lead.company_hq_country) != _normalize_country(icp.country):
             return "country_mismatch"
 
+    # Exact-bucket match: ``icp.employee_count`` is a list of canonical
+    # buckets (e.g. ``["201-500", "501-1,000", "1,001-5,000"]``).  Miners
+    # submit leads using the same canonical vocabulary (enforced in
+    # gateway/api/submit.py), so this is a pure set-membership check.
+    # Prior implementation used a range-overlap test which let leads
+    # slip through when their bucket touched the ICP range at a single
+    # endpoint (e.g. a ``"51-200"`` lead against a ``"200-5000"`` ICP
+    # matched via the shared 200-employee boundary even though the
+    # client excluded companies below 200 employees).
     if icp.employee_count and lead.employee_count:
-        icp_range = _parse_employee_range(icp.employee_count)
-        lead_range = _parse_employee_range(lead.employee_count)
-        if icp_range != (0, 0) and lead_range != (0, 0):
-            if not _ranges_overlap(icp_range, lead_range):
-                return "employee_count_mismatch"
+        allowed = icp.employee_count if isinstance(icp.employee_count, list) else [icp.employee_count]
+        if lead.employee_count not in allowed:
+            return "employee_count_mismatch"
 
     if icp.company_stage and lead_output.role:
         pass
