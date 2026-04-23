@@ -602,9 +602,9 @@ Fulfillment is a new incentive mechanism where miners compete directly on real c
 
 1. **Request Published** — A client submits a fulfillment request with a specific ICP (industry, roles, seniority, geography, intent signals). The request is published globally for all miners.
 
-2. **Commit Window (2 epochs, ~2.5 hours)** — Miners source leads matching the ICP, then submit **hashed lead data** (commit). This prevents other miners from copying your leads.
+2. **Commit Window (1 epoch, ~72 minutes)** — Miners source leads matching the ICP, then submit **hashed lead data** (commit). This prevents other miners from copying your leads.
 
-3. **Reveal Window (2 minutes after commit closes)** — Miners reveal the actual lead data corresponding to their committed hashes. Hashes must match or the submission is rejected.
+3. **Reveal Window (15 minutes after commit closes)** — Miners reveal the actual lead data corresponding to their committed hashes. Hashes must match or the submission is rejected.
 
 4. **Validator Scoring** — Validators score every revealed lead through a three-tier pipeline:
    - **Tier 1 (ICP Fit)** — Industry, sub-industry, role, seniority, employee count, country must match the request
