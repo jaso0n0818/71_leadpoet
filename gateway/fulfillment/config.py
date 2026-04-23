@@ -26,18 +26,21 @@ FULFILLMENT_MIN_VALIDATORS = int(os.getenv("FULFILLMENT_MIN_VALIDATORS", "1"))
 # How long the gateway waits (after reveal_window_end) for validators to
 # score a request before recycling it with reason=no_validators_timeout.
 # Must exceed the validator's worst-case end-to-end scoring time, not
-# just its polling cadence.  Scoring a single request with 60+ leads
-# takes 30-60 minutes under real load (Stage 4 LinkedIn scrapes, Tier
+# just its polling cadence.  Scoring a single request with 40+ leads
+# takes 90-120 minutes under real load (Stage 4 LinkedIn scrapes, Tier
 # 3 LLM calls per signal, TrueList batch verification, per-lead rep
-# score lookup).  5 min was too tight (2026-04-21).  15 min was also
-# too tight (2026-04-22: requests 669fd2b7 and 7c666b4e both expired
-# with no consensus computed even though the validator DID score them
-# minutes later — scores landed in fulfillment_scores after the gateway
-# had already marked the request expired, orphaning real miner work).
-# 90 min gives the validator plenty of headroom for a backed-up scoring
-# queue across multiple concurrent requests and is still well under the
-# 72-min epoch × multiple-epoch runway that the reward system allows.
-FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "90"))
+# score lookup), plus queue time when ff-workers are busy with other
+# requests.  Historical tightenings have all been too aggressive:
+#   5 min  → 2026-04-21: requests died before validator even started
+#  15 min  → 2026-04-22: 669fd2b7 / 7c666b4e died mid-scoring
+#  90 min  → 2026-04-23: e3586265 died 18 s before scores landed — 48
+#           scores (21 passing, would have easily fulfilled 10 winners)
+#           posted in a 2-second batch 14 minutes after the recycle.
+# Bumping to 180 min to clear the observed 1h 44m scoring path with a
+# comfortable margin for ff-worker queueing under high request load.
+# Still well under the 72-min-epoch × 30-epoch reward runway, so there
+# is no downstream incentive impact from the longer wait.
+FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES = int(os.getenv("FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES", "180"))
 FULFILLMENT_BANS_ENABLED = os.getenv("FULFILLMENT_BANS_ENABLED", "false").lower() == "true"
 
 FULFILLMENT_MAX_PARALLEL_REQUESTS = int(os.getenv("FULFILLMENT_MAX_PARALLEL_REQUESTS", "5"))
