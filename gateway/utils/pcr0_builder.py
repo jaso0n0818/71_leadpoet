@@ -189,7 +189,24 @@ async def clone_or_update_repo(repo_dir: str) -> bool:
     ]
     
     if os.path.exists(os.path.join(repo_dir, ".git")):
-        # Update existing repo - just fetch and reset
+        # Update existing repo - fetch, reset, AND re-apply sparse-checkout.
+        #
+        # BUG FIX (2026-04-23): The original implementation only ran
+        # `sparse-checkout set` on the fresh-clone branch.  We observed a
+        # production state where the repo's sparse-checkout file was stuck
+        # at the default cone-mode patterns (``/*`` + ``!/*/`` — i.e. only
+        # root-level files, no directories) even though the fresh-clone
+        # path had long since run.  With that state, `validator_tee/`,
+        # `leadpoet_canonical/`, and `neurons/` are all absent from the
+        # working tree, so `compute_dockerfile_base_hash()` fails with
+        # "Cannot read Dockerfile.base: No such file or directory" and
+        # the whole PCR0 pipeline never produces a new cache entry —
+        # every weight submission gets rejected with 403 "PCR0 not
+        # recognized".  Root cause is unclear (possibly a git version
+        # behavior change, a previous crash between `clone --sparse` and
+        # `sparse-checkout set`, or a stray `git sparse-checkout init`
+        # somewhere), but the fix is trivially safe: re-apply the patterns
+        # on every update so the state is self-healing.
         proc = await asyncio.create_subprocess_exec(
             "git", "fetch", "--depth", "1", "origin", GITHUB_BRANCH,
             cwd=repo_dir,
@@ -217,8 +234,42 @@ async def clone_or_update_repo(repo_dir: str) -> bool:
         if proc.returncode != 0:
             logger.error(f"[PCR0] git reset failed: {stderr.decode()}")
             return False
-            
-        logger.info("[PCR0] Repo updated via fetch")
+
+        # Self-heal the sparse-checkout config.  `set --no-cone` is
+        # idempotent when the patterns already match, and re-materializes
+        # the working tree if they don't.  If this fails, the broken
+        # state from a stale clone would persist forever, so on failure
+        # we nuke the repo and re-clone from scratch.
+        proc = await asyncio.create_subprocess_exec(
+            "git", "sparse-checkout", "set", "--no-cone", *sparse_paths,
+            cwd=repo_dir,
+            env=git_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                f"[PCR0] sparse-checkout re-apply failed on update branch: "
+                f"{stderr.decode()[:300]} — nuking repo and re-cloning"
+            )
+            shutil.rmtree(repo_dir)
+            return await clone_or_update_repo(repo_dir)
+
+        # Verify critical monitored files actually materialized.  If the
+        # working tree still doesn't have `validator_tee/Dockerfile.base`
+        # after the above, something else is wrong and a fresh clone is
+        # the only recovery.
+        dockerfile_base = os.path.join(repo_dir, "validator_tee", "Dockerfile.base")
+        if not os.path.exists(dockerfile_base):
+            logger.warning(
+                f"[PCR0] {dockerfile_base} still missing after sparse-checkout "
+                f"re-apply — working tree is corrupt, re-cloning"
+            )
+            shutil.rmtree(repo_dir)
+            return await clone_or_update_repo(repo_dir)
+
+        logger.info("[PCR0] Repo updated via fetch (sparse-checkout re-applied)")
     else:
         # Fresh clone with sparse checkout (minimal download)
         if os.path.exists(repo_dir):
