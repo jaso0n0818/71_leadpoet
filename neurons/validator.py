@@ -5959,41 +5959,117 @@ class Validator(BaseValidatorNeuron):
             
             epoch_started_after_refresh = epoch_start_minutes_since_midnight >= rebenchmark_minutes_since_midnight
             
-            # Get the UTC date we last evaluated on (if tracked)
+            # ═══════════════════════════════════════════════════════════════════
+            # REBENCHMARK GATE — two timestamps, two distinct checks:
+            #
+            #   last_rebenchmark_at      — set on COMPLETION (only updates when
+            #                              the worker actually finishes scoring).
+            #                              Source of truth for "did we actually
+            #                              evaluate today?"
+            #
+            #   last_evaluated_utc_date  — set at DISPATCH time by
+            #                              _mark_rebenchmark_attempted_today().
+            #                              Prevents duplicate dispatch while a
+            #                              rebenchmark is running.
+            #
+            # Previous implementation used last_evaluated_utc_date alone.  Bug:
+            # if the dispatch succeeded but the worker never finished (validator
+            # restart mid-evaluation, worker crash, work file deleted by the
+            # startup cleanup in _assign_qualification_to_dedicated_workers),
+            # the date stayed at "today" and the champion was never re-scored
+            # for that ICP set.  Observed 2026-04-24: coordinator dispatched
+            # rebenchmark at 00:15:29 UTC, user restarted validator ~30 min
+            # later, startup cleanup wiped the in-flight work file, and every
+            # subsequent tick skipped with "already evaluated today" even
+            # though last_rebenchmark_at was still yesterday's timestamp.
+            #
+            # New gate:
+            #   1. If last_rebenchmark_at.date() == today → truly done, skip
+            #   2. Else if a rebenchmark work file exists on disk (dispatch
+            #      succeeded, worker still running) → skip, wait for completion
+            #   3. Else → dispatch
+            # ═══════════════════════════════════════════════════════════════════
             last_evaluated_utc_date = champion.get("last_evaluated_utc_date")
-            today_utc_date_str = epoch_start_date.isoformat()  # YYYY-MM-DD format
-            
+            last_rebenchmark_at_raw = champion.get("last_rebenchmark_at") or ""
+            today_utc_date_str = epoch_start_date.isoformat()  # YYYY-MM-DD
+
+            # Parse last-completion date (actual, not dispatched)
+            last_completed_date_str = None
+            if last_rebenchmark_at_raw:
+                try:
+                    last_completed_date_str = (
+                        datetime.fromisoformat(
+                            last_rebenchmark_at_raw.replace("Z", "+00:00")
+                        ).date().isoformat()
+                    )
+                except Exception:
+                    last_completed_date_str = None
+
+            completed_today = last_completed_date_str == today_utc_date_str
+
+            # Is a rebenchmark still in flight?  The surest signal is a
+            # work file on disk that carries is_rebenchmark_container=True
+            # or a model with is_rebenchmark=True and no matching results
+            # file.  This is self-healing: the moment the work file is
+            # deleted (either by the cleanup or by the worker after writing
+            # results), we unblock the next dispatch.
+            in_flight = False
+            try:
+                weights_dir = Path("validator_weights")
+                for wf in weights_dir.glob("qual_worker_*_work_*.json"):
+                    # Matching results file → worker is done, not in flight
+                    results_name = wf.name.replace("_work_", "_results_", 1)
+                    if (weights_dir / results_name).exists():
+                        continue
+                    try:
+                        with open(wf, "r") as _f:
+                            _data = json.load(_f)
+                    except Exception:
+                        continue
+                    if _data.get("is_rebenchmark_container"):
+                        in_flight = True
+                        break
+                    for _m in (_data.get("models") or []):
+                        if _m.get("is_rebenchmark"):
+                            in_flight = True
+                            break
+                    if in_flight:
+                        break
+            except Exception as in_flight_err:
+                bt.logging.warning(
+                    f"Rebenchmark in-flight probe failed (assuming not in flight): {in_flight_err}"
+                )
+
             print(f"   📊 Rebenchmark check:")
             print(f"      Current epoch: {current_epoch}")
             print(f"      Epoch start (UTC): {epoch_start_utc.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"      Rebenchmark trigger time: {rebenchmark_hour:02d}:{rebenchmark_minute:02d} UTC")
             print(f"      Epoch started after trigger time: {epoch_started_after_refresh}")
-            print(f"      Last evaluated UTC date: {last_evaluated_utc_date or 'Never'}")
-            print(f"      Today's UTC date: {today_utc_date_str}")
-            
-            # ═══════════════════════════════════════════════════════════════════
-            # REBENCHMARK CONDITIONS:
-            # 1. This epoch STARTED after 12:05 AM UTC (not spanning midnight)
-            # 2. Champion hasn't been evaluated today (new ICP set)
-            # ═══════════════════════════════════════════════════════════════════
+            print(f"      Last evaluated UTC date: {last_evaluated_utc_date or 'Never'}  (dispatch flag)")
+            print(f"      Last rebenchmark_at date:  {last_completed_date_str or 'Never'}  (completion)")
+            print(f"      Rebenchmark in flight:     {in_flight}")
+            print(f"      Today's UTC date:          {today_utc_date_str}")
+
             needs_rebenchmark = (
-                epoch_started_after_refresh and
-                last_evaluated_utc_date != today_utc_date_str
+                epoch_started_after_refresh
+                and not completed_today
+                and not in_flight
             )
-            
+
             if needs_rebenchmark:
                 bt.logging.info(
                     f"🔄 Champion rebenchmark needed: New ICP set for {today_utc_date_str} "
-                    f"(last evaluated: {last_evaluated_utc_date or 'Never'})"
+                    f"(last completed: {last_completed_date_str or 'Never'})"
                 )
                 print(f"   ✅ REBENCHMARK TRIGGERED: New ICP set for {today_utc_date_str}")
                 return champion
-            else:
-                if not epoch_started_after_refresh:
-                    print(f"   ⏭️ Skipping: Epoch started before {rebenchmark_hour:02d}:{rebenchmark_minute:02d} UTC")
-                else:
-                    print(f"   ⏭️ Skipping: Already evaluated on today's ICP set ({today_utc_date_str})")
-            
+
+            if not epoch_started_after_refresh:
+                print(f"   ⏭️ Skipping: Epoch started before {rebenchmark_hour:02d}:{rebenchmark_minute:02d} UTC")
+            elif completed_today:
+                print(f"   ⏭️ Skipping: Champion already rebenchmarked today ({today_utc_date_str})")
+            elif in_flight:
+                print(f"   ⏭️ Skipping: Rebenchmark already dispatched and worker still running")
             return None
             
         except Exception as e:
@@ -6245,10 +6321,30 @@ class Validator(BaseValidatorNeuron):
         if not hasattr(self, '_qual_startup_cleanup_done'):
             self._qual_startup_cleanup_done = True
             cleaned = 0
+            dropped_inflight_rebenchmark = False
             for old_file in weights_dir.glob("qual_worker_*_work_*.json"):
                 try:
                     file_epoch = int(old_file.stem.split('_')[-1])
                     if file_epoch != current_epoch:
+                        # Before deleting, check whether this work file was a
+                        # rebenchmark that never completed.  If so, we need
+                        # to roll back the champion's `last_evaluated_utc_date`
+                        # so the next tick re-dispatches — otherwise the old
+                        # "dispatched today" flag would permanently block
+                        # rebenchmarking for the day.
+                        try:
+                            with open(old_file, 'r') as _f:
+                                _data = json.load(_f)
+                            if _data.get("is_rebenchmark_container") or any(
+                                (m or {}).get("is_rebenchmark")
+                                for m in (_data.get("models") or [])
+                            ):
+                                # Check whether results were actually written.
+                                results_name = old_file.name.replace("_work_", "_results_", 1)
+                                if not (weights_dir / results_name).exists():
+                                    dropped_inflight_rebenchmark = True
+                        except Exception:
+                            pass
                         old_file.unlink()
                         cleaned += 1
                 except:
@@ -6263,6 +6359,42 @@ class Validator(BaseValidatorNeuron):
                     print(f"   🧹 Startup cleanup: reset failure counter")
                 except:
                     pass
+
+            # If we just dropped an in-flight rebenchmark, roll back the
+            # "dispatched today" flag on the champion JSON so the next
+            # _check_champion_rebenchmark_needed tick re-triggers dispatch.
+            # Without this, the champion stays stuck at yesterday's score
+            # until the next daily rotation (~24h).
+            if dropped_inflight_rebenchmark:
+                try:
+                    champion_file = Path("validator_weights") / "qualification_champion.json"
+                    if champion_file.exists():
+                        with open(champion_file, 'r') as _f:
+                            _cdata = json.load(_f)
+                        cur = _cdata.get("current_champion") or {}
+                        last_rebench = cur.get("last_rebenchmark_at") or ""
+                        try:
+                            rollback_date = datetime.fromisoformat(
+                                last_rebench.replace("Z", "+00:00")
+                            ).date().isoformat() if last_rebench else None
+                        except Exception:
+                            rollback_date = None
+                        old_date = cur.get("last_evaluated_utc_date")
+                        if rollback_date and rollback_date != old_date:
+                            cur["last_evaluated_utc_date"] = rollback_date
+                            _cdata["current_champion"] = cur
+                            with open(champion_file, 'w') as _f:
+                                json.dump(_cdata, _f, indent=2)
+                            print(
+                                f"   🧹 Startup cleanup: dropped an in-flight rebenchmark work "
+                                f"file — rolled champion last_evaluated_utc_date back "
+                                f"{old_date} → {rollback_date} (matches last completion) so "
+                                f"the next tick will re-dispatch."
+                            )
+                except Exception as rollback_err:
+                    bt.logging.warning(
+                        f"Startup rebenchmark rollback failed: {rollback_err}"
+                    )
         
         # ── PER-WORKER BUSY CHECK: Only assign to workers that are free ──
         # A worker is "busy" if it has a work file from THIS epoch's window
