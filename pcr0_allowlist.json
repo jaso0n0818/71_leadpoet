@@ -1,6 +1,6 @@
 {
   "_comment": "PCR0 allowlist for LeadPoet TEE verification. Updated by CI/CD on each enclave build.",
-  "_updated": "2026-04-23T23:50:00Z",
+  "_updated": "2026-02-06T03:30:00Z",
   "_repo": "https://github.com/LeadPoet/Bittensor-subnet",
   
   "gateway_pcr0": [
@@ -30,12 +30,6 @@
       "version": "v1.1.0",
       "deployed": "2026-02-06",
       "notes": "IMMEDIATE REVEAL MODE - validator with weight calculation and reveal removal changes"
-    },
-    {
-      "pcr0": "bb22a3994b5eda42563fc1425880384fecccd227cbc1dbf464b6794baf5822a074a0b1191c46f8f1d5b717305543646f",
-      "version": "v1.2.0",
-      "deployed": "2026-04-23",
-      "notes": "Validator enclave rebuilt on 2026-04-23 to pick up gateway-weight-submission fix (normalize_to_u16_with_uids keeping UID/u16 arrays aligned after bittensor drops zero-rounded UIDs) and the day's fulfillment pipeline fixes (T_EPOCHS=1, consensus timeout 180min, excluded_companies, employee_count exact-bucket match, intent_details v2 via gpt-4o-mini, YouTube/TikTok scrapers).  Commits 2e2dc71 + da94cf9."
     }
   ]
 }
