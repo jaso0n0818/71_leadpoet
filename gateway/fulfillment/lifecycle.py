@@ -16,6 +16,7 @@ from gateway.fulfillment.config import (
     FULFILLMENT_MIN_VALIDATORS,
     FULFILLMENT_CONSENSUS_TIMEOUT_MINUTES,
     FULFILLMENT_MAX_PARALLEL_REQUESTS,
+    FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES,
     L_EPOCHS,
     M_MINUTES,
     T_EPOCHS,
@@ -173,12 +174,31 @@ async def _lifecycle_tick_inner(supabase) -> None:
     # pick the same pending row, only one UPDATE lands; the other is
     # a no-op.  Idempotent and safe.
     try:
-        open_count_resp = supabase.table("fulfillment_requests") \
+        # Count "miner-visible" open requests, not just raw open.  The
+        # miner-facing /fulfillment/requests/active endpoint hides any
+        # open request whose window_end is within
+        # FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES of now (a safety
+        # filter that prevents a miner from being handed a request
+        # they can't realistically commit to in time).  If we count
+        # only raw open here, a request in its "last 15 min of soon-
+        # to-expire" tail keeps the slot reserved without being
+        # visible to miners, which produced Mase's observed intermittent
+        # "/active sometimes returns fewer than 5 active requests"
+        # behaviour.  Using the visibility-aware cutoff keeps the
+        # pool of miner-visible requests at MAX_PARALLEL_REQUESTS at
+        # all times (or as close as pending-queue depth allows),
+        # while still letting the tail-end request naturally progress
+        # to commit_closed on its normal timer.
+        visibility_cutoff_iso = (
+            now + timedelta(minutes=FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES)
+        ).isoformat()
+        visible_open_resp = supabase.table("fulfillment_requests") \
             .select("request_id", count="exact") \
             .eq("status", "open") \
+            .gt("window_end", visibility_cutoff_iso) \
             .execute()
-        open_count = open_count_resp.count or 0
-        slots = FULFILLMENT_MAX_PARALLEL_REQUESTS - open_count
+        visible_open_count = visible_open_resp.count or 0
+        slots = FULFILLMENT_MAX_PARALLEL_REQUESTS - visible_open_count
         if slots > 0:
             pending = supabase.table("fulfillment_requests") \
                 .select("request_id") \
