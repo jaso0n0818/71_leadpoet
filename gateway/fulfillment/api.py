@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List
 
 from dateutil.parser import isoparse as _isoparse
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from gateway.fulfillment.config import (
     T_EPOCHS, T_SECONDS_OVERRIDE, M_MINUTES,
@@ -289,9 +289,62 @@ def _verify_fulfillment_signature(
 # POST /fulfillment/request  — client creates a new ICP request
 # ---------------------------------------------------------------
 @fulfillment_router.post("/request")
-async def create_request(icp: FulfillmentICP):
+async def create_request(
+    icp: FulfillmentICP,
+    authorization: str = Header(default=""),
+):
     if not _enable_fulfillment():
         raise HTTPException(503, detail="Fulfillment system is not enabled on this gateway")
+
+    # ───────────────────────────────────────────────────────────────────
+    # Auth gate — shared-secret bearer token.
+    #
+    # We use the gateway's existing SUPABASE_SERVICE_ROLE_KEY as the
+    # secret because (a) it's already provisioned in the gateway env,
+    # so there's no new infrastructure to manage, and (b) only the
+    # subnet operators hold it (it grants write access to the entire
+    # production DB, so it would never be shared with miners or
+    # clients anyway).  The team-only google doc that holds this key
+    # IS the source of truth for who can create requests.
+    #
+    # NOTE: this key is NEVER hardcoded.  It is read from the
+    # gateway process env at request time.  Don't log it, don't echo
+    # it in error messages, don't write it anywhere.  hmac.compare_digest
+    # gives us constant-time comparison so the failure path doesn't
+    # leak partial-match timing info.
+    #
+    # Header format: ``Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>``.
+    #
+    # Pre-existing requests created before this gate landed are not
+    # affected — only new POSTs are challenged.
+    # ───────────────────────────────────────────────────────────────────
+    import hmac as _hmac
+    expected_secret = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not expected_secret:
+        # Fail closed if the gateway itself is misconfigured rather than
+        # silently allowing all requests through.
+        logger.error(
+            "create_request: SUPABASE_SERVICE_ROLE_KEY not set in gateway env — "
+            "rejecting all requests until configured"
+        )
+        raise HTTPException(503, detail="Gateway auth misconfigured")
+
+    presented = ""
+    if authorization:
+        parts = authorization.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            presented = parts[1].strip()
+        else:
+            presented = authorization.strip()
+
+    if not presented or not _hmac.compare_digest(presented, expected_secret):
+        # Generic message — don't tell the caller whether their header
+        # was missing, malformed, or wrong.  All three are 401.
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized.  POST /fulfillment/request requires a valid "
+                   "bearer token in the Authorization header.",
+        )
 
     # Enforce `company` at the API boundary only.  The model itself defaults
     # this to "" so later re-parses of the scrubbed icp_details dict by the
