@@ -220,11 +220,26 @@ def _tier1_check(
     """
     Return failure_reason string if the lead fails any ICP check, else None.
     """
-    if icp.industry and lead.industry != icp.industry:
-        return "industry_mismatch"
+    # ``icp.industry`` and ``icp.sub_industry`` are lists of taxonomy values.
+    # The Tier 1 gate matches a lead if its single industry/sub_industry
+    # tag is present in the corresponding ICP list (set-membership), so a
+    # client can target multiple verticals in one request (e.g.
+    # restaurants + gyms + medspas) without splitting it into N separate
+    # requests.  Empty list means "any industry accepted" — same semantics
+    # as the legacy empty-string sentinel.
+    #
+    # Defensive ``isinstance(..., list)`` guards: an old icp_details row
+    # that pre-dates the multi-value migration may still be a plain str
+    # if any code path bypasses the model's ``mode="before"`` validator.
+    if icp.industry:
+        allowed_inds = icp.industry if isinstance(icp.industry, list) else [icp.industry]
+        if lead.industry not in allowed_inds:
+            return "industry_mismatch"
 
-    if icp.sub_industry and lead.sub_industry != icp.sub_industry:
-        return "sub_industry_mismatch"
+    if icp.sub_industry:
+        allowed_subs = icp.sub_industry if isinstance(icp.sub_industry, list) else [icp.sub_industry]
+        if lead.sub_industry not in allowed_subs:
+            return "sub_industry_mismatch"
 
     # Excluded companies: leads whose company EXACTLY matches any entry
     # in the ICP's excluded_companies list (case-insensitive only, no

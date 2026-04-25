@@ -150,8 +150,16 @@ class FulfillmentICP(BaseModel):
 
     icp_id: str = Field(default="")
     prompt: str = Field(..., min_length=1)
-    industry: str = ""
-    sub_industry: str = ""
+    # Industries and sub-industries the client will accept.  A single client
+    # ICP frequently spans multiple verticals (e.g. local-business outreach
+    # covering restaurants + gyms + medspas), so both fields are lists and
+    # the Tier 1 gate accepts a lead matching ANY listed value (set
+    # membership).  The validators (mode="before") accept either a list or
+    # a single string and normalize to a list — required for back-compat
+    # with historical icp_details JSON in the DB that was stored as a
+    # plain string before this column became multi-valued.
+    industry: List[str] = Field(default_factory=list)
+    sub_industry: List[str] = Field(default_factory=list)
     target_role_types: List[str] = Field(default_factory=list)
     target_roles: List[str] = Field(default_factory=list)
     target_seniority: str = ""
@@ -243,26 +251,90 @@ class FulfillmentICP(BaseModel):
             out.append(s)
         return out
 
-    @field_validator("industry")
+    @field_validator("industry", mode="before")
     @classmethod
-    def validate_industry(cls, v: str) -> str:
-        if not v:
-            return v
-        if v not in VALID_INDUSTRIES:
-            raise ValueError(f"Industry '{v}' not in taxonomy. Valid: {sorted(VALID_INDUSTRIES)}")
-        return v
+    def validate_industry(cls, v) -> List[str]:
+        """Coerce to ``List[str]`` of taxonomy-valid industries.
 
-    @field_validator("sub_industry")
+        Accepts:
+          * ``None`` / ``""`` / ``[]``   -> ``[]``
+          * Single ``str``               -> ``[str]`` (back-compat with
+            legacy icp_details rows where industry was stored as a plain
+            string before the column became multi-valued)
+          * ``List[str]``                -> validated, deduped (case-sensitive
+            because taxonomy keys are canonical-case strings)
+
+        Rejects any entry not present in ``VALID_INDUSTRIES``.
+        """
+        if v is None or v == "" or v == []:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list):
+            raise ValueError(
+                f"industry must be a list or string, got {type(v).__name__}"
+            )
+        seen = set()
+        out: List[str] = []
+        for entry in v:
+            s = str(entry).strip()
+            if not s or s in seen:
+                continue
+            if s not in VALID_INDUSTRIES:
+                raise ValueError(
+                    f"Industry '{s}' not in taxonomy. Valid: {sorted(VALID_INDUSTRIES)}"
+                )
+            seen.add(s)
+            out.append(s)
+        return out
+
+    @field_validator("sub_industry", mode="before")
     @classmethod
-    def validate_sub_industry(cls, v: str, info) -> str:
-        if not v:
-            return v
-        if v not in VALID_SUB_INDUSTRIES:
-            raise ValueError(f"Sub-industry '{v}' not in taxonomy")
-        industry = info.data.get("industry", "")
-        if industry and v not in SUB_INDUSTRY_TO_PARENTS.get(v, []) and industry not in INDUSTRY_TAXONOMY.get(v, {}).get("industries", []):
-            raise ValueError(f"Sub-industry '{v}' does not belong to industry '{industry}'")
-        return v
+    def validate_sub_industry(cls, v, info) -> List[str]:
+        """Coerce to ``List[str]`` of taxonomy-valid sub-industries.
+
+        Each entry must belong to AT LEAST ONE of the request's
+        ``industry`` entries (when ``industry`` is non-empty); otherwise
+        the cross-check is skipped.  This lets a client target multiple
+        sub-industries spanning multiple parent industries (e.g.
+        ``industry=["Food and Beverage", "Health Care"]``,
+        ``sub_industry=["Restaurants", "Fitness"]``).
+        """
+        if v is None or v == "" or v == []:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list):
+            raise ValueError(
+                f"sub_industry must be a list or string, got {type(v).__name__}"
+            )
+
+        industries = info.data.get("industry") or []
+        if isinstance(industries, str):
+            industries = [industries] if industries else []
+
+        seen = set()
+        out: List[str] = []
+        for entry in v:
+            s = str(entry).strip()
+            if not s or s in seen:
+                continue
+            if s not in VALID_SUB_INDUSTRIES:
+                raise ValueError(f"Sub-industry '{s}' not in taxonomy")
+            if industries:
+                # Build the set of valid parent industries for this
+                # sub-industry from BOTH directions of the taxonomy graph,
+                # matching the legacy single-value validator's tolerance.
+                parents = set(SUB_INDUSTRY_TO_PARENTS.get(s, []))
+                parents.update(INDUSTRY_TAXONOMY.get(s, {}).get("industries", []))
+                if not (parents & set(industries)):
+                    raise ValueError(
+                        f"Sub-industry '{s}' does not belong to any of "
+                        f"the listed industries {industries}"
+                    )
+            seen.add(s)
+            out.append(s)
+        return out
 
     @field_validator("target_role_types")
     @classmethod
@@ -333,11 +405,20 @@ class FulfillmentICP(BaseModel):
             ec_str = f"{min(los)}-{max(his)}"
         else:
             ec_str = ""
+        # ``ICPPrompt`` is the legacy single-value schema shared with the
+        # qualification/sourcing pipeline; collapse the multi-value
+        # ``industry``/``sub_industry`` lists to comma-joined strings so
+        # downstream consumers still receive a non-empty value.  The only
+        # field of ``icp_prompt`` that fulfillment scoring actually reads
+        # is ``intent_signals`` (see scoring.py L389), so the collapsed
+        # form is purely cosmetic for the rest.
+        industry_str = ", ".join(self.industry) if self.industry else ""
+        sub_industry_str = ", ".join(self.sub_industry) if self.sub_industry else ""
         return ICPPrompt(
             icp_id=self.icp_id,
             prompt=self.prompt,
-            industry=self.industry,
-            sub_industry=self.sub_industry,
+            industry=industry_str,
+            sub_industry=sub_industry_str,
             target_roles=roles,
             target_seniority=self.target_seniority,
             employee_count=ec_str,

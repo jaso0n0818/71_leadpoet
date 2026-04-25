@@ -586,6 +586,41 @@ async def get_active_requests(miner_hotkey: str = ""):
             icp["employee_count"] = ""
         icp["employee_count_buckets"] = buckets
 
+        # Industry / sub-industry: same dual-shape treatment as
+        # employee_count.  ``industry`` (and ``sub_industry``) are now
+        # multi-valued internally but historically miners parsed them as
+        # single strings.  Expose:
+        #   - ``industry`` / ``sub_industry``       : comma-joined string
+        #     (back-compat for any miner that already does
+        #     ``r["icp"]["industry"] == "Software"``-style checks).
+        #     With multi-value ICPs this WILL contain commas (e.g.
+        #     ``"Food and Beverage, Health Care"``); legacy miners that
+        #     do exact-match comparisons should migrate to the lists below.
+        #   - ``industries`` / ``sub_industries``   : authoritative lists.
+        #     These are what the validator's Tier 1 gate uses (set-
+        #     membership), so any miner that wants their submitted leads
+        #     to pass ICP fit MUST check the lead's industry/sub_industry
+        #     against these lists.
+        ind_val = icp.get("industry")
+        if isinstance(ind_val, list):
+            ind_list = [s for s in ind_val if isinstance(s, str) and s]
+        elif isinstance(ind_val, str) and ind_val:
+            ind_list = [ind_val]
+        else:
+            ind_list = []
+        icp["industry"] = ", ".join(ind_list)
+        icp["industries"] = ind_list
+
+        sub_val = icp.get("sub_industry")
+        if isinstance(sub_val, list):
+            sub_list = [s for s in sub_val if isinstance(s, str) and s]
+        elif isinstance(sub_val, str) and sub_val:
+            sub_list = [sub_val]
+        else:
+            sub_list = []
+        icp["sub_industry"] = ", ".join(sub_list)
+        icp["sub_industries"] = sub_list
+
         requests_out.append({
             "request_id": r["request_id"],
             "icp": icp,
