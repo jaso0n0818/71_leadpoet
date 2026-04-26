@@ -61,7 +61,15 @@ async def score_miner_submission(
         return [pe if pe is not None else FulfillmentScoreResult(failure_reason="empty")
                 for pe in parse_errors]
 
-    scored = await score_fulfillment_batch(scoreable, icp)
+    # use_apify=True flips fulfillment Stage 4/5 from the legacy
+    # check_linkedin_gse + check_stage5_unified pair to the new Apify-based
+    # fulfillment_person_verification + fulfillment_company_verification
+    # path.  Sourcing is unaffected — that pipeline goes through
+    # run_automated_checks in neurons/validator.py and never reaches this
+    # function.  Requires APIFY_API_TOKEN in the container env (wired in
+    # deploy_dynamic.sh -e flags) plus the existing OPENROUTER_KEY and
+    # SCRAPINGDOG_API_KEY which are already provisioned.
+    scored = await score_fulfillment_batch(scoreable, icp, use_apify=True)
 
     results: List[FulfillmentScoreResult] = []
     score_idx = 0
