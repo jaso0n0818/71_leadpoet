@@ -755,7 +755,9 @@ async def run_stage0_2_checks(lead: dict) -> Tuple[bool, dict]:
 async def run_stage4_5_repscore(
     lead: dict,
     email_result: dict,
-    stage0_2_data: dict
+    stage0_2_data: dict,
+    skip_stage4: bool = False,
+    skip_stage5: bool = False,
 ) -> Tuple[bool, dict]:
     """
     Run Stage 4, Stage 5, and Rep Score checks only.
@@ -881,27 +883,34 @@ async def run_stage4_5_repscore(
     # Stage 4: LinkedIn/GSE Validation (HARD)
     # EXTRACTED VERBATIM from run_automated_checks()
     # ========================================================================
-    print(f"🔍 Stage 4: LinkedIn/GSE validation for {email} @ {company}")
+    if skip_stage4:
+        print(f"   ⏭️  Stage 4: Skipped (Apify verified) for {email} @ {company}")
+        automated_checks_data["stage_4_linkedin"]["linkedin_verified"] = True
+        automated_checks_data["stage_4_linkedin"]["gse_search_count"] = lead.get("gse_search_count", 0)
+        automated_checks_data["stage_4_linkedin"]["llm_confidence"] = lead.get("llm_confidence", "apify")
+        automated_checks_data["stage_4_linkedin"]["source"] = "apify"
+    else:
+        print(f"🔍 Stage 4: LinkedIn/GSE validation for {email} @ {company}")
 
-    passed, rejection_reason = await check_linkedin_gse(lead)
+        passed, rejection_reason = await check_linkedin_gse(lead)
 
-    # Collect Stage 4 data even on failure
-    automated_checks_data["stage_4_linkedin"]["gse_search_count"] = lead.get("gse_search_count", 0)
-    automated_checks_data["stage_4_linkedin"]["llm_confidence"] = lead.get("llm_confidence", "none")
+        # Collect Stage 4 data even on failure
+        automated_checks_data["stage_4_linkedin"]["gse_search_count"] = lead.get("gse_search_count", 0)
+        automated_checks_data["stage_4_linkedin"]["llm_confidence"] = lead.get("llm_confidence", "none")
 
-    if not passed:
-        msg = rejection_reason.get("message", "Unknown error") if rejection_reason else "Unknown error"
-        print(f"   ❌ Stage 4 failed: {msg}")
-        automated_checks_data["passed"] = False
-        automated_checks_data["rejection_reason"] = rejection_reason
-        return False, automated_checks_data
+        if not passed:
+            msg = rejection_reason.get("message", "Unknown error") if rejection_reason else "Unknown error"
+            print(f"   ❌ Stage 4 failed: {msg}")
+            automated_checks_data["passed"] = False
+            automated_checks_data["rejection_reason"] = rejection_reason
+            return False, automated_checks_data
 
-    print("   ✅ Stage 4 passed")
+        print("   ✅ Stage 4 passed")
 
-    # Collect Stage 4 data after successful check
-    automated_checks_data["stage_4_linkedin"]["linkedin_verified"] = True
-    automated_checks_data["stage_4_linkedin"]["gse_search_count"] = lead.get("gse_search_count", 0)
-    automated_checks_data["stage_4_linkedin"]["llm_confidence"] = lead.get("llm_confidence", "none")
+        # Collect Stage 4 data after successful check
+        automated_checks_data["stage_4_linkedin"]["linkedin_verified"] = True
+        automated_checks_data["stage_4_linkedin"]["gse_search_count"] = lead.get("gse_search_count", 0)
+        automated_checks_data["stage_4_linkedin"]["llm_confidence"] = lead.get("llm_confidence", "none")
 
     # ========================================================================
     # Stage 5: Role/Region/Industry Verification (HARD)
@@ -911,27 +920,39 @@ async def run_stage4_5_repscore(
     # - Early exit: if region fails → skip industry
     # - Anti-gaming: rejects if miner puts multiple states in region
     # ========================================================================
-    print(f"🔍 Stage 5: Role/Region/Industry verification for {email} @ {company}")
+    if skip_stage5:
+        print(f"   ⏭️  Stage 5: Skipped (fulfillment verified) for {email} @ {company}")
+        automated_checks_data["stage_5_verification"]["company_name_verified"] = lead.get("stage5_name_match", False)
+        automated_checks_data["stage_5_verification"]["company_size_verified"] = lead.get("stage5_size_match", False)
+        automated_checks_data["stage_5_verification"]["company_hq_verified"] = lead.get("stage5_hq_match", False)
+        automated_checks_data["stage_5_verification"]["industry_verified"] = lead.get("stage5_industry_match", False)
+        automated_checks_data["stage_5_verification"]["extracted_name"] = lead.get("stage5_extracted_name")
+        automated_checks_data["stage_5_verification"]["extracted_size"] = lead.get("stage5_extracted_size")
+        automated_checks_data["stage_5_verification"]["extracted_hq"] = lead.get("stage5_extracted_hq")
+        automated_checks_data["stage_5_verification"]["extracted_industry"] = lead.get("stage5_extracted_industry")
+        automated_checks_data["stage_5_verification"]["source"] = "fulfillment_company_verification"
+    else:
+        print(f"🔍 Stage 5: Role/Region/Industry verification for {email} @ {company}")
 
-    passed, rejection_reason = await check_stage5_unified(lead)
+        passed, rejection_reason = await check_stage5_unified(lead)
 
-    # Collect Stage 5 data (company verification - role/location handled by Stage 4)
-    automated_checks_data["stage_5_verification"]["company_name_verified"] = lead.get("stage5_name_match", False)
-    automated_checks_data["stage_5_verification"]["company_size_verified"] = lead.get("stage5_size_match", False)
-    automated_checks_data["stage_5_verification"]["company_hq_verified"] = lead.get("stage5_hq_match", False)
-    automated_checks_data["stage_5_verification"]["industry_verified"] = lead.get("stage5_industry_match", False)
-    automated_checks_data["stage_5_verification"]["extracted_name"] = lead.get("stage5_extracted_name")
-    automated_checks_data["stage_5_verification"]["extracted_size"] = lead.get("stage5_extracted_size")
-    automated_checks_data["stage_5_verification"]["extracted_hq"] = lead.get("stage5_extracted_hq")
-    automated_checks_data["stage_5_verification"]["extracted_industry"] = lead.get("stage5_extracted_industry")
+        # Collect Stage 5 data (company verification - role/location handled by Stage 4)
+        automated_checks_data["stage_5_verification"]["company_name_verified"] = lead.get("stage5_name_match", False)
+        automated_checks_data["stage_5_verification"]["company_size_verified"] = lead.get("stage5_size_match", False)
+        automated_checks_data["stage_5_verification"]["company_hq_verified"] = lead.get("stage5_hq_match", False)
+        automated_checks_data["stage_5_verification"]["industry_verified"] = lead.get("stage5_industry_match", False)
+        automated_checks_data["stage_5_verification"]["extracted_name"] = lead.get("stage5_extracted_name")
+        automated_checks_data["stage_5_verification"]["extracted_size"] = lead.get("stage5_extracted_size")
+        automated_checks_data["stage_5_verification"]["extracted_hq"] = lead.get("stage5_extracted_hq")
+        automated_checks_data["stage_5_verification"]["extracted_industry"] = lead.get("stage5_extracted_industry")
 
-    if not passed:
-        msg = rejection_reason.get("message", "Unknown error") if rejection_reason else "Unknown error"
-        print(f"   ❌ Stage 5 failed: {msg}")
-        automated_checks_data["passed"] = False
-        automated_checks_data["rejection_reason"] = rejection_reason
-        automated_checks_data["stage_5_verification"]["early_exit"] = rejection_reason.get("early_exit") if rejection_reason else None
-        return False, automated_checks_data
+        if not passed:
+            msg = rejection_reason.get("message", "Unknown error") if rejection_reason else "Unknown error"
+            print(f"   ❌ Stage 5 failed: {msg}")
+            automated_checks_data["passed"] = False
+            automated_checks_data["rejection_reason"] = rejection_reason
+            automated_checks_data["stage_5_verification"]["early_exit"] = rejection_reason.get("early_exit") if rejection_reason else None
+            return False, automated_checks_data
 
     print("   ✅ Stage 5 passed")
 

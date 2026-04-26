@@ -86,7 +86,39 @@ from qualification.scoring.lead_scorer import (
     _apply_signal_time_decay,
     _extract_domain as _extract_signal_domain,
 )
-from gateway.fulfillment.scoring import aggregate_intent_scores
+# Inlined verbatim from gateway/fulfillment/scoring.py::aggregate_intent_scores
+# rather than imported, because that gateway module pulls in validator-only
+# scrapers (Apify, ScrapingDog, OpenRouter) at module load time.  Miners
+# don't ship those validator-only modules, so importing the gateway file
+# here would crash the miner with ModuleNotFoundError before any work
+# starts.  This local copy is a pure-math helper — if the validator-side
+# formula in gateway/fulfillment/scoring.py changes, this MUST be kept in
+# sync (the constants below are imported live from gateway.fulfillment.config
+# so threshold tuning still propagates without a code change here).
+from gateway.fulfillment.config import (
+    FULFILLMENT_INTENT_QUALITY_FLOOR,
+    FULFILLMENT_INTENT_BREADTH_WEIGHT,
+)
+
+
+def aggregate_intent_scores(signal_scores):
+    """Peak-weighted aggregation: best signal dominates, quality signals
+    add diminishing breadth bonus, noise is ignored.
+
+    KEEP IN SYNC with gateway/fulfillment/scoring.py::aggregate_intent_scores.
+    """
+    if not signal_scores:
+        return 0.0
+    sorted_desc = sorted(signal_scores, reverse=True)
+    best = sorted_desc[0]
+    bonus = 0.0
+    for i, score in enumerate(sorted_desc[1:], start=1):
+        if score < FULFILLMENT_INTENT_QUALITY_FLOOR:
+            break
+        bonus += score * FULFILLMENT_INTENT_BREADTH_WEIGHT * (1 / i)
+    return min(best + bonus, 60.0)
+
+
 from gateway.qualification.models import (
     IntentSignal as ValidatorIntentSignal,
     IntentSignalSource,

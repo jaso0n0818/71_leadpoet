@@ -8,6 +8,7 @@ Tier 3: Intent Scoring ($moderate — LLM calls, peak-weighted aggregation)
 
 import asyncio
 import logging
+import os
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -24,6 +25,8 @@ from gateway.fulfillment.models import (
     VALID_ROLE_TYPES,
 )
 from gateway.qualification.models import LeadOutput, ICPPrompt
+from validator_models.fulfillment_person_verification import fulfillment_person_verification
+from validator_models.fulfillment_company_verification import fulfillment_company_verification
 
 logger = logging.getLogger(__name__)
 
@@ -317,14 +320,16 @@ async def score_fulfillment_lead(
     icp: FulfillmentICP,
     seen_companies: Set[str],
     email_result: Optional[dict] = None,
+    use_apify: bool = False,
 ) -> FulfillmentScoreResult:
     """Score a single fulfillment lead through the full verification + scoring pipeline.
 
     Pipeline order:
       Tier 1  – ICP fit (free, deterministic)
       Tier 2  – Stage 0-2 data accuracy (DNS, DNSBL, basic checks)
+              – Apify Stage 4 (if use_apify=True, replaces ScrapingDog Stage 4)
               – Stage 3   email verification (TrueList result)
-              – Stage 4   person verification (LinkedIn/GSE)
+              – Stage 4   person verification (LinkedIn/GSE) — skipped if Apify verified
               – Stage 5   company verification + rep score
       Tier 3  – Intent scoring (LLM, peak-weighted aggregation)
     """
@@ -351,9 +356,49 @@ async def score_fulfillment_lead(
             failure_reason=t2_failure,
         )
 
+    # --- Fulfillment Stage 5 + Stage 4 (before Tier 2b) ---
+    # Company verification first (cheaper), then person verification
+    skip_stage4 = False
+    skip_stage5 = False
+    if use_apify:
+        apify_token = os.environ.get("APIFY_API_TOKEN", "")
+        openrouter_key = os.environ.get("OPENROUTER_KEY", "")
+        scrapingdog_key = os.environ.get("SCRAPINGDOG_API_KEY", "")
+
+        # Fulfillment Stage 5: ScrapingDog LinkedIn company verification (cheap)
+        if scrapingdog_key:
+            s5_passed, s5_rejection = await fulfillment_company_verification(
+                validator_dict, scrapingdog_key, openrouter_key,
+            )
+            if not s5_passed:
+                reason = s5_rejection.get("check_name", "fulfillment_company_failed") if s5_rejection else "fulfillment_company_failed"
+                return FulfillmentScoreResult(
+                    tier1_passed=True, tier2_passed=True,
+                    failure_reason=reason,
+                )
+            skip_stage5 = True
+
+        # Fulfillment Stage 4: Person verification (Q1 → SD → Apify)
+        if apify_token and skip_stage5:
+            passed, rejection_reason = await fulfillment_person_verification(
+                validator_dict, apify_token, openrouter_key, scrapingdog_key,
+            )
+            if passed:
+                skip_stage4 = True
+            elif rejection_reason and rejection_reason.get("check_name") == "fulfillment_person_fetch_failed":
+                # Apify API error — fall back to ScrapingDog Stage 4
+                print("   ⚠️ Apify fetch failed, falling back to ScrapingDog Stage 4")
+            elif not passed:
+                reason = rejection_reason.get("check_name", "fulfillment_person_verification_failed") if rejection_reason else "fulfillment_person_verification_failed"
+                return FulfillmentScoreResult(
+                    tier1_passed=True, tier2_passed=True,
+                    failure_reason=reason,
+                )
+
     # --- Tier 2b: Stage 3+4+5 verification ---
     verif_failure, verif_data = await _run_verification_stages(
         validator_dict, email_result, stage0_2_data,
+        skip_stage4=skip_stage4, skip_stage5=skip_stage5,
     )
 
     email_verified = verif_data.get("stage_3_email", {}).get("email_status") == "valid"
@@ -520,6 +565,7 @@ async def score_fulfillment_lead(
 async def score_fulfillment_batch(
     leads: List[FulfillmentLead],
     icp: FulfillmentICP,
+    use_apify: bool = False,
 ) -> List[FulfillmentScoreResult]:
     """Score a batch of fulfillment leads with batch email verification."""
     seen_companies: Set[str] = set()
@@ -532,6 +578,7 @@ async def score_fulfillment_batch(
         per_lead = email_results_map.get(lead.email.lower())
         result = await score_fulfillment_lead(
             lead, icp, seen_companies, email_result=per_lead,
+            use_apify=use_apify,
         )
         results.append(result)
 
@@ -765,11 +812,17 @@ async def _run_verification_stages(
     validator_dict: dict,
     email_result: Optional[dict],
     stage0_2_data: Optional[dict],
+    skip_stage4: bool = False,
+    skip_stage5: bool = False,
 ) -> Tuple[Optional[str], dict]:
     """Run Stage 3 (email) + Stage 4 (person) + Stage 5 (company) + rep score.
 
     Delegates to the validator pipeline's ``run_stage4_5_repscore`` which
     expects pre-computed TrueList email results and the Stage 0-2 data dict.
+
+    When *skip_stage4* is True (Apify already verified the person), Stage 4
+    inside ``run_stage4_5_repscore`` is skipped.  When *skip_stage5* is True
+    (fulfillment Stage 5 already verified the company), Stage 5 is skipped.
 
     Returns ``(failure_reason, verification_data)``.
     """
@@ -783,6 +836,7 @@ async def _run_verification_stages(
 
     passed, full_data = await run_stage4_5_repscore(
         validator_dict, email_result, stage0_2_data,
+        skip_stage4=skip_stage4, skip_stage5=skip_stage5,
     )
     if not passed:
         rej = full_data.get("rejection_reason") or {}
