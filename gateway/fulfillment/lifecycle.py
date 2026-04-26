@@ -192,9 +192,14 @@ async def _lifecycle_tick_inner(supabase) -> None:
         visibility_cutoff_iso = (
             now + timedelta(minutes=FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES)
         ).isoformat()
+        # Count miner-visible 'open' OR 'continued_open' requests when
+        # computing slots — both are surfaced to miners by /active and
+        # both consume a slot in the FULFILLMENT_MAX_PARALLEL_REQUESTS
+        # cap.  A continued_open is functionally identical to open for
+        # commit windowing; only the label differs.
         visible_open_resp = supabase.table("fulfillment_requests") \
             .select("request_id", count="exact") \
-            .eq("status", "open") \
+            .in_("status", ["open", "continued_open"]) \
             .gt("window_end", visibility_cutoff_iso) \
             .execute()
         visible_open_count = visible_open_resp.count or 0
@@ -215,16 +220,39 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 r_end = w_end + timedelta(minutes=M_MINUTES)
                 for p in pending.data:
                     rid = p["request_id"]
+                    # Decide whether this pending row should be promoted
+                    # to 'open' (fresh) or 'continued_open' (chain
+                    # continuation) by looking at the predecessor's
+                    # status.  Predecessors with status='partially_fulfilled'
+                    # signal a chain in flight — successors get the
+                    # 'continued_open' label so miners (and dashboards)
+                    # know prior held leads exist and rewards won't flow
+                    # for this cycle alone.
+                    target_status = "open"
+                    try:
+                        pred = supabase.table("fulfillment_requests") \
+                            .select("status") \
+                            .eq("successor_request_id", rid) \
+                            .limit(1) \
+                            .execute()
+                        if pred.data and pred.data[0].get("status") == "partially_fulfilled":
+                            target_status = "continued_open"
+                    except Exception:
+                        # Predecessor lookup is a hint only — falling
+                        # back to plain 'open' is safe (commit window
+                        # behavior is identical between the two).
+                        pass
+
                     try:
                         supabase.table("fulfillment_requests").update({
-                            "status": "open",
+                            "status": target_status,
                             "window_start": now_iso,
                             "window_end": w_end.isoformat(),
                             "reveal_window_end": r_end.isoformat(),
                         }).eq("request_id", rid) \
                           .eq("status", "pending") \
                           .execute()
-                        print(f"   ⬆️  {rid[:8]}... promoted pending → open "
+                        print(f"   ⬆️  {rid[:8]}... promoted pending → {target_status} "
                               f"(window_end {w_end.strftime('%H:%M:%S')}Z)")
                     except Exception as e:
                         print(f"   ⚠️  Promote failed for {rid[:8]}: {e}")
@@ -234,7 +262,7 @@ async def _lifecycle_tick_inner(supabase) -> None:
     # Debug: show all non-terminal request statuses
     all_req = supabase.table("fulfillment_requests") \
         .select("request_id, status, window_end, reveal_window_end") \
-        .in_("status", ["pending", "open", "commit_closed", "scoring"]) \
+        .in_("status", ["pending", "open", "continued_open", "commit_closed", "scoring"]) \
         .execute()
     if all_req.data:
         print(f"🔄 Lifecycle tick @ {now_iso[:19]}Z — {len(all_req.data)} active request(s):")
@@ -245,14 +273,15 @@ async def _lifecycle_tick_inner(supabase) -> None:
                   f"window_end={str(we)[:19]} "
                   f"reveal_end={str(re_)[:19]}")
 
-    # Step 1: open -> commit_closed (past window_end)
+    # Step 1: open -> commit_closed (past window_end).  Both 'open' and
+    # 'continued_open' transition the same way — only the label differs.
     open_past_window = supabase.table("fulfillment_requests") \
         .select("request_id") \
-        .eq("status", "open") \
+        .in_("status", ["open", "continued_open"]) \
         .lt("window_end", now_iso) \
         .execute()
     if open_past_window.data:
-        print(f"Lifecycle: {len(open_past_window.data)} open request(s) past window_end")
+        print(f"Lifecycle: {len(open_past_window.data)} open/continued_open request(s) past window_end")
     for r in (open_past_window.data or []):
         try:
             supabase.rpc("fulfillment_close_window", {
@@ -309,10 +338,16 @@ async def _lifecycle_tick_inner(supabase) -> None:
                 print(f"   ❌ Error transitioning {rid[:8]}... to scoring: {e}")
         else:
             print(f"   ⚠️  No reveals for {rid[:8]}... — recycling")
+            chain_state = _chain_held_state_for_recycle(
+                supabase, rid, r.get("num_leads") or 0,
+            )
             _recycle_request(
                 supabase, r, now, now_iso,
-                terminal_status="recycled",
+                terminal_status=chain_state["recycle_status"] or "recycled",
                 reason="no_reveals",
+                successor_status_target=chain_state["successor_status_target"],
+                successor_num_leads=chain_state["successor_num_leads"],
+                held_companies=chain_state["held_companies"],
             )
 
     # Step 3: consensus aggregation for scoring requests
@@ -346,10 +381,20 @@ async def _lifecycle_tick_inner(supabase) -> None:
                     f"   ⚠️  {rid[:8]}... has 0 validators after timeout — "
                     f"expiring and recycling"
                 )
+                chain_state = _chain_held_state_for_recycle(
+                    supabase, rid, r.get("num_leads") or 0,
+                )
                 _recycle_request(
                     supabase, r, now, now_iso,
-                    terminal_status="expired",
+                    # If prior held leads exist, mark the predecessor
+                    # partially_fulfilled rather than expired so miners
+                    # see the chain is still in flight; otherwise keep
+                    # the legacy 'expired' label.
+                    terminal_status=chain_state["recycle_status"] or "expired",
                     reason="no_validators_timeout",
+                    successor_status_target=chain_state["successor_status_target"],
+                    successor_num_leads=chain_state["successor_num_leads"],
+                    held_companies=chain_state["held_companies"],
                 )
                 continue
 
@@ -365,10 +410,16 @@ async def _lifecycle_tick_inner(supabase) -> None:
                     f"   ⚠️  {rid[:8]}... produced empty consensus — "
                     f"expiring and recycling"
                 )
+                chain_state = _chain_held_state_for_recycle(
+                    supabase, rid, r.get("num_leads") or 0,
+                )
                 _recycle_request(
                     supabase, r, now, now_iso,
-                    terminal_status="expired",
+                    terminal_status=chain_state["recycle_status"] or "expired",
                     reason="empty_consensus",
+                    successor_status_target=chain_state["successor_status_target"],
+                    successor_num_leads=chain_state["successor_num_leads"],
+                    held_companies=chain_state["held_companies"],
                 )
                 continue
 
@@ -399,44 +450,119 @@ async def _lifecycle_tick_inner(supabase) -> None:
                           f"lead {str(cr.get('lead_id',''))[:8]}: {e}")
 
             num_requested = r.get("num_leads") or (r.get("icp_details", {}) or {}).get("num_leads") or 0
-            winner_lead_ids = await _run_dedup_and_rewards(rid, consensus_results, num_requested)
 
-            # Quota gate: only mark `fulfilled` when the client's full N-lead
-            # quota is satisfied. Otherwise discard this batch and recycle
-            # into a fresh successor so miners can take another pass at the
-            # same ICP. Clients never see a partial-fulfillment state.
-            if num_requested > 0 and len(winner_lead_ids) < num_requested:
+            # Chain-aware top-K resolution.
+            #   * Combines this cycle's qualifying candidates with any leads
+            #     already held in earlier generations of this chain
+            #     (is_chain_held=TRUE on predecessor consensus rows).
+            #   * Cross-cycle dedup on company so the same business never
+            #     occupies two slots, even across recycle generations.
+            #   * Updates the is_chain_held flag for the entire chain
+            #     (sets TRUE on the new top-K, clears FALSE on displaced
+            #     leads that lost their slot to a higher-scoring entry).
+            #   * Does NOT distribute rewards yet; rewards only flow when
+            #     the chain reaches its full quota (see fulfilled branch
+            #     below).  Held leads earn nothing until then — by design.
+            chain = await _resolve_chain_topk(rid, consensus_results, num_requested)
+            chain_target = chain["chain_target"]
+            topk = chain["topk"]
+            topk_lead_ids = chain["topk_lead_ids"]
+            topk_companies = chain["topk_companies"]
+            displaced_count = chain["displaced_count"]
+
+            held_count = len(topk)
+            print(
+                f"   📊 {rid[:8]}... chain top-K: held {held_count}/{chain_target} "
+                f"(this cycle contributed {len(chain['this_cycle_winners'])}, "
+                f"displaced {displaced_count} from prior generations)"
+            )
+
+            if held_count >= chain_target:
+                # ────────────────────────────────────────────────────────
+                # FULFILLED: chain reached full quota.  Distribute rewards
+                # NOW for the entire top-K (including held leads from
+                # earlier generations — their request_id stays in their
+                # original generation, but reward_pct/expires_epoch is
+                # written via calculate_lead_rewards keyed on
+                # (request_id, submission_id, lead_id)).
+                # ────────────────────────────────────────────────────────
+                winner_lead_ids = await _finalize_chain_rewards(
+                    rid, topk, chain["tied_groups"],
+                )
+                supabase.table("fulfillment_requests").update({
+                    "status": "fulfilled",
+                }).eq("request_id", rid).execute()
                 print(
-                    f"   ♻️  {rid[:8]}... insufficient winners "
-                    f"({len(winner_lead_ids)}/{num_requested}) — recycling"
+                    f"   ✅ {rid[:8]}... -> fulfilled "
+                    f"({len(winner_lead_ids)}/{chain_target} winners; "
+                    f"chain reached quota)"
+                )
+
+                ranked = sorted(
+                    consensus_results,
+                    key=lambda x: x.get("consensus_final_score", 0),
+                    reverse=True,
+                )
+                print(f"\n{'='*60}")
+                print(f"🏆 FULFILLMENT RESULTS — Request {rid[:8]}...")
+                print(f"   {len(ranked)} leads scored this cycle; chain target={chain_target}")
+                print(f"{'='*60}")
+                for i, cr in enumerate(ranked, 1):
+                    miner = cr.get("miner_hotkey", "?")[:16]
+                    score = cr.get("consensus_final_score", 0)
+                    t2 = "✅" if cr.get("consensus_tier2_passed") else "❌"
+                    is_winner = cr.get("lead_id") in winner_lead_ids
+                    winner = "👑" if is_winner else "  "
+                    lid = cr.get("lead_id", "?")[:8]
+                    print(f"   {winner} #{i}: score={score:.1f} tier2={t2} miner={miner}... lead={lid}...")
+                print(f"\n   Winners: {len(winner_lead_ids)}/{chain_target} leads")
+                print(f"{'='*60}\n")
+            elif held_count > 0:
+                # ────────────────────────────────────────────────────────
+                # PARTIALLY_FULFILLED: chain produced some held leads but
+                # didn't hit the quota.  Successor inherits the in-flight
+                # held set (held companies become excluded_companies) and
+                # asks miners only for the remaining quota.  No rewards
+                # distributed yet; held leads sit in DB with
+                # is_chain_held=TRUE and earn $0 until the chain
+                # eventually reaches `fulfilled`.
+                # ────────────────────────────────────────────────────────
+                remaining = chain_target - held_count
+                print(
+                    f"   📈 {rid[:8]}... -> partially_fulfilled "
+                    f"({held_count}/{chain_target} held, "
+                    f"recycling for {remaining} more)"
+                )
+                _recycle_request(
+                    supabase, r, now, now_iso,
+                    terminal_status="partially_fulfilled",
+                    successor_status_target="continued_open",
+                    successor_num_leads=remaining,
+                    held_companies=topk_companies,
+                    reason=(
+                        f"chain_partial_{held_count}_of_{chain_target}"
+                    ),
+                )
+            else:
+                # ────────────────────────────────────────────────────────
+                # RECYCLED: chain produced ZERO held leads this cycle and
+                # has no held leads from prior generations either (or
+                # they all just got knocked out).  Treat this like the
+                # legacy "no useful work" recycle — successor is a fresh
+                # `open` request asking for the full quota again.
+                # ────────────────────────────────────────────────────────
+                print(
+                    f"   ♻️  {rid[:8]}... -> recycled "
+                    f"(0 held, target {chain_target}) — fresh start"
                 )
                 _recycle_request(
                     supabase, r, now, now_iso,
                     terminal_status="recycled",
-                    reason=f"insufficient_winners_{len(winner_lead_ids)}_of_{num_requested}",
+                    successor_status_target="open",
+                    successor_num_leads=chain_target,
+                    held_companies=[],
+                    reason=f"empty_chain_topk_target_{chain_target}",
                 )
-                continue
-
-            supabase.table("fulfillment_requests").update({
-                "status": "fulfilled",
-            }).eq("request_id", rid).execute()
-            print(f"   ✅ {rid[:8]}... -> fulfilled ({len(winner_lead_ids)}/{num_requested} winners from {len(consensus_results)} scored)")
-
-            ranked = sorted(consensus_results, key=lambda x: x.get("consensus_final_score", 0), reverse=True)
-            print(f"\n{'='*60}")
-            print(f"🏆 FULFILLMENT RESULTS — Request {rid[:8]}...")
-            print(f"   {len(ranked)} leads scored, client requested {num_requested}")
-            print(f"{'='*60}")
-            for i, cr in enumerate(ranked, 1):
-                miner = cr.get("miner_hotkey", "?")[:16]
-                score = cr.get("consensus_final_score", 0)
-                t2 = "✅" if cr.get("consensus_tier2_passed") else "❌"
-                is_winner = cr.get("lead_id") in winner_lead_ids
-                winner = "👑" if is_winner else "  "
-                lid = cr.get("lead_id", "?")[:8]
-                print(f"   {winner} #{i}: score={score:.1f} tier2={t2} miner={miner}... lead={lid}...")
-            print(f"\n   Winners: {len(winner_lead_ids)}/{len(ranked)} leads")
-            print(f"{'='*60}\n")
 
         except Exception as e:
             print(f"   ❌ Error in consensus for {rid[:8]}...: {e}")
@@ -450,26 +576,207 @@ async def _lifecycle_tick_inner(supabase) -> None:
         print(f"❌ Reward expiry error: {e}")
 
 
-async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_leads: int = 0) -> set:
-    """Deduplicate across miners and assign rewards. Returns set of winner lead_ids.
+def _chain_held_state_for_recycle(supabase, request_id: str, current_num_leads: int) -> dict:
+    """Lightweight chain-state lookup for the non-consensus recycle paths
+    (no_reveals, no_validators_timeout, empty_consensus).
 
-    Quota gate: a request is only considered fulfillable when the number of
-    unique deduped leads with ``score > 0`` is GREATER THAN OR EQUAL TO
-    ``num_leads``.  If the quota is not met, this function returns an empty
-    set WITHOUT writing any rewards — the caller is expected to recycle the
-    request into a fresh successor. Clients only receive a complete batch
-    of N leads; partial fulfillment is not emitted and miners who submitted
-    an insufficient batch get no reward for this request (they can
-    re-participate in the successor).
+    These paths bail out BEFORE consensus is computed, so they don't run
+    through ``_resolve_chain_topk``.  But the chain may already have held
+    leads from earlier generations that must propagate through this
+    recycle so they're not lost.
 
-    If ``num_leads`` is 0 (legacy / unspecified), all deduped leads are
-    rewarded as before.
+    Returns a dict matching the keyword args ``_recycle_request`` accepts:
+      * ``successor_status_target``: ``"continued_open"`` if any prior
+        held leads exist, else ``"open"``.
+      * ``successor_num_leads``: ``chain_target − len(held)`` if held>0,
+        else the chain's full target.
+      * ``held_companies``: list of (company-normalized) names of the
+        prior held leads, used to seed the successor's
+        excluded_companies.
+      * ``recycle_status``: ``"partially_fulfilled"`` when held>0
+        (preferring this label for the predecessor so miners and
+        dashboards see "chain in progress, awaiting more leads"),
+        else falls through to the caller's chosen terminal_status
+        (``"recycled"`` / ``"expired"``).
     """
-    from gateway.fulfillment.rewards import calculate_lead_rewards
+    prior_held = _load_chain_held_winners(supabase, request_id)
+    if not prior_held:
+        return {
+            "successor_status_target": "open",
+            "successor_num_leads": _chain_target_num_leads(supabase, request_id, current_num_leads),
+            "held_companies": [],
+            "recycle_status": None,  # caller's terminal_status stands
+        }
+
+    chain_target = _chain_target_num_leads(supabase, request_id, current_num_leads)
+
+    # Hydrate held leads' companies from fulfillment_submissions.
+    needed_subs = {r["submission_id"] for r in prior_held}
+    sub_lead_data: dict = {}
+    if needed_subs:
+        sub_resp = supabase.table("fulfillment_submissions") \
+            .select("submission_id, lead_data") \
+            .in_("submission_id", list(needed_subs)) \
+            .execute()
+        for row in (sub_resp.data or []):
+            ld_list = row.get("lead_data") or []
+            lookup = {ld.get("lead_id"): ld.get("data", {}) for ld in ld_list}
+            sub_lead_data[row["submission_id"]] = lookup
+    held_companies: list = []
+    for r in prior_held:
+        info = sub_lead_data.get(r["submission_id"], {}).get(r["lead_id"])
+        if info:
+            company = _normalize_company(info.get("business", ""))
+            if company:
+                held_companies.append(company)
+
+    return {
+        "successor_status_target": "continued_open",
+        "successor_num_leads": max(0, chain_target - len(prior_held)),
+        "held_companies": held_companies,
+        "recycle_status": "partially_fulfilled",
+    }
+
+
+def _walk_chain_predecessors(supabase, request_id: str) -> list:
+    """Return the list of all request_ids upstream of ``request_id`` in the
+    recycle chain (oldest first), EXCLUDING ``request_id`` itself.
+
+    The chain is linked via ``successor_request_id``: each predecessor row
+    has its successor_request_id field set to the next generation's id.
+    Walks backwards from the given request, finding the row whose
+    ``successor_request_id`` equals the current id, and repeats until the
+    chain root (no predecessor pointing at us).  Bounded to 50 generations
+    as a safety against pathological loops in malformed data.
+    """
+    chain: list = []
+    cur = request_id
+    for _ in range(50):
+        pred = supabase.table("fulfillment_requests") \
+            .select("request_id") \
+            .eq("successor_request_id", cur) \
+            .limit(1) \
+            .execute()
+        if not pred.data:
+            break
+        cur = pred.data[0]["request_id"]
+        chain.append(cur)
+    chain.reverse()  # oldest → newest
+    return chain
+
+
+def _load_chain_held_winners(supabase, request_id: str) -> list:
+    """Load all consensus rows currently flagged is_chain_held=TRUE across
+    every predecessor of ``request_id`` (not including ``request_id`` itself).
+
+    Returned shape matches the consensus_results dicts produced by
+    ``compute_fulfillment_consensus``: one entry per (submission, lead),
+    plus a ``request_id`` field so the caller can write back the right row
+    when updating ``is_chain_held``.
+
+    Empty list when:
+      * the request is the chain root (no predecessors), OR
+      * predecessors exist but none flipped ``is_chain_held`` (because the
+        predecessor was a clean ``recycled`` with no useful work, or this
+        is a fresh chain pre-migration).
+    """
+    chain_predecessors = _walk_chain_predecessors(supabase, request_id)
+    if not chain_predecessors:
+        return []
+
+    held = supabase.table("fulfillment_score_consensus") \
+        .select(
+            "consensus_id, request_id, submission_id, lead_id, miner_hotkey, "
+            "consensus_final_score, consensus_intent_signal_final, "
+            "consensus_company_verified, consensus_person_verified, "
+            "consensus_email_verified, consensus_decision_maker, "
+            "consensus_icp_fit, consensus_rep_score, consensus_tier2_passed, "
+            "any_fabricated, intent_details, intent_signal_mapping, "
+            "num_validators"
+        ) \
+        .in_("request_id", chain_predecessors) \
+        .eq("is_chain_held", True) \
+        .execute()
+    return list(held.data or [])
+
+
+def _chain_target_num_leads(supabase, request_id: str, current_num_leads: int) -> int:
+    """The chain's full quota (the K in 'top-K').
+
+    Walks back to the chain root (the oldest predecessor with no row
+    pointing at it) and reads its ``num_leads``, which represents the
+    client's original request size.  This stays invariant across all
+    successors in the chain.
+
+    Falls back to ``current_num_leads`` if the chain has no predecessors
+    (i.e., this IS the root).
+    """
+    predecessors = _walk_chain_predecessors(supabase, request_id)
+    if not predecessors:
+        return current_num_leads
+    root_id = predecessors[0]
+    try:
+        root = supabase.table("fulfillment_requests") \
+            .select("num_leads") \
+            .eq("request_id", root_id) \
+            .limit(1) \
+            .execute()
+        if root.data and root.data[0].get("num_leads"):
+            return int(root.data[0]["num_leads"])
+    except Exception as e:
+        print(f"   ⚠️  Could not read chain root num_leads from {root_id[:8]}: {e}")
+    return current_num_leads
+
+
+async def _resolve_chain_topk(
+    request_id: str,
+    consensus_results: list,
+    current_request_num_leads: int,
+) -> dict:
+    """Chain-aware top-K resolution.
+
+    Combines the new cycle's qualifying candidates (final_score > 0) with
+    any leads previously held in earlier generations of this chain
+    (is_chain_held=TRUE upstream rows).  Cross-cycle dedups by company
+    so the same company never occupies two slots in the final top-K
+    even if multiple miners submitted leads at it across generations.
+    Picks the top K (where K = the chain's original num_leads), updates
+    is_chain_held flags across the entire chain accordingly, and returns
+    a structured decision dict.
+
+    Crucially: NO REWARDS ARE WRITTEN HERE.  Reward distribution only
+    happens when the chain reaches its full quota; until then, held
+    leads sit in DB with is_chain_held=TRUE but is_winner=FALSE and
+    reward_pct=NULL.  See ``_finalize_chain_rewards`` for the
+    fulfillment-time payout.
+
+    Returned dict:
+      {
+        "chain_target":       int  (K — the client's original num_leads),
+        "topk":               list of consensus dicts (length ≤ K),
+        "topk_lead_ids":      set  (ids of leads currently held),
+        "topk_companies":     list (normalized company strings, used by
+                                    the recycle path's exclusion list),
+        "displaced_count":    int  (held leads that just got bumped),
+        "this_cycle_winners": list (subset of topk that came from this
+                                    cycle — used for tracing only),
+        "tied_groups":        list of (lead_id, tied_consensus_rows) so
+                                    reward distribution can compute
+                                    tie_count correctly later,
+      }
+    """
     supabase = _get_supabase()
 
-    needed_subs = {r["submission_id"] for r in consensus_results
-                   if r["consensus_final_score"] > 0}
+    # 1) Load prior held leads (across all predecessor generations).
+    prior_held = _load_chain_held_winners(supabase, request_id)
+    chain_target = _chain_target_num_leads(supabase, request_id, current_request_num_leads)
+
+    # 2) Hydrate "business" / company on EVERY candidate.  Need it for
+    #    cross-cycle dedup (same company across generations collapses).
+    #    Prior held rows already passed validation in their cycle, so we
+    #    fetch their lead_data from fulfillment_submissions; current
+    #    cycle results may also need hydration.
+    needed_subs = {r["submission_id"] for r in (consensus_results + prior_held)}
     sub_lead_data: dict = {}
     if needed_subs:
         sub_resp = supabase.table("fulfillment_submissions") \
@@ -481,65 +788,171 @@ async def _run_dedup_and_rewards(request_id: str, consensus_results: list, num_l
             lookup = {ld.get("lead_id"): ld.get("data", {}) for ld in ld_list}
             sub_lead_data[row["submission_id"]] = lookup
 
-    groups: dict = {}
+    def _company_for(r: dict) -> str:
+        info = sub_lead_data.get(r["submission_id"], {}).get(r["lead_id"])
+        if not info:
+            return ""
+        return _normalize_company(info.get("business", ""))
+
+    # 3) Build the candidate pool: this cycle's qualifying rows ∪ prior held.
+    pool: list = []
     for r in consensus_results:
-        if r["consensus_final_score"] <= 0:
+        if (r.get("consensus_final_score") or 0) <= 0:
             continue
-
-        lead_info = sub_lead_data.get(r["submission_id"], {}).get(r["lead_id"])
-        if not lead_info:
-            continue
-
-        # Cross-miner dedup: one lead per company in the final ranking.
-        # Different contacts at the same company from different miners collapse
-        # into one group; the highest-scoring contact wins and the rest drop.
-        company = _normalize_company(lead_info.get("business", ""))
+        company = _company_for(r)
         if not company:
             continue
-        dedup_key = company
+        # Tag origin so we know which rows are "from this cycle" vs prior
+        pool.append({**r, "_chain_company": company, "_chain_origin": "current"})
+    for r in prior_held:
+        company = _company_for(r)
+        if not company:
+            # A prior held row whose company we can't recover — drop it.
+            # Should not happen in practice but defensive.
+            continue
+        pool.append({**r, "_chain_company": company, "_chain_origin": "prior"})
 
-        if dedup_key not in groups:
-            groups[dedup_key] = []
-        groups[dedup_key].append(r)
+    # 4) Cross-cycle dedup by company: keep the highest-scoring entry per
+    #    company across the whole chain.  A held lead at a company can be
+    #    REPLACED by a new cycle's higher-scoring lead at the same company —
+    #    the held one gets displaced (is_chain_held → FALSE on next update).
+    by_company: dict = {}
+    for c in pool:
+        key = c["_chain_company"]
+        cur = by_company.get(key)
+        if cur is None:
+            by_company[key] = c
+            continue
+        # Same-company collision: pick the higher (final_score, intent_signal_final)
+        cur_score = (cur.get("consensus_final_score") or 0,
+                     cur.get("consensus_intent_signal_final") or 0)
+        new_score = (c.get("consensus_final_score") or 0,
+                     c.get("consensus_intent_signal_final") or 0)
+        if new_score > cur_score:
+            by_company[key] = c
 
-    # Pick the best candidate(s) per dedup group (tied miners on same lead)
-    group_results = []  # list of (best_score, best_raw, tied_candidates)
-    for dedup_key, candidates in groups.items():
-        candidates.sort(key=lambda x: (
-            -x["consensus_final_score"],
-            -x.get("consensus_intent_signal_final", 0),
-        ))
+    # 5) Rank by score, take top K.
+    ranked = sorted(
+        by_company.values(),
+        key=lambda x: (
+            -(x.get("consensus_final_score") or 0),
+            -(x.get("consensus_intent_signal_final") or 0),
+        ),
+    )
+    topk = ranked[:chain_target]
+    topk_lead_ids = {r["lead_id"] for r in topk}
+    topk_companies = [r["_chain_company"] for r in topk]
 
-        best_score = candidates[0]["consensus_final_score"]
-        best_raw = candidates[0].get("consensus_intent_signal_final", 0)
-        tied = [c for c in candidates
-                if c["consensus_final_score"] == best_score
-                and c.get("consensus_intent_signal_final", 0) == best_raw]
-        group_results.append((best_score, best_raw, tied))
+    displaced_count = sum(1 for r in prior_held if r["lead_id"] not in topk_lead_ids)
 
-    # Rank unique leads (dedup groups) by score
-    group_results.sort(key=lambda g: (-g[0], -g[1]))
+    # 6) Persist is_chain_held flags across the whole chain.
+    #    Order matters: clear FALSE first so leads moving in/out within
+    #    the same cycle land cleanly, then mark TRUE for the new top-K.
+    chain_request_ids = [request_id] + _walk_chain_predecessors(supabase, request_id)
 
-    # Quota gate: if the client asked for N leads, require at least N unique
-    # qualifying deduped leads. Otherwise return empty (no rewards written);
-    # caller will recycle into a fresh successor.
-    if num_leads > 0 and len(group_results) < num_leads:
-        print(
-            f"   ⚠️  {request_id[:8]}... quota not met: "
-            f"{len(group_results)} unique leads with score>0 < {num_leads} requested — "
-            f"no rewards assigned, caller should recycle"
-        )
+    # 6a) Clear is_chain_held=FALSE on every chain row that's no longer in topk.
+    if topk_lead_ids:
+        try:
+            supabase.table("fulfillment_score_consensus").update({
+                "is_chain_held": False,
+            }).in_("request_id", chain_request_ids) \
+              .not_.in_("lead_id", list(topk_lead_ids)) \
+              .execute()
+        except Exception as e:
+            print(f"   ⚠️  Failed clearing is_chain_held for displaced rows: {e}")
+    else:
+        # Empty top-K — clear everyone in the chain.
+        try:
+            supabase.table("fulfillment_score_consensus").update({
+                "is_chain_held": False,
+            }).in_("request_id", chain_request_ids) \
+              .execute()
+        except Exception as e:
+            print(f"   ⚠️  Failed clearing all is_chain_held: {e}")
+
+    # 6b) Set is_chain_held=TRUE on the new top-K.  Each (request_id,
+    #     submission_id, lead_id) triple uniquely identifies a row, so
+    #     update them individually — there's no cheap multi-row in_()
+    #     filter that disambiguates per (request_id, lead_id) pairs.
+    for r in topk:
+        try:
+            supabase.table("fulfillment_score_consensus").update({
+                "is_chain_held": True,
+            }).eq("request_id", r["request_id"]) \
+              .eq("submission_id", r["submission_id"]) \
+              .eq("lead_id", r["lead_id"]) \
+              .execute()
+        except Exception as e:
+            print(f"   ⚠️  Failed setting is_chain_held for "
+                  f"lead {str(r.get('lead_id',''))[:8]}: {e}")
+
+    # 7) Build tied groups — needed by the reward distribution path.
+    tied_groups: list = []
+    for r in topk:
+        # Within a single (request_id, lead_id) pair the validator scoring
+        # may have produced multiple consensus rows from tied miners.  We
+        # surface the tied set so reward_pct is split correctly.
+        tied = supabase.table("fulfillment_score_consensus") \
+            .select("submission_id, lead_id, miner_hotkey, request_id") \
+            .eq("request_id", r["request_id"]) \
+            .eq("lead_id", r["lead_id"]) \
+            .execute()
+        tied_rows = list(tied.data or [])
+        tied_groups.append((r["lead_id"], tied_rows))
+
+    return {
+        "chain_target": chain_target,
+        "topk": topk,
+        "topk_lead_ids": topk_lead_ids,
+        "topk_companies": topk_companies,
+        "displaced_count": displaced_count,
+        "this_cycle_winners": [r for r in topk if r.get("_chain_origin") == "current"],
+        "tied_groups": tied_groups,
+    }
+
+
+async def _finalize_chain_rewards(
+    request_id: str,
+    topk: list,
+    tied_groups: list,
+) -> set:
+    """Distribute rewards for a fulfilled chain.  Sets is_winner=TRUE and
+    reward_pct on each top-K consensus row.  Called ONLY when the chain
+    has reached its full quota and the current request is about to
+    transition to status='fulfilled'.
+
+    Tie handling: when multiple miners produced consensus rows for the
+    same (request_id, lead_id) — i.e., they submitted identical leads
+    that all passed validation — Z_PERCENT is split evenly between
+    them (Z_PERCENT / tie_count).  A miner whose lead was held in an
+    earlier generation gets paid by the request_id where their row
+    actually lives, not the chain head.
+
+    Returns the set of lead_ids that were rewarded.
+    """
+    from gateway.fulfillment.rewards import calculate_lead_rewards
+    supabase = _get_supabase()
+
+    tied_by_lead = {lead_id: tied_rows for lead_id, tied_rows in tied_groups}
+
+    winners: list = []
+    for r in topk:
+        lid = r["lead_id"]
+        tied_rows = tied_by_lead.get(lid, [])
+        tie_count = max(1, len(tied_rows))
+        for tr in tied_rows:
+            winners.append({
+                **tr,
+                "tie_count": tie_count,
+            })
+
+    if not winners:
         return set()
 
-    top_groups = group_results[:num_leads] if num_leads > 0 else group_results
-
-    # Flatten to winners; tie_count reflects only tied miners SELECTED (not dropped)
-    winners = []
-    for _, _, tied in top_groups:
-        for c in tied:
-            winners.append({**c, "tie_count": len(tied)})
-
     current_epoch = await _get_current_epoch()
+    # ``calculate_lead_rewards`` keys on (request_id, submission_id, lead_id)
+    # so cross-generation winners (whose request_id is a predecessor) get
+    # their own rows updated — no need to remap to the chain head.
     calculate_lead_rewards(request_id, winners, Z_PERCENT, current_epoch, L_EPOCHS)
 
     # Enrich each winner with the client-ready "Intent Details" paragraph.
@@ -616,15 +1029,55 @@ def _recycle_request(
     *,
     terminal_status: str,
     reason: str,
+    successor_status_target: str = "open",
+    successor_num_leads: int = None,
+    held_companies: list = None,
 ) -> None:
     """Create a successor request and mark the original as terminal.
 
-    Used when a request can't complete normally (no reveals, no validators,
-    empty consensus). The successor is a fresh ``open`` request with new
-    commit/reveal windows, added to the BACK of the FIFO queue via a new
-    ``window_start = now``.  The original is marked ``recycled`` (if nobody
-    responded) or ``expired`` (if validators failed to score) so dashboards
-    can distinguish why a request was recycled.
+    Used in three lifecycle scenarios:
+      * ``terminal_status='partially_fulfilled'``: chain produced ≥1 held
+        leads but fell short of the quota.  Successor enters the queue
+        intended for ``continued_open`` (held in pending until the
+        promotion step picks it up), inherits the in-flight chain's
+        held companies as additional excluded_companies, and asks
+        miners only for ``successor_num_leads`` (the remaining quota).
+      * ``terminal_status='recycled'``: chain produced 0 held leads.
+        Successor is a plain ``open`` (after promotion) request asking
+        for the full original quota again.  Used for both
+        no-reveals-after-commit and no-useful-output-after-consensus
+        edge cases.
+      * ``terminal_status='expired'``: validators didn't materialize or
+        consensus was empty.  Successor is also ``open``.
+
+    The two new keyword args make the recycle behavior data-driven so
+    the chain logic in ``_lifecycle_tick_inner`` controls the policy
+    while this function stays focused on the database race-safe
+    insert+claim protocol.
+
+    successor_status_target:
+      * ``"open"`` (default) — for legacy / no-progress recycles.  The
+        ``pending → open`` promotion step in step 0 transitions it.
+      * ``"continued_open"`` — for partially_fulfilled chains.  The
+        promotion step looks at the predecessor's status to pick the
+        right transition target.
+
+    successor_num_leads:
+      * ``None`` (default) — inherit predecessor's num_leads as before.
+      * specified — use this value (typically chain_target − held_count
+        for partially_fulfilled successors).  Stored in the
+        ``num_leads`` column of the new row.
+
+    held_companies:
+      * ``None`` or ``[]`` — no in-flight held set; only the client's
+        prior fulfilled-request winners are added to excluded_companies
+        (legacy behavior).
+      * non-empty list — these company names are appended to the
+        successor's excluded_companies so miners don't re-do work on
+        leads that are already held in the chain.  When a held lead
+        gets displaced in a later cycle, its company drops from this
+        list automatically because the next recycle's held_companies
+        only reflects the current chain top-K.
     """
     rid = original_request["request_id"]
     new_id = str(uuid4())
@@ -694,11 +1147,46 @@ def _recycle_request(
                 print(f"   ⚠️  recycle: excluded_companies refresh failed "
                       f"for {rid[:8]} → {new_id[:8]}: {type(e).__name__}: {e}")
 
+        # Append in-flight held companies (chain-aware) to excluded_companies.
+        # These are leads currently in is_chain_held=TRUE for this chain;
+        # they're not yet "delivered" to the client (no rewards distributed
+        # yet — that happens only on chain fulfillment), but miners should
+        # not waste work re-submitting at the same companies.  When a held
+        # lead is later displaced, its company drops off naturally because
+        # the next recycle's held_companies only reflects the current top-K.
+        if held_companies:
+            try:
+                prior = successor_icp.get("excluded_companies") or []
+                seen = {str(x).strip().lower() for x in prior if str(x).strip()}
+                merged = list(prior)
+                for biz in held_companies:
+                    biz_str = str(biz or "").strip()
+                    if not biz_str:
+                        continue
+                    if biz_str.lower() not in seen:
+                        merged.append(biz_str)
+                        seen.add(biz_str.lower())
+                successor_icp["excluded_companies"] = merged
+            except Exception as e:
+                print(f"   ⚠️  recycle: held_companies merge failed "
+                      f"for {rid[:8]} → {new_id[:8]}: {type(e).__name__}: {e}")
+
+        # Determine successor's num_leads.  For partially_fulfilled chains
+        # this is the remaining quota (chain_target − held_count); for
+        # plain recycles or expired requests it's the original
+        # num_leads (full quota).  None falls back to the predecessor's
+        # num_leads for backward compatibility with non-chain callers.
+        target_num_leads = (
+            successor_num_leads
+            if successor_num_leads is not None
+            else original_request["num_leads"]
+        )
+
         supabase.table("fulfillment_requests").insert({
             "request_id": new_id,
             "request_hash": "",
             "icp_details": successor_icp,
-            "num_leads": original_request["num_leads"],
+            "num_leads": target_num_leads,
             "internal_label": original_request.get("internal_label"),
             "company": original_request.get("company"),
             "window_start": None,

@@ -520,12 +520,20 @@ async def get_active_requests(miner_hotkey: str = ""):
     min_remaining = timedelta(minutes=FULFILLMENT_MIN_REMAINING_WINDOW_MINUTES)
     cutoff = (now + min_remaining).isoformat()
 
-    # FIFO: return up to FULFILLMENT_MAX_PARALLEL_REQUESTS oldest open requests.
-    # Miners may work on any/all of them in parallel. Once a request is
-    # fulfilled/recycled/expired, the next one in line becomes visible.
+    # FIFO: return up to FULFILLMENT_MAX_PARALLEL_REQUESTS oldest visible
+    # requests.  Miners may work on any/all of them in parallel. Once a
+    # request is fulfilled/recycled/expired/partially_fulfilled, the next
+    # one in line becomes visible.
+    #
+    # Both 'open' (fresh) and 'continued_open' (chain continuation) are
+    # surfaced — they're functionally identical for the miner's purposes
+    # (commit window, reveal window, num_leads, ICP shape).  The status
+    # label is preserved on each entry's "status" field so miners that
+    # care can detect "this request is part of an in-flight chain;
+    # rewards only flow when the chain reaches its full quota".
     resp = supabase.table("fulfillment_requests") \
         .select("*") \
-        .eq("status", "open") \
+        .in_("status", ["open", "continued_open"]) \
         .gt("window_end", cutoff) \
         .order("window_start", desc=False) \
         .limit(FULFILLMENT_MAX_PARALLEL_REQUESTS) \
@@ -628,6 +636,19 @@ async def get_active_requests(miner_hotkey: str = ""):
             "max_submissions_per_miner": per_miner_cap,
             "window_end": r["window_end"],
             "reveal_window_end": r["reveal_window_end"],
+            # Miner-facing status hint:
+            #   "open"           — fresh request; rewards flow normally
+            #                       at the end of THIS cycle if quota is
+            #                       met.
+            #   "continued_open" — chain continuation; some leads were
+            #                       already accepted in earlier cycles
+            #                       and are held server-side.  Rewards
+            #                       only flow when the chain reaches its
+            #                       full quota across all generations.
+            #                       num_leads here is the REMAINING
+            #                       quota (chain_target − held_count),
+            #                       not the chain's full size.
+            "status": r.get("status", "open"),
         })
 
     return {
@@ -669,7 +690,10 @@ async def commit_leads(commit: FulfillmentCommitRequest):
         raise HTTPException(404, detail="Request not found")
 
     req = req_resp.data[0]
-    if req["status"] != "open":
+    # Both 'open' (fresh) and 'continued_open' (chain continuation) accept
+    # commits — they have identical commit window semantics; only the
+    # status label differs to flag chain continuations to miners.
+    if req["status"] not in ("open", "continued_open"):
         raise HTTPException(400, detail=f"Window not open (status={req['status']})")
 
     now = datetime.now(timezone.utc)
