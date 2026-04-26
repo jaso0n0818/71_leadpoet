@@ -61,15 +61,31 @@ async def score_miner_submission(
         return [pe if pe is not None else FulfillmentScoreResult(failure_reason="empty")
                 for pe in parse_errors]
 
-    # use_apify=True flips fulfillment Stage 4/5 from the legacy
-    # check_linkedin_gse + check_stage5_unified pair to the new Apify-based
-    # fulfillment_person_verification + fulfillment_company_verification
-    # path.  Sourcing is unaffected — that pipeline goes through
+    # FULFILLMENT_USE_APIFY env var flips fulfillment Stage 4/5 from the
+    # legacy check_linkedin_gse + check_stage5_unified pair to the new
+    # Apify-based fulfillment_person_verification +
+    # fulfillment_company_verification path.  Default is OFF — opt in by
+    # setting FULFILLMENT_USE_APIFY=true (or 1/yes) in the container env.
+    # Sourcing is unaffected by either value: that pipeline goes through
     # run_automated_checks in neurons/validator.py and never reaches this
-    # function.  Requires APIFY_API_TOKEN in the container env (wired in
-    # deploy_dynamic.sh -e flags) plus the existing OPENROUTER_KEY and
-    # SCRAPINGDOG_API_KEY which are already provisioned.
-    scored = await score_fulfillment_batch(scoreable, icp, use_apify=True)
+    # function.
+    #
+    # Operator notes:
+    #   * When ON, requires APIFY_API_TOKEN in the container env (wired
+    #     in deploy_dynamic.sh -e flags); also requires OPENROUTER_KEY
+    #     and SCRAPINGDOG_API_KEY which are already provisioned.
+    #   * Graceful degradation: if APIFY_API_TOKEN is missing or invalid
+    #     while the flag is on, fulfillment_person_verification returns
+    #     "fulfillment_person_fetch_failed" and scoring.py falls back to
+    #     the legacy ScrapingDog Stage 4 path automatically (see
+    #     scoring.py L374-376).
+    #   * Kill switch: set FULFILLMENT_USE_APIFY=false in .env and restart
+    #     the validator — instantly reverts to legacy Stage 4/5.
+    import os as _os
+    _use_apify = _os.getenv("FULFILLMENT_USE_APIFY", "false").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+    scored = await score_fulfillment_batch(scoreable, icp, use_apify=_use_apify)
 
     results: List[FulfillmentScoreResult] = []
     score_idx = 0
