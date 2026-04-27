@@ -1,0 +1,3 @@
+[console_scripts]
+btcli=bittensor_cli.cli:main
+
