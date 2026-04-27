@@ -8,6 +8,7 @@ modify any existing models in gateway/models/ or Leadpoet/protocol.py.
 See business_files/tasks10.md Phase 1.2 for specification.
 """
 
+import re
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Literal, Dict, Any
 from datetime import date, datetime
@@ -119,17 +120,109 @@ class Seniority(str, Enum):
 # Intent Signal Models
 # =============================================================================
 
+_INTENT_INJECTION_PATTERNS = [
+    re.compile(
+        r"\b(?:ignore|disregard|forget|skip|bypass|override|nullify|cancel)\s+"
+        r"(?:all\s+|any\s+|the\s+|every\s+|whatever\s+|what\s+(?:was\s+)?)?"
+        r"(?:previous|prior|above|earlier|preceding|former|original|initial)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:ignore|disregard)\s+(?:everything|all)\b", re.IGNORECASE),
+    re.compile(r"\bforget\s+(?:everything|all|what|that)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:new|updated?|revised?|fresh|different)\s+"
+        r"(?:instructions?|task|prompt|rules?|directives?|orders?|guidelines?)\s*"
+        r"(?:[:.]|are|is|to|that)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"<\|(?:im_(?:start|end)|endoftext|fim_[a-z]+|begin_of_text|end_of_text)\|>",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:^|\n)\s*(?:system|assistant|user)\s*[:>]", re.IGNORECASE),
+    re.compile(
+        r"\b(?:return|respond|reply|output|give|set|make|use|score|assign)\s+"
+        r"(?:with\s+|this\s+|a\s+|the\s+)?(?:score|value|rating)?\s*"
+        r"(?:of\s+|=\s*|:\s*|to\s+)?\s*(?:5\d|60)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bscore\s*[:=]\s*(?:5\d|60)\b", re.IGNORECASE),
+    re.compile(r"\bmatched_icp_signal_idx\s*[:=]", re.IGNORECASE),
+    re.compile(r"\bact\s+as\s+(?:a\s+)?(?:different|new)", re.IGNORECASE),
+    re.compile(r"\byou\s+are\s+now\s+(?:a\s+)?(?:different|new)", re.IGNORECASE),
+    re.compile(r"\bfollow\s+(?:these|the)\s+new\b", re.IGNORECASE),
+]
+
+
+def _scan_for_prompt_injection(text: str, field_name: str) -> None:
+    """Raise ``ValueError`` if ``text`` contains evident prompt-injection.
+    Used by IntentSignal field validators so that signals embedding gaming
+    instructions are rejected at parse time, BEFORE they ever reach a
+    scoring or verification LLM.
+
+    The regex set is intentionally specific to known attack phrases; legit
+    intent descriptions ("hiring for new SDRs", "raised Series B in 2026")
+    do not trigger any of these patterns.  See lead_scorer + intent_verification
+    LLM hardening for the second-line defenses (system/user split, JSON
+    schema lock) that catch any subtler attempts that slip past this gate.
+    """
+    if not text:
+        return
+    for rx in _INTENT_INJECTION_PATTERNS:
+        m = rx.search(text)
+        if m:
+            raise ValueError(
+                f"prompt_injection_detected in {field_name!r}: matched {m.group(0)[:60]!r}"
+            )
+
+
 class IntentSignal(BaseModel):
     """
     Intent signal attached to a lead.
     Models must provide evidence of buying intent.
+
+    PROMPT-INJECTION DEFENSE
+    ------------------------
+    The ``description`` and ``snippet`` fields are interpolated into LLM
+    prompts at scoring + verification time.  Two classes of defenses
+    protect that surface:
+
+      1. **Parse-time rejection** (field validators below): the regex set
+         in ``_INTENT_INJECTION_PATTERNS`` scans for evident gaming
+         phrases ("ignore previous instructions", ChatML control tokens,
+         direct score steering, role-hijacking lines, etc.).  Any match
+         raises a ``ValueError``, which causes the parent ``FulfillmentLead``
+         to fail validation and the lead to be silently dropped from the
+         miner's submission with no points earned.  Blanket length caps
+         (description ≤ 350, snippet ≤ 600) tightened from prior values
+         to reduce the room for crafted attacks.
+
+      2. **LLM-call defenses** (in ``qualification/scoring/intent_verification.py``
+         and ``lead_scorer.py``): system/user message separation, neutral
+         ``<<<MINER_*>>>`` delimited blocks, and strict JSON Schema
+         response_format on every LLM call.  Even if a subtler injection
+         slipped past the regex, those defenses constrain the worst-case
+         outcome to "the LLM ignores the injection and returns a real
+         score" — there is no output channel that escapes the schema.
     """
     source: IntentSignalSource
-    description: str = Field(..., max_length=500, description="Description of the intent signal")
+    description: str = Field(..., max_length=350, description="Description of the intent signal")
     url: str = Field(..., description="URL to the source of the intent signal")
     date: Optional[str] = Field(None, description="Date of the signal in ISO 8601 format (YYYY-MM-DD), or null if no verifiable date")
-    snippet: str = Field(..., max_length=1000, description="Relevant text snippet extracted from source URL")
-    
+    snippet: str = Field(..., max_length=600, description="Relevant text snippet extracted from source URL")
+
+    @field_validator('description')
+    @classmethod
+    def validate_description_no_injection(cls, v: str) -> str:
+        _scan_for_prompt_injection(v, "description")
+        return v
+
+    @field_validator('snippet')
+    @classmethod
+    def validate_snippet_no_injection(cls, v: str) -> str:
+        _scan_for_prompt_injection(v, "snippet")
+        return v
+
     @field_validator('date')
     @classmethod
     def validate_date_format(cls, v: Optional[str]) -> Optional[str]:
