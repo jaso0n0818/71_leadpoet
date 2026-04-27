@@ -131,3 +131,6 @@ neurons/.pending_equivocation_check.json
 
 # Validator logs (local testing)
 validator_logs.txt
+venv/
+__pycache__/
+*.pyc
